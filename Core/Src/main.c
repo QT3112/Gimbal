@@ -26,6 +26,7 @@
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
 #include "stdint.h"
+#include "math.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -35,7 +36,8 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
+#define PWM_PERIOD 4249.0f
+#define PI 3.14159265359f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -46,7 +48,10 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-
+float voltage_limit = 0.05f;
+volatile float theta = 0.0f;
+float velocity = 5.0f;   // rad/s điện
+float Ts = 0.0001f;      // 100us
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -57,6 +62,24 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+void setPhaseVoltage(float theta)
+{
+  float Ua, Ub, Uc;
+
+  Ua = 0.5f + voltage_limit * sinf(theta);
+  Ub = 0.5f + voltage_limit * sinf(theta - 2.0f*PI/3.0f);
+  Uc = 0.5f + voltage_limit * sinf(theta - 4.0f*PI/3.0f);
+
+  uint16_t dutyA = (uint16_t)(Ua * PWM_PERIOD);
+  uint16_t dutyB = (uint16_t)(Ub * PWM_PERIOD);
+  uint16_t dutyC = (uint16_t)(Uc * PWM_PERIOD);
+
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, dutyA);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, dutyB);
+  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, dutyC);
+}
+
+
 
 /* USER CODE END 0 */
 
@@ -92,13 +115,16 @@ int main(void)
   MX_USB_Device_Init();
   MX_TIM1_Init();
   /* USER CODE BEGIN 2 */
+
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
 
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1062); // 25%
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 2125); // 50%
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 3187); // 75%
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
+
+  // __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1062); // 25%
+  // __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 2125); // 50%
+  // __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 3187); // 75%
 
   /* USER CODE END 2 */
 
@@ -106,6 +132,15 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
+    theta += 0.02f;
+
+    if(theta > 2.0f * PI)
+      theta -= 2.0f * PI;
+
+    setPhaseVoltage(theta);
+
+    HAL_Delay(1);
+
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
