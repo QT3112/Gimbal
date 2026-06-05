@@ -18,6 +18,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "i2c.h"
 #include "tim.h"
 #include "usb_device.h"
 #include "gpio.h"
@@ -74,9 +75,9 @@ void setPhaseVoltage(float theta)
   uint16_t dutyB = (uint16_t)(Ub * PWM_PERIOD);
   uint16_t dutyC = (uint16_t)(Uc * PWM_PERIOD);
 
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, dutyA);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, dutyB);
-  __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, dutyC);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, dutyA);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, dutyB);
+  __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, dutyC);
 }
 
 
@@ -113,18 +114,19 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_USB_Device_Init();
-  MX_TIM1_Init();
+  MX_I2C3_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
 
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
 
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
 
-  // __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, 1062); // 25%
-  // __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, 2125); // 50%
-  // __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, 3187); // 75%
+  // __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, 1062); // 25%
+  // __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 2125); // 50%
+  // __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 3187); // 75%
 
   /* USER CODE END 2 */
 
