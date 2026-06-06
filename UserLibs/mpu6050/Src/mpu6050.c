@@ -115,10 +115,16 @@ static MPU6050_Status_t MPU6050_Configure(MPU6050_Handle_t *hdev)
     MPU6050_Status_t status;
     uint8_t who_am_i = 0;
 
-    /* 1. Kiểm tra chip thông qua WHO_AM_I (mong đợi 0x68 hoặc 0x72 tùy revision) */
+    /* 1. Kiểm tra chip thông qua WHO_AM_I
+     *   0x68 = MPU6050 chính hãng
+     *   0x72 = MPU6050 revision B1
+     *   0x70 = Clone chip phổ biến trên module GY-521 hàng Trung Quốc
+     *   0x98 = Clone chip variant khác
+     */
     status = MPU6050_ReadReg(hdev, MPU6050_REG_WHO_AM_I, &who_am_i);
     if (status != MPU6050_OK) return MPU6050_ERROR;
-    if (who_am_i != 0x68 && who_am_i != 0x72) return MPU6050_WRONG_DEVICE;
+    if (who_am_i != 0x68 && who_am_i != 0x72 &&
+        who_am_i != 0x70 && who_am_i != 0x98) return MPU6050_WRONG_DEVICE;
 
     /* 2. Đánh thức chip (xóa bit SLEEP trong PWR_MGMT_1, chọn clock PLL từ Gyro X) */
     status = MPU6050_WriteReg(hdev, MPU6050_REG_PWR_MGMT_1, 0x01);
