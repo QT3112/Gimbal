@@ -18,15 +18,17 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "gpio.h"
 #include "i2c.h"
+#include "spi.h"
 #include "tim.h"
 #include "usb_device.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "math.h"
 #include "mpu6050.h"
+#include "as5048a.h"
 #include "stdint.h"
 #include "stdio.h"
 
@@ -59,6 +61,10 @@ float Ts = 0.0001f;    // 100us
 /* --- MPU6050 --- */
 MPU6050_Handle_t imu;  // Handle của cảm biến
 uint8_t imu_ready = 0; // Cờ trạng thái: 1 = sẵn sàng
+
+/* --- AS5048A Encoder --- */
+AS5048A_Handle_t encoder;   // Handle encoder
+uint8_t encoder_ready = 0;  // Cờ trạng thái: 1 = sẵn sàng
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -88,10 +94,11 @@ void setPhaseVoltage(float theta) {
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int main(void) {
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
 
   /* USER CODE BEGIN 1 */
 
@@ -99,8 +106,7 @@ int main(void) {
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
-   */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -119,6 +125,7 @@ int main(void) {
   MX_USB_Device_Init();
   MX_I2C3_Init();
   MX_TIM2_Init();
+  MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
 
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
@@ -131,36 +138,26 @@ int main(void) {
   // __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, 2125); // 50%
   // __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, 3187); // 75%
 
-  /* --- Khởi tạo MPU6050 --- */
-
-  /* Debug bước 1: Đọc trực tiếp thanh ghi WHO_AM_I (0x75) */
+  /* --- Khởi tạo AS5048A Encoder ---
+   * SPI1: đã được CubeMX init qua MX_SPI1_Init() ở trên
+   * CS:   PC4 (GPIO_Output, mặc định HIGH)
+   */
   {
-    uint8_t who_am_i = 0;
-    HAL_StatusTypeDef ret =
-        HAL_I2C_Mem_Read(&hi2c3, MPU6050_ADDR_LOW, 0x75, /* WHO_AM_I reg */
-                         I2C_MEMADD_SIZE_8BIT, &who_am_i, 1, 10);
-    if (ret == HAL_OK)
-      printf("[WHO_AM_I] doc thanh cong, gia tri = 0x%02X\r\n", who_am_i);
-    else
-      printf("[WHO_AM_I] doc that bai, HAL ret = %d, ErrorCode = 0x%lX\r\n",
-             ret, hi2c3.ErrorCode);
-    /* MPU6050 goc: 0x68 | MPU6050-B1 revision: 0x68 | GY-521 clone: co the la
-     * 0x98 */
-  }
+    AS5048A_Status_t enc_ret = AS5048A_Init(&encoder, &hspi1, GPIOC, GPIO_PIN_4);
+    printf("[AS5048A_Init] ma tra ve = %d "
+           "(0=OK, 1=SPI_ERR, 2=PARITY_ERR, 3=EF, 4=CORDIC)\r\n", enc_ret);
 
-  /* Debug bước 2: Gọi MPU6050_Init và in mã lỗi cụ thể */
-  {
-    MPU6050_Status_t init_ret = MPU6050_Init(&imu, &hi2c3, MPU6050_ADDR_LOW);
-    printf("[MPU6050_Init] ma tra ve = %d  "
-           "(0=OK, 1=ERROR, 2=BUSY, 3=WRONG_DEVICE)\r\n",
-           init_ret);
+    if (enc_ret == AS5048A_OK) {
+      encoder_ready = 1;
 
-    if (init_ret == MPU6050_OK) {
-      imu_ready = 1;
-      printf("[MPU6050] Khoi tao thanh cong!\r\n");
-
-      /* Hiệu chỉnh gyroscope: giữ cảm biến bất động trong ~1 giây */
-      MPU6050_CalibrateGyro(&imu, 200);
+      /* Đọc diagnostics để kiểm tra trạng thái nam châm */
+      AS5048A_ReadDiagnostics(&encoder);
+      printf("[AS5048A] AGC=%u | CompH=%u CompL=%u | COF=%u | OCF=%u\r\n",
+             encoder.agc_value,
+             encoder.comp_high,
+             encoder.comp_low,
+             encoder.cordic_overflow,
+             encoder.offset_comp_finished);
     }
   }
 
@@ -186,41 +183,46 @@ int main(void) {
       printf("Ax=%.2f Ay=%.2f Az=%.2f | Gx=%.2f Gy=%.2f Gz=%.2f\r\n",
              imu.accel_x, imu.accel_y, imu.accel_z, imu.gyro_x, imu.gyro_y,
              imu.gyro_z);
-
-      /* Dữ liệu đã sẵn sàng trong struct imu:
-       *   imu.accel_x, imu.accel_y, imu.accel_z  [m/s²]
-       *   imu.gyro_x,  imu.gyro_y,  imu.gyro_z   [°/s]
-       *   imu.temp_c                              [°C]
-       *
-       * Ví dụ in ra UART/USB-CDC:
-       *   printf("Ax=%.2f Ay=%.2f Az=%.2f | Gx=%.2f Gy=%.2f Gz=%.2f\r\n",
-       *           imu.accel_x, imu.accel_y, imu.accel_z,
-       *           imu.gyro_x,  imu.gyro_y,  imu.gyro_z);
-       */
     }
-    // printf("MPU6050_Init: %d \n", imu_ready);
-    HAL_Delay(1);
+
+    /* --- Đọc AS5048A Encoder --- */
+    if (encoder_ready) {
+      AS5048A_Status_t ret = AS5048A_ReadAngle(&encoder);
+      if (ret == AS5048A_OK) {
+        printf("[ENC] Angle: %.2f deg | %.4f rad | Raw: %u\r\n",
+               encoder.angle_deg,
+               encoder.angle_rad,
+               encoder.raw_angle);
+      } else {
+        /* Có lỗi: đọc và xóa error register */
+        uint16_t err_bits = 0;
+        AS5048A_ClearErrors(&encoder, &err_bits);
+        printf("[ENC] Loi doc: status=%d | err_bits=0x%04X\r\n", ret, err_bits);
+      }
+    }
+
+    HAL_Delay(10);
   }
   /* USER CODE END 3 */
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
-void SystemClock_Config(void) {
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-   */
+  */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
-  RCC_OscInitStruct.OscillatorType =
-      RCC_OSCILLATORTYPE_HSI | RCC_OSCILLATORTYPE_HSI48;
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSI48;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
@@ -231,20 +233,22 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV4;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
     Error_Handler();
   }
 }
@@ -254,10 +258,11 @@ void SystemClock_Config(void) {
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
   /* USER CODE BEGIN Error_Handler_Debug */
   /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
@@ -267,13 +272,14 @@ void Error_Handler(void) {
 }
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
-void assert_failed(uint8_t *file, uint32_t line) {
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
   /* USER CODE BEGIN 6 */
   /* User can add his own implementation to report the file name and line
      number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,

@@ -58,7 +58,7 @@ extern "C" {
 #define AS5048A_SPI_READ_BIT       (1U << 14)    /*!< Bit RWn = 1: lệnh READ */
 #define AS5048A_SPI_PARITY_BIT     (1U << 15)    /*!< Bit parity ở vị trí bit 15 */
 #define AS5048A_DATA_MASK          0x3FFF         /*!< Lấy 14 bit dữ liệu */
-#define AS5048A_ERROR_FLAG         (1U << 14)    /*!< Bit EF trong response MISO */
+#define AS5048A_EF_BIT             (1U << 14)    /*!< Bit EF (Error Flag) trong MISO response */
 #define AS5048A_MAX_VALUE          16384.0f       /*!< 2^14 = 16384 bước/vòng */
 #define AS5048A_CMD_NOP            0xC000U        /*!< Lệnh NOP: READ(1) + addr(0) + parity */
 

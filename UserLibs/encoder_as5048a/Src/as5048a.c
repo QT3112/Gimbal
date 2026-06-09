@@ -133,7 +133,7 @@ static AS5048A_Status_t AS5048A_ReadRegister(AS5048A_Handle_t *hdev,
     }
 
     /* --- Kiểm tra Error Flag (bit 14 của MISO) --- */
-    if (rx_frame2 & AS5048A_ERROR_FLAG) {
+    if (rx_frame2 & AS5048A_EF_BIT) {
         return AS5048A_ERROR_FLAG;
     }
 
@@ -183,10 +183,42 @@ AS5048A_Status_t AS5048A_Init(AS5048A_Handle_t *hdev, SPI_HandleTypeDef *hspi,
     hdev->cs_port = cs_port;
     hdev->cs_pin  = cs_pin;
 
-    /* Đảm bảo CS ở mức HIGH (không chọn chip) */
+    /* Đảm bảo CS ở mức HIGH */
     AS5048A_CS_High(hdev);
+    HAL_Delay(1); /* Chờ chip ổn định sau power-up */
 
-    /* Đọc thử diagnostics để kiểm tra kết nối */
+    /* =========================================================
+     * BƯỚC 1: Flush SPI pipeline bằng 1 frame NOP giả
+     *
+     * AS5048A dùng cơ chế pipeline 1 frame trễ. Khi chip vừa
+     * khởi động, "lệnh trước đó" không tồn tại, nên EF bit sẽ
+     * được bật trong response của frame đầu tiên. Gửi NOP để
+     * frame giả này hấp thụ phần "kết quả rác" đó.
+     * ========================================================= */
+    {
+        uint16_t dummy = 0;
+        AS5048A_SPI_Transfer(hdev, AS5048A_CMD_NOP, &dummy);
+        /* Kết quả dummy bị bỏ qua hoàn toàn */
+    }
+
+    /* =========================================================
+     * BƯỚC 2: Xóa Error Register (0x0001)
+     *
+     * Đọc thanh ghi lỗi sẽ đồng thời xóa tất cả các error flag
+     * (parity error, command invalid, framing error). Bỏ qua
+     * trạng thái trả về vì EF có thể vẫn còn ở bước này.
+     * ========================================================= */
+    {
+        uint16_t err_bits = 0;
+        AS5048A_ClearErrors(hdev, &err_bits);
+    }
+
+    /* =========================================================
+     * BƯỚC 3: Đọc Diagnostics để xác nhận chip hoạt động bình thường
+     *
+     * Sau khi đã xóa lỗi, frame này sẽ không còn EF = 1 nữa.
+     * OCF = 1 nghĩa là chip đã hoàn thành Offset Compensation.
+     * ========================================================= */
     AS5048A_Status_t status = AS5048A_ReadDiagnostics(hdev);
 
     return status;
