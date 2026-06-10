@@ -128,7 +128,7 @@ int main(void) {
   FOC_Init(&foc, &htim2, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
            4249.0f, /* PWM Period (ARR) */
            7,       /* Số cặp cực - chỉnh theo motor */
-           0.2f,    /* voltage_limit [V] */
+           0.05f,   /* voltage_limit [V] */
            0.01f);  /* Ts = 10ms */
 
   /* --- Khởi tạo AS5048A Encoder --- */
@@ -148,9 +148,46 @@ int main(void) {
     }
   }
 
-  /* Bật FOC - sẵn sàng chạy open-loop */
+  /* Bật FOC - sẵn sàng chạy closed-loop */
+  /* --- Cấu hình bộ lọc tốc độ (LPF) ---
+   * alpha = 0.9: lọc mạnh, phù hợp cho Ts=10ms
+   * Giảm alpha (0.7~0.8) nếu muốn đáp ứng nhanh hơn */
+  FOC_SetLPF_Vel(&foc, 0.9f);
+
+  /* --- Cấu hình PID vòng tốc độ ---
+   * Điểm khởi đầu an toàn: Kp nhỏ, Ki nhỏ
+   * Output clamp trong ±voltage_limit để bảo vệ motor
+   * Tăng Kp nếu motor phản ứng quá chậm
+   * Tăng Ki nếu tốc độ bị sai số xác lập (không đạt setpoint)
+   * Thêm Kd nếu có overshoot */
+  FOC_SetPID_Vel(&foc,
+                 0.008f,    /* Kp */
+                 0.004f,    /* Ki */
+                 0.0f,      /* Kd */
+                 -foc.voltage_limit,
+                  foc.voltage_limit);
+
   FOC_Start(&foc);
 
+  /* --- CĂN CHỈNH GÓC ENCODER (ALIGNMENT) ---
+   * Bắt buộc thực hiện để FOC biết vị trí zero điện tuyệt đối.
+   * Nếu bỏ qua bước này, angle_elec tính sai -> áp lực sai -> motor rung/nóng */
+  if (encoder_ready) {
+    printf("[ALIGN] Dang can chinh rotor...\r\n");
+    /* Giữ Vd để kéo rotor về vị trí D-axis tuyệt đối.
+     * Sử dụng voltage_limit để đảm bảo đủ lực mà không quá dòng */
+    for (int i = 0; i < 50; i++) {
+        FOC_AlignD(&foc, foc.voltage_limit);
+        HAL_Delay(10);
+    }
+
+    /* Đọc encoder sau khi rotor đã đứng yên hoàn toàn */
+    if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
+        FOC_CalibrateAngle(&foc, encoder.angle_rad);
+        foc.prev_angle_mech = encoder.angle_rad;
+        printf("[ALIGN] Xong! Offset = %.2f rad\r\n", foc.angle_offset);
+    }
+  }
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -161,30 +198,34 @@ int main(void) {
     /* USER CODE BEGIN 3 */
 
     /* ===========================================================
-     * Open-loop velocity: quét góc điện liên tục để motor quay
+     * Closed-loop Velocity Control
      *
-     * velocity_elec = tốc độ CƠ mong muốn × pole_pairs
-     * Ví dụ: 2 vòng/s cơ = 2 × 2π × 7 = ~88 rad/s điện
+     * FOC_RunVelocity():
+     *   1. Đọc angle encoder
+     *   2. Tính tốc độ = dθ/dt (vi phân)
+     *   3. Lọc LPF để loại nhiễu
+     *   4. PID: (target - vel_filtered) → Vq
+     *   5. InvPark + InvClarke → PWM
      *
-     * Tăng Vq nếu motor không đủ lực (trượt bước)
-     * Giảm velocity nếu motor bị rung lắc
+     * Tốc độ đặt: 1.0 vòng/s ≈ 6.28 rad/s cơ học
+     * Đổi dấu để đảo chiều quay
      * =========================================================== */
-    float velocity_mech_rps = 1.0f; /* [vòng/s] cơ học */
-    float velocity_elec = velocity_mech_rps * FOC_TWO_PI * foc.pole_pairs;
-    float Vq_drive = 0.8f; /* [V] - tăng nếu không đủ lực */
+    float target_vel = 1.0f * FOC_TWO_PI; /* [rad/s] cơ học = 1 vòng/giây */
 
-    FOC_RunOpenLoop(&foc, velocity_elec, Vq_drive);
-
-    /* Theo dõi góc encoder (tùy chọn, không ảnh hưởng điều khiển) */
     if (encoder_ready) {
       if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
-        printf("[SPIN] enc=%.1f deg | elec=%.1f deg | Vq=%.2fV\r\n",
-               encoder.angle_deg, foc.angle_elec * (180.0f / FOC_PI),
-               foc.Vq_ref);
+        FOC_RunVelocity(&foc, encoder.angle_rad, target_vel);
+
+        /* Log để quan sát (có thể tắt để cải thiện timing) */
+        printf("[VEL] set=%.2f | meas=%.2f | Vq=%.3f | angle=%.1f\r\n",
+               target_vel,
+               foc.velocity_mech,
+               foc.Vq_ref,
+               encoder.angle_deg);
       }
     }
 
-    HAL_Delay(10); /* Ts = 10ms → gọi FOC_RunOpenLoop 100 lần/giây */
+    HAL_Delay(10); /* Ts = 10ms — khớp với FOC_Init Ts=0.01f */
   }
   /* USER CODE END 3 */
 }

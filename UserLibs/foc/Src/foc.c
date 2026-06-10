@@ -289,6 +289,30 @@ void FOC_Start(FOC_Handle_t *hfoc)
     hfoc->enabled = 1;
 }
 
+void FOC_AlignD(FOC_Handle_t *hfoc, float Vd)
+{
+    if (!hfoc->enabled) return;
+
+    /* Áp điện áp vào trục D (từ thông) và Vq = 0 (không tạo torque quay ngoài)
+     * Góc điện = 0 (D-axis absolute) */
+    hfoc->Vd_ref = _clamp(Vd, 0.0f, hfoc->voltage_limit);
+    hfoc->Vq_ref = 0.0f;
+    hfoc->angle_elec = 0.0f;
+
+    FOC_DQ_t dq_ref = { hfoc->Vd_ref, hfoc->Vq_ref };
+    hfoc->V_ab = FOC_InvPark(dq_ref, hfoc->angle_elec);
+
+    float ua_c, ub_c, uc_c;
+    FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
+
+    float inv_vmax = 1.0f / hfoc->voltage_limit;
+    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
+    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
+    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
+
+    _apply_pwm(hfoc, ua, ub, uc);
+}
+
 void FOC_CalibrateAngle(FOC_Handle_t *hfoc, float current_angle_mech)
 {
     /* Khi rotor đang được giữ ở điện áp Vd và Iq=0,
@@ -312,15 +336,106 @@ void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq)
 {
     if (!hfoc->enabled) return;
 
-    /* Tự tăng góc điện theo vận tốc yêu cầu */
     hfoc->angle_elec += velocity_elec_rad_s * hfoc->Ts;
     hfoc->angle_elec  = _normalize_angle(hfoc->angle_elec);
 
-    /* Cập nhật Vq (clamp trong giới hạn an toàn) */
     hfoc->Vq_ref = _clamp(Vq, -hfoc->voltage_limit, hfoc->voltage_limit);
     hfoc->Vd_ref = 0.0f;
 
-    /* Áp vector điện áp theo góc điện hiện tại */
+    FOC_DQ_t dq_ref = { hfoc->Vd_ref, hfoc->Vq_ref };
+    hfoc->V_ab = FOC_InvPark(dq_ref, hfoc->angle_elec);
+
+    float ua_c, ub_c, uc_c;
+    FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
+
+    float inv_vmax = 1.0f / hfoc->voltage_limit;
+    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
+    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
+    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
+
+    _apply_pwm(hfoc, ua, ub, uc);
+}
+
+/* ===========================================================================
+ * Closed-loop Velocity Control
+ * =========================================================================== */
+
+/**
+ * @brief  Tính 1 bước LPF bậc 1
+ *         y[n] = α * y[n-1] + (1-α) * x[n]
+ */
+float FOC_LPF_Update(FOC_LPF_t *lpf, float input)
+{
+    lpf->output = lpf->alpha * lpf->output + (1.0f - lpf->alpha) * input;
+    return lpf->output;
+}
+
+void FOC_SetLPF_Vel(FOC_Handle_t *hfoc, float alpha)
+{
+    hfoc->lpf_vel.alpha  = _clamp(alpha, 0.0f, 0.9999f);
+    hfoc->lpf_vel.output = 0.0f;
+}
+
+void FOC_SetPID_Vel(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
+                    float out_min, float out_max)
+{
+    hfoc->pid_vel.Kp         = Kp;
+    hfoc->pid_vel.Ki         = Ki;
+    hfoc->pid_vel.Kd         = Kd;
+    hfoc->pid_vel.output_min = out_min;
+    hfoc->pid_vel.output_max = out_max;
+    FOC_PID_Reset(&hfoc->pid_vel);
+}
+
+/**
+ * @brief  Closed-loop velocity control — 1 chu kỳ điều khiển
+ *
+ * Bước 1: Ước lượng tốc độ cơ học từ encoder (vi phân góc)
+ *   vel_raw = (angle_now - angle_prev) / Ts
+ *   Xử lý wrap-around: nếu ∆θ > π thì ∆θ -= 2π (và ngược lại)
+ *
+ * Bước 2: Lọc nhiễu qua LPF
+ *   vel_filtered = α * vel_filtered_prev + (1-α) * vel_raw
+ *
+ * Bước 3: PID vòng tốc độ → Vq
+ *   error = target_vel - vel_filtered
+ *   Vq = Kp*error + Ki*∫error*dt + Kd*d(error)/dt
+ *
+ * Bước 4: FOC transforms → PWM (dùng góc encoder thực)
+ *   angle_elec = angle_mech * pole_pairs - offset
+ *   InvPark(Vd=0, Vq) → Vα,Vβ → InvClarke → Ua,Ub,Uc → PWM
+ */
+void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
+                     float target_vel_rad_s)
+{
+    if (!hfoc->enabled) return;
+
+    /* --- Bước 1: Tính tốc độ cơ học thô (vi phân góc) --- */
+    float d_angle = angle_mech_rad - hfoc->prev_angle_mech;
+
+    /* Xử lý wrap-around (encoder nhảy qua 0/2π) */
+    if (d_angle >  FOC_PI)  d_angle -= FOC_TWO_PI;
+    if (d_angle < -FOC_PI)  d_angle += FOC_TWO_PI;
+
+    float vel_raw = d_angle / hfoc->Ts;  /* [rad/s] cơ học */
+    hfoc->prev_angle_mech = angle_mech_rad;
+
+    /* --- Bước 2: Lọc LPF --- */
+    hfoc->velocity_mech = FOC_LPF_Update(&hfoc->lpf_vel, vel_raw);
+
+    /* --- Bước 3: PID vòng tốc độ → Vq --- */
+    float vel_error = target_vel_rad_s - hfoc->velocity_mech;
+    float Vq = FOC_PID_Update(&hfoc->pid_vel, vel_error, hfoc->Ts);
+
+    hfoc->Vq_ref = Vq;  /* đã clamp trong PID */
+    hfoc->Vd_ref = 0.0f;
+
+    /* --- Bước 4: Cập nhật góc điện từ encoder --- */
+    float elec = angle_mech_rad * (float)hfoc->pole_pairs - hfoc->angle_offset;
+    hfoc->angle_mech = angle_mech_rad;
+    hfoc->angle_elec = _normalize_angle(elec);
+
+    /* --- Bước 5: FOC transforms → PWM --- */
     FOC_DQ_t dq_ref = { hfoc->Vd_ref, hfoc->Vq_ref };
     hfoc->V_ab = FOC_InvPark(dq_ref, hfoc->angle_elec);
 

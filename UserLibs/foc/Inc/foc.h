@@ -61,16 +61,27 @@ extern "C" {
  * Cấu trúc PID Controller
  * =========================================================================== */
 typedef struct {
-    float Kp;           /*!< Hệ số tỉ lệ */
-    float Ki;           /*!< Hệ số tích phân */
-    float Kd;           /*!< Hệ số vi phân */
-
-    float integral;     /*!< Tích lũy tích phân */
-    float prev_error;   /*!< Sai số lần trước (cho vi phân) */
-
-    float output_min;   /*!< Giới hạn output tối thiểu (anti-windup) */
-    float output_max;   /*!< Giới hạn output tối đa (anti-windup) */
+    float Kp;
+    float Ki;
+    float Kd;
+    float integral;
+    float prev_error;
+    float output_min;
+    float output_max;
 } FOC_PID_t;
+
+/* ===========================================================================
+ * Cấu trúc Low-Pass Filter (LPF) — lọc nhiễu tốc độ encoder
+ *
+ * Công thức: y[n] = α * y[n-1] + (1-α) * x[n]
+ *   α gần 1 = lọc nhiều, chậm theo (dùng khi nhiễu lớn)
+ *   α gần 0 = lọc ít, nhanh theo (dùng khi muốn đáp ứng nhanh)
+ *   Khuyến nghị: 0.85 – 0.95 cho bước lấy mẫu 10ms
+ * =========================================================================== */
+typedef struct {
+    float alpha;   /*!< Hệ số lọc: 0 < α < 1 */
+    float output;  /*!< Giá trị đã lọc (khởi tạo = 0) */
+} FOC_LPF_t;
 
 /* ===========================================================================
  * Cấu trúc trạng thái tọa độ αβ (stationary frame)
@@ -93,37 +104,43 @@ typedef struct {
  * =========================================================================== */
 typedef struct {
     /* --- Phần cứng PWM --- */
-    TIM_HandleTypeDef *htim;     /*!< Con trỏ TIM handle của HAL */
-    uint32_t ch_a;               /*!< TIM Channel pha A (TIM_CHANNEL_1) */
-    uint32_t ch_b;               /*!< TIM Channel pha B (TIM_CHANNEL_2) */
-    uint32_t ch_c;               /*!< TIM Channel pha C (TIM_CHANNEL_3) */
-    float    pwm_period;         /*!< Giá trị ARR của Timer (ví dụ: 4249.0f) */
+    TIM_HandleTypeDef *htim;
+    uint32_t ch_a;
+    uint32_t ch_b;
+    uint32_t ch_c;
+    float    pwm_period;
 
     /* --- Thông số động cơ --- */
-    uint8_t  pole_pairs;         /*!< Số cặp cực (pole pairs). Ví dụ: 7 */
-    float    voltage_supply;     /*!< Điện áp cấp nguồn [V] (dùng để normalize) */
-    float    voltage_limit;      /*!< Điện áp tối đa cho phép [V] (bảo vệ motor) */
+    uint8_t  pole_pairs;
+    float    voltage_supply;
+    float    voltage_limit;
 
     /* --- Góc điện --- */
-    float angle_mech;            /*!< Góc cơ học từ encoder [rad], 0 đến 2π */
-    float angle_elec;            /*!< Góc điện = angle_mech * pole_pairs [rad] */
-    float angle_offset;          /*!< Offset hiệu chỉnh góc 0 (zero angle) [rad] */
+    float angle_mech;
+    float angle_elec;
+    float angle_offset;
+
+    /* --- Ước lượng tốc độ từ encoder --- */
+    float prev_angle_mech;   /*!< Góc cơ lần trước [rad] — dùng tính vi phân */
+    float velocity_mech;     /*!< Tốc độ cơ học đã lọc LPF [rad/s] */
+    FOC_LPF_t lpf_vel;       /*!< Bộ lọc LPF cho tín hiệu tốc độ */
 
     /* --- Setpoint điều khiển --- */
-    float Vd_ref;                /*!< Điện áp trục d mong muốn [V] (thường = 0) */
-    float Vq_ref;                /*!< Điện áp trục q mong muốn [V] (= torque) */
+    float Vd_ref;
+    float Vq_ref;
 
     /* --- Trạng thái biến đổi tọa độ --- */
-    FOC_AlphaBeta_t V_ab;        /*!< Điện áp αβ sau Park Inverse */
-    FOC_DQ_t        V_dq;        /*!< Điện áp dq (output của PID) */
+    FOC_AlphaBeta_t V_ab;
+    FOC_DQ_t        V_dq;
 
     /* --- PID Controllers --- */
-    FOC_PID_t pid_d;             /*!< PID trục d (điều khiển từ thông) */
-    FOC_PID_t pid_q;             /*!< PID trục q (điều khiển moment) */
+    FOC_PID_t pid_d;    /*!< PID trục d (từ thông, thường Kp=0) */
+    FOC_PID_t pid_q;    /*!< PID trục q (moment) */
+    FOC_PID_t pid_vel;  /*!< PID vòng tốc độ: vel_error → Vq */
 
     /* --- Trạng thái vòng lặp --- */
-    float Ts;                    /*!< Chu kỳ lấy mẫu [s] */
-    uint8_t enabled;             /*!< 1 = FOC đang chạy, 0 = dừng (PWM = 50%) */
+    float Ts;
+    uint8_t enabled;
 } FOC_Handle_t;
 
 /* ===========================================================================
@@ -250,25 +267,92 @@ float FOC_PID_Update(FOC_PID_t *pid, float error, float Ts);
 void FOC_PID_Reset(FOC_PID_t *pid);
 
 /**
- * @brief  Chạy open-loop velocity: quét góc điện liên tục không cần encoder
+ * @brief  Căn chỉnh góc encoder-rotor (Alignment sequence)
  *
- * Đây là chế độ dùng để:
- *   1. Test motor lần đầu (không cần encoder hoạt động)
- *   2. Làm điểm khởi đầu trước khi chuyển sang closed-loop
+ * ĐÂY LÀ BƯỚC BẮT BUỘC trước khi chạy closed-loop FOC.
+ * Không có alignment → angle_elec sai → FOC áp lực sai hướng → rung + nóng.
  *
  * Nguyên lý:
- *   - Tự tăng theta_elec với tốc độ velocity_elec_rad_s mỗi chu kỳ Ts
- *   - Áp vector điện áp (Vd=0, Vq) theo góc đó → tạo từ trường quay
- *   - Motor sẽ đồng bộ theo từ trường (như stepper motor)
+ *   - Áp Vd tại theta_elec = 0 (KHÔNG dùng encoder)
+ *   - Vd kéo rotor về vị trí D-axis tuyệt đối (phụ thuộc vật lý motor)
+ *   - Sau khi rotor ổn định, đọc encoder → đó chính là góc "D-axis"
+ *   - Gọi FOC_CalibrateAngle() với góc đó để lưu offset
  *
- * @param  hfoc              Con trỏ FOC_Handle_t
- * @param  velocity_elec_rad_s  Tốc độ góc ĐIỆN [rad/s]
- *                              = tốc độ cơ học [rad/s] × pole_pairs
- *                              Ví dụ: 10.0f rad/s điện ≈ 1.4 rad/s cơ (7 cặp cực)
- * @param  Vq                Điện áp trục q [V] (tỉ lệ với lực kéo)
- *                           Bắt đầu nhỏ (0.3–0.5V), tăng dần nếu motor trượt bước
+ * Quy trình sử dụng trong main.c:
+ *   1. Gọi FOC_AlignD() lặp lại trong ~500ms (rotor kéo về vị trí)
+ *   2. Đọc encoder.angle_rad
+ *   3. Gọi FOC_CalibrateAngle(&foc, encoder.angle_rad)
+ *   4. Khởi động velocity control bình thường
+ *
+ * @param  hfoc  Con trỏ FOC_Handle_t
+ * @param  Vd    Điện áp căn chỉnh [V] — dùng 0.3×voltage_limit đến voltage_limit
+ *               Đủ lớn để kéo rotor nhưng không gây quá nhiệt
+ */
+void FOC_AlignD(FOC_Handle_t *hfoc, float Vd);
+
+/**
+ * @brief  Chạy open-loop velocity (giữ lại để test ban đầu)
  */
 void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq);
+
+/* ===========================================================================
+ * API Closed-loop Velocity Control (bộ lọc tốc độ + PID)
+ * =========================================================================== */
+
+/**
+ * @brief  Tính 1 bước LPF
+ * @param  lpf    Con trỏ FOC_LPF_t
+ * @param  input  Giá trị đầu vào thô (tốc độ chưa lọc [rad/s])
+ * @retval Giá trị đã lọc [rad/s]
+ */
+float FOC_LPF_Update(FOC_LPF_t *lpf, float input);
+
+/**
+ * @brief  Cài hệ số LPF cho bộ lọc tốc độ
+ * @param  alpha  Hệ số [0.0, 1.0]:
+ *                0.9 = lọc mạnh (dùng khi nhiễu lớn, encoder rung)
+ *                0.7 = lọc vừa (đáp ứng nhanh hơn)
+ */
+void FOC_SetLPF_Vel(FOC_Handle_t *hfoc, float alpha);
+
+/**
+ * @brief  Cấu hình PID vòng tốc độ (velocity loop)
+ * @param  Kp/Ki/Kd    Hệ số PID
+ * @param  out_min/max Giới hạn Vq output [V] — thường = ±voltage_limit
+ *
+ * Điểm khởi đầu điều chỉnh:
+ *   Kp = 0.05 ~ 0.3  (tăng nếu đáp ứng chậm, giảm nếu dao động)
+ *   Ki = 0.01 ~ 0.1  (tăng để triệt sai số xác lập, giảm nếu rung)
+ *   Kd = 0            (thường không cần, thêm nếu overshoot nhiều)
+ */
+void FOC_SetPID_Vel(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
+                    float out_min, float out_max);
+
+/**
+ * @brief  Chạy 1 chu kỳ Closed-loop Velocity Control
+ *
+ * Pipeline đầy đủ:
+ *
+ *   [Encoder angle] ──> dθ/dt ──> LPF ──> velocity_mech
+ *                                              │
+ *                              (target - velocity_mech)
+ *                                              │
+ *                                           PID_vel
+ *                                              │ Vq
+ *                                         InvPark(Vd=0,Vq)
+ *                                              │ Vα,Vβ
+ *                                         InvClarke
+ *                                              │ Ua,Ub,Uc
+ *                                            PWM
+ *
+ * @param  hfoc              Con trỏ FOC_Handle_t (đã FOC_Start())
+ * @param  angle_mech_rad    Góc cơ học từ encoder [rad], range [0, 2π)
+ * @param  target_vel_rad_s  Tốc độ cơ học mục tiêu [rad/s]
+ *                           Dương = chiều thuận, Âm = ngược chiều
+ *                           Ví dụ: 2*PI ≈ 1 vòng/giây
+ */
+void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
+                     float target_vel_rad_s);
 
 #ifdef __cplusplus
 }
