@@ -51,6 +51,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     UserLibs/mpu6050/Src/mpu6050.c
     UserLibs/encoder_as5048a/Src/as5048a.c
     UserLibs/foc/Src/foc.c
+    UserLibs/imu_filter/Src/imu_filter.c
 )
 
 # Add include paths
@@ -61,6 +62,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     UserLibs/mpu6050/Inc
     UserLibs/encoder_as5048a/Inc
     UserLibs/foc/Inc
+    UserLibs/imu_filter/Inc
 )
 
 # Add project symbols (macros)
