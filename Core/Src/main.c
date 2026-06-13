@@ -135,8 +135,8 @@ int main(void) {
    */
   FOC_Init(&foc, &htim2, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
            4249.0f, /* PWM Period (ARR) */
-           7,       /* Số cặp cực - chỉnh theo motor */
-           0.05f,   /* voltage_limit [V] */
+           7,       /* 12N14P = 7 cặp cực */
+           0.5f,    /* voltage_limit [V] - Bắt đầu 1.0V, tăng dần nếu cần lực hơn */
            0.01f);  /* Ts = 10ms */
 
   /* --- Khởi tạo MPU6050 --- */
@@ -183,22 +183,24 @@ int main(void) {
    * Tăng Kp nếu motor phản ứng quá chậm
    * Tăng Ki nếu tốc độ bị sai số xác lập (không đạt setpoint)
    * Thêm Kd nếu có overshoot */
-  FOC_SetPID_Vel(&foc, 0.008f, /* Kp */
-                 0.004f,       /* Ki */
+  /* PID vòng vận tốc (vòng trong)
+   * output_min/max phải bằng ±voltage_limit để PID có thể dùng toàn dải điện áp.
+   * Kp=0.05: điểm khởi đầu an toàn cho motor 160KV, tăng dần nếu phản ứng chậm */
+  FOC_SetPID_Vel(&foc, 0.05f,  /* Kp - tăng dần nếu motor phản ứng chậm */
+                 0.01f,        /* Ki - giữ nhỏ để tránh windup */
                  0.0f,         /* Kd */
-                 -foc.voltage_limit, foc.voltage_limit);
+                 -foc.voltage_limit, foc.voltage_limit); /* PHẢI = ±voltage_limit */
 
   /* --- Cấu hình PID vòng ngoài (Vị trí góc Pitch) ---
-   * Động cơ 12N14P 160KV (Mô-men xoắn cao, quay chậm). Rất lý tưởng cho gimbal.
-   * Kp = 5.0: Cứ lệch 1 radian (57 độ) thì yêu cầu quay 5 rad/s
-   * Tăng Kp để gimbal giữ cứng hơn, nhưng nếu quá cao sẽ bị rít / rung.
-   * Có thể thêm Kd (~0.1) để giảm dao động (overshoot).
+   * Kp=2.0: Lệch 1 radian (57 độ) → yêu cầu motor quay 2 rad/s (~0.3 vòng/s).
+   * Giá trị này an toàn cho Ts=10ms. Tăng dần lên 3-5 nếu gimbal giữ chưa cứng.
+   * output_min/max = ±10 rad/s: giới hạn tốc độ điều chỉnh tối đa của gimbal.
    */
-  pid_pitch.Kp = 5.0f;  
-  pid_pitch.Ki = 0.0f;  
-  pid_pitch.Kd = 0.0f;  
-  pid_pitch.output_min = -30.0f; /* Giới hạn tốc độ tối đa của Gimbal (rad/s) */
-  pid_pitch.output_max = 30.0f;
+  pid_pitch.Kp = 2.0f;
+  pid_pitch.Ki = 0.0f;
+  pid_pitch.Kd = 0.0f;
+  pid_pitch.output_min = -10.0f;
+  pid_pitch.output_max = 10.0f;
   FOC_PID_Reset(&pid_pitch);
 
   FOC_Start(&foc);
@@ -249,7 +251,7 @@ int main(void) {
         pitch_angle = ahrs.pitch * (180.0f / PI);
 
         // Có thể mở comment dòng dưới để in ra Serial Monitor xem góc có chính xác không
-        printf("[IMU] Pitch: %.2f deg | GyroY: %.2f\r\n", pitch_angle, imu.gyro_y);
+        // printf("[IMU] Pitch: %.2f deg | GyroY: %.2f\r\n", pitch_angle, imu.gyro_y);
       }
     }
 
@@ -276,9 +278,11 @@ int main(void) {
         // Giải pháp: Bạn chỉ cần thêm dấu trừ: target_vel_rad_s = -target_vel_rad_s;
         FOC_RunVelocity(&foc, encoder.angle_rad, target_vel_rad_s);
 
-        /* Log để quan sát (có thể tắt để cải thiện timing) */
-        // printf("[VEL] set=%.2f | meas=%.2f | Vq=%.3f | angle=%.1f\r\n",
-        //        target_vel, foc.velocity_mech, foc.Vq_ref, encoder.angle_deg);
+        /* Log để quan sát — TẮT KHI CHẠY THẬT vì printf rất chậm (~1-5ms/lần).
+         * Với Ts=10ms, printf ăn hết >50% thời gian, khiến vòng điều khiển mất ổn định.
+         * Chỉ bật để debug, sau đó comment lại ngay! */
+        // printf("[GIMBAL] pitch=%.1f | vel_set=%.2f | vel_meas=%.2f | Vq=%.3f\r\n",
+        //        pitch_angle, target_vel_rad_s, foc.velocity_mech, foc.Vq_ref);
       }
     }
 
