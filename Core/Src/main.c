@@ -27,13 +27,14 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "as5048a.h"
+#include "examples.h"
 #include "foc.h"
+#include "imu_filter.h"
 #include "math.h"
 #include "mpu6050.h"
-#include "imu_filter.h"
 #include "stdint.h"
 #include "stdio.h"
-#include "examples.h"
+
 
 /* USER CODE END Includes */
 
@@ -120,40 +121,70 @@ int main(void) {
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
 
-  // ExampleConfig_t ex_cfg = EXAMPLE_DEFAULT_CONFIG;
-  // Example_Init(&foc, &ex_cfg);
+  /* --- Khởi động PWM 3 pha --- */
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
+
+  /* PC6: Enable driver (nếu có gate driver) */
+  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
+
   // --- KHỞI TẠO FOC ---
   FOC_Init(&foc, &htim2, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
-           4249.0f, 7, 1.0f, 0.01f);
- 
+           4249.0f, /* PWM Period (ARR) */
+           7,       /* 12N14P = 7 cặp cực */
+           0.5f,   /* voltage_limit [V] - tăng dần nếu motor không xoay */
+           0.01f); /* Ts = 10ms - PHẢI khớp với HAL_Delay(10) */
+
   // --- KHỞI TẠO MPU6050 ---
   if (MPU6050_Init(&imu, &hi2c3, MPU6050_ADDR_LOW) == MPU6050_OK) {
-      imu_ready = 1;
-      MPU6050_CalibrateGyro(&imu, 500);
-      Mahony_Init(&ahrs, 1.5f, 0.005f);
+    imu_ready = 1;
+    MPU6050_CalibrateGyro(&imu, 500);
+    printf("[MPU6050] Calibrate xong! Offset X:%.2f, Y:%.2f, Z:%.2f\r\n",
+           imu.gyro_offset_x, imu.gyro_offset_y, imu.gyro_offset_z);
+    Mahony_Init(&ahrs, 1.5f, 0.005f);
+  } else {
+    printf("[MPU6050] Loi khoi tao!\r\n");
   }
- 
+
   // --- KHỞI TẠO AS5048A ---
-  if (AS5048A_Init(&encoder, &hspi1, GPIOC, GPIO_PIN_4) == AS5048A_OK) {
+  {
+    AS5048A_Status_t enc_ret =
+        AS5048A_Init(&encoder, &hspi1, GPIOC, GPIO_PIN_4);
+    printf("[AS5048A_Init] ma tra ve = %d "
+           "(0=OK, 1=SPI_ERR, 2=PARITY_ERR, 3=EF, 4=CORDIC)\r\n",
+           enc_ret);
+
+    if (enc_ret == AS5048A_OK) {
       encoder_ready = 1;
+      AS5048A_ReadDiagnostics(&encoder);
+      printf("[AS5048A] AGC=%u | CompH=%u CompL=%u | COF=%u | OCF=%u\r\n",
+             encoder.agc_value, encoder.comp_high, encoder.comp_low,
+             encoder.cordic_overflow, encoder.offset_comp_finished);
+    }
   }
- 
+
   // --- CẤU HÌNH PID & LPF ---
-  FOC_SetLPF_Vel(&foc, 0.9f);
-  FOC_SetPID_Vel(&foc, 0.05f, 0.01f, 0.0f, -foc.voltage_limit, foc.voltage_limit);
-  pid_pitch.Kp=2.0f; 
-  pid_pitch.Ki=0.0f; 
-  pid_pitch.Kd=0.0f;
-  pid_pitch.output_min=-10.0f; 
-  pid_pitch.output_max=10.0f;
+  // LPF alpha=0.85: lọc vừa đủ, phản ứng nhanh hơn alpha=0.9
+  FOC_SetLPF_Vel(&foc, 0.85f);
+  FOC_SetPID_Vel(&foc, 0.1f, 0.01f, 0.0f, -foc.voltage_limit, foc.voltage_limit);
+
+  pid_pitch.Kp = 2.0f;
+  pid_pitch.Ki = 0.0f;
+  pid_pitch.Kd = 0.0f;
+  pid_pitch.output_min = -10.0f;
+  pid_pitch.output_max = 10.0f;
   FOC_PID_Reset(&pid_pitch);
- 
+
   // --- ALIGNMENT ---
   FOC_Start(&foc);
-  for (int i=0; i<50; i++) { FOC_AlignD(&foc, foc.voltage_limit); HAL_Delay(10); }
-  if (AS5048A_ReadAngle(&encoder)==AS5048A_OK) {
-      FOC_CalibrateAngle(&foc, encoder.angle_rad);
-      foc.prev_angle_mech = encoder.angle_rad;
+  for (int i = 0; i < 50; i++) {
+    FOC_AlignD(&foc, foc.voltage_limit);
+    HAL_Delay(10);
+  }
+  if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
+    FOC_CalibrateAngle(&foc, encoder.angle_rad);
+    foc.prev_angle_mech = encoder.angle_rad;
   }
 
   /* USER CODE END 2 */
@@ -167,14 +198,15 @@ int main(void) {
     // BƯỚC 2: Đọc IMU
     if (imu_ready) {
       if (MPU6050_ReadAll(&imu) == MPU6050_OK) {
-        float gx = imu.gyro_x * (PI/180.0f);
-        float gy = imu.gyro_y * (PI/180.0f);
-        float gz = imu.gyro_z * (PI/180.0f);
-        Mahony_Update(&ahrs, gx, gy, gz, imu.accel_x, imu.accel_y, imu.accel_z, 0.01f);
+        float gx = imu.gyro_x * (PI / 180.0f);
+        float gy = imu.gyro_y * (PI / 180.0f);
+        float gz = imu.gyro_z * (PI / 180.0f);
+        Mahony_Update(&ahrs, gx, gy, gz, imu.accel_x, imu.accel_y, imu.accel_z,
+                      0.01f);
         pitch_angle = ahrs.pitch * (180.0f / PI);
       }
     }
-  
+
     // BƯỚC 3 & 4: Cascade PID Gimbal
     float target_pitch_angle = 0.0f;
     float pitch_error_rad = (target_pitch_angle - pitch_angle) * (PI / 180.0f);
@@ -182,8 +214,9 @@ int main(void) {
     if (encoder_ready) {
       if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
         FOC_RunVelocity(&foc, encoder.angle_rad, target_vel_rad_s);
-        // printf("[GIMBAL] pitch=%.1f | vel_set=%.2f | vel_meas=%.2f | Vq=%.3f\r\n",
-        //        pitch_angle, target_vel_rad_s, foc.velocity_mech, foc.Vq_ref);
+        printf(
+            "[GIMBAL] pitch=%.1f | vel_set=%.2f | vel_meas=%.2f | Vq=%.3f\r\n",
+            pitch_angle, target_vel_rad_s, foc.velocity_mech, foc.Vq_ref);
       }
     }
     HAL_Delay(10);
