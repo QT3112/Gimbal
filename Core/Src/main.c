@@ -167,7 +167,7 @@ int main(void) {
   // --- CẤU HÌNH PID & LPF ---
   // LPF alpha=0.85: lọc vừa đủ, phản ứng nhanh hơn alpha=0.9
   FOC_SetLPF_Vel(&foc, 0.85f);
-  FOC_SetPID_Vel(&foc, 0.1f, 0.01f, 0.0f, -foc.voltage_limit, foc.voltage_limit);
+  FOC_SetPID_Vel(&foc, 0.05f, 0.01f, 0.0f, -foc.voltage_limit, foc.voltage_limit);
 
   pid_pitch.Kp = 2.0f;
   pid_pitch.Ki = 0.0f;
