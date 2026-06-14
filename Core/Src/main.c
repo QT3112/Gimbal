@@ -33,6 +33,7 @@
 #include "imu_filter.h"
 #include "stdint.h"
 #include "stdio.h"
+#include "examples.h"
 
 /* USER CODE END Includes */
 
@@ -119,112 +120,42 @@ int main(void) {
   MX_SPI1_Init();
   /* USER CODE BEGIN 2 */
 
-  /* --- Khởi động PWM 3 pha --- */
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-
-  /* PC6: Enable driver (nếu có gate driver) */
-  HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
-
-  /* --- Khởi tạo FOC ---
-   * TIM2: 3 kênh PWM, PWM_PERIOD=4249
-   * Pole pairs: 7 (thay đổi theo động cơ thực tế)
-   * voltage_limit: 1.0V (giảm nếu motor nóng)
-   * Ts: 0.01s (khớp với HAL_Delay(10) trong vòng lặp)
-   */
+  // ExampleConfig_t ex_cfg = EXAMPLE_DEFAULT_CONFIG;
+  // Example_Init(&foc, &ex_cfg);
+  // --- KHỞI TẠO FOC ---
   FOC_Init(&foc, &htim2, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
-           4249.0f, /* PWM Period (ARR) */
-           7,       /* 12N14P = 7 cặp cực */
-           0.5f,    /* voltage_limit [V] - Bắt đầu 1.0V, tăng dần nếu cần lực hơn */
-           0.01f);  /* Ts = 10ms */
-
-  /* --- Khởi tạo MPU6050 --- */
-  printf("[MPU6050] Dang khoi tao...\r\n");
+           4249.0f, 7, 1.0f, 0.01f);
+ 
+  // --- KHỞI TẠO MPU6050 ---
   if (MPU6050_Init(&imu, &hi2c3, MPU6050_ADDR_LOW) == MPU6050_OK) {
-    imu_ready = 1;
-    printf("[MPU6050] OK! Dang calibrate gyro (vui long de yen)...\r\n");
-    MPU6050_CalibrateGyro(&imu, 500); // Lấy 500 mẫu
-    printf("[MPU6050] Calibrate xong! Offset X:%.2f, Y:%.2f, Z:%.2f\r\n",
-           imu.gyro_offset_x, imu.gyro_offset_y, imu.gyro_offset_z);
-
-    /* Khởi tạo bộ lọc Mahony AHRS */
-    Mahony_Init(&ahrs, 1.5f, 0.005f); // Kp=1.5, Ki=0.005 để hội tụ khá nhanh
-  } else {
-    printf("[MPU6050] Loi khoi tao!\r\n");
+      imu_ready = 1;
+      MPU6050_CalibrateGyro(&imu, 500);
+      Mahony_Init(&ahrs, 1.5f, 0.005f);
   }
-
-  /* --- Khởi tạo AS5048A Encoder --- */
-  {
-    AS5048A_Status_t enc_ret =
-        AS5048A_Init(&encoder, &hspi1, GPIOC, GPIO_PIN_4);
-    printf("[AS5048A_Init] ma tra ve = %d "
-           "(0=OK, 1=SPI_ERR, 2=PARITY_ERR, 3=EF, 4=CORDIC)\r\n",
-           enc_ret);
-
-    if (enc_ret == AS5048A_OK) {
+ 
+  // --- KHỞI TẠO AS5048A ---
+  if (AS5048A_Init(&encoder, &hspi1, GPIOC, GPIO_PIN_4) == AS5048A_OK) {
       encoder_ready = 1;
-      AS5048A_ReadDiagnostics(&encoder);
-      printf("[AS5048A] AGC=%u | CompH=%u CompL=%u | COF=%u | OCF=%u\r\n",
-             encoder.agc_value, encoder.comp_high, encoder.comp_low,
-             encoder.cordic_overflow, encoder.offset_comp_finished);
-    }
   }
-
-  /* Bật FOC - sẵn sàng chạy closed-loop */
-  /* --- Cấu hình bộ lọc tốc độ (LPF) ---
-   * alpha = 0.9: lọc mạnh, phù hợp cho Ts=10ms
-   * Giảm alpha (0.7~0.8) nếu muốn đáp ứng nhanh hơn */
+ 
+  // --- CẤU HÌNH PID & LPF ---
   FOC_SetLPF_Vel(&foc, 0.9f);
-
-  /* --- Cấu hình PID vòng tốc độ ---
-   * Điểm khởi đầu an toàn: Kp nhỏ, Ki nhỏ
-   * Output clamp trong ±voltage_limit để bảo vệ motor
-   * Tăng Kp nếu motor phản ứng quá chậm
-   * Tăng Ki nếu tốc độ bị sai số xác lập (không đạt setpoint)
-   * Thêm Kd nếu có overshoot */
-  /* PID vòng vận tốc (vòng trong)
-   * output_min/max phải bằng ±voltage_limit để PID có thể dùng toàn dải điện áp.
-   * Kp=0.05: điểm khởi đầu an toàn cho motor 160KV, tăng dần nếu phản ứng chậm */
-  FOC_SetPID_Vel(&foc, 0.05f,  /* Kp - tăng dần nếu motor phản ứng chậm */
-                 0.01f,        /* Ki - giữ nhỏ để tránh windup */
-                 0.0f,         /* Kd */
-                 -foc.voltage_limit, foc.voltage_limit); /* PHẢI = ±voltage_limit */
-
-  /* --- Cấu hình PID vòng ngoài (Vị trí góc Pitch) ---
-   * Kp=2.0: Lệch 1 radian (57 độ) → yêu cầu motor quay 2 rad/s (~0.3 vòng/s).
-   * Giá trị này an toàn cho Ts=10ms. Tăng dần lên 3-5 nếu gimbal giữ chưa cứng.
-   * output_min/max = ±10 rad/s: giới hạn tốc độ điều chỉnh tối đa của gimbal.
-   */
-  pid_pitch.Kp = 2.0f;
-  pid_pitch.Ki = 0.0f;
-  pid_pitch.Kd = 0.0f;
-  pid_pitch.output_min = -10.0f;
-  pid_pitch.output_max = 10.0f;
+  FOC_SetPID_Vel(&foc, 0.05f, 0.01f, 0.0f, -foc.voltage_limit, foc.voltage_limit);
+  pid_pitch.Kp=2.0f; 
+  pid_pitch.Ki=0.0f; 
+  pid_pitch.Kd=0.0f;
+  pid_pitch.output_min=-10.0f; 
+  pid_pitch.output_max=10.0f;
   FOC_PID_Reset(&pid_pitch);
-
+ 
+  // --- ALIGNMENT ---
   FOC_Start(&foc);
-
-  /* --- CĂN CHỈNH GÓC ENCODER (ALIGNMENT) ---
-   * Bắt buộc thực hiện để FOC biết vị trí zero điện tuyệt đối.
-   * Nếu bỏ qua bước này, angle_elec tính sai -> áp lực sai -> motor rung/nóng
-   */
-  if (encoder_ready) {
-    printf("[ALIGN] Dang can chinh rotor...\r\n");
-    /* Giữ Vd để kéo rotor về vị trí D-axis tuyệt đối.
-     * Sử dụng voltage_limit để đảm bảo đủ lực mà không quá dòng */
-    for (int i = 0; i < 50; i++) {
-      FOC_AlignD(&foc, foc.voltage_limit);
-      HAL_Delay(10);
-    }
-
-    /* Đọc encoder sau khi rotor đã đứng yên hoàn toàn */
-    if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
+  for (int i=0; i<50; i++) { FOC_AlignD(&foc, foc.voltage_limit); HAL_Delay(10); }
+  if (AS5048A_ReadAngle(&encoder)==AS5048A_OK) {
       FOC_CalibrateAngle(&foc, encoder.angle_rad);
       foc.prev_angle_mech = encoder.angle_rad;
-      printf("[ALIGN] Xong! Offset = %.2f rad\r\n", foc.angle_offset);
-    }
   }
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -233,60 +164,29 @@ int main(void) {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
-    /* ===========================================================
-     * BƯỚC 2: Đọc IMU và ước lượng góc không gian (Attitude Estimation)
-     * =========================================================== */
+    // BƯỚC 2: Đọc IMU
     if (imu_ready) {
       if (MPU6050_ReadAll(&imu) == MPU6050_OK) {
-        // Chuyển đổi Gyro từ độ/s sang radian/s cho thuật toán Mahony
-        float gx = imu.gyro_x * (PI / 180.0f);
-        float gy = imu.gyro_y * (PI / 180.0f);
-        float gz = imu.gyro_z * (PI / 180.0f);
-
-        // Cập nhật bộ lọc Mahony với chu kỳ Ts = 0.01s (10ms)
+        float gx = imu.gyro_x * (PI/180.0f);
+        float gy = imu.gyro_y * (PI/180.0f);
+        float gz = imu.gyro_z * (PI/180.0f);
         Mahony_Update(&ahrs, gx, gy, gz, imu.accel_x, imu.accel_y, imu.accel_z, 0.01f);
-
-        // Trích xuất góc Pitch (đổi từ Radian sang Độ để dễ quan sát)
         pitch_angle = ahrs.pitch * (180.0f / PI);
-
-        // Có thể mở comment dòng dưới để in ra Serial Monitor xem góc có chính xác không
-        // printf("[IMU] Pitch: %.2f deg | GyroY: %.2f\r\n", pitch_angle, imu.gyro_y);
       }
     }
-
-    /* ===========================================================
-     * BƯỚC 3 & 4: Vòng lặp điều khiển Gimbal (Cascade PID)
-     * =========================================================== */
-    float target_pitch_angle = 0.0f; // Mục tiêu: Giữ camera luôn cân bằng ngang (0 độ)
-    
-    // 1. VÒNG LẶP NGOÀI (POSITION LOOP): Góc -> Vận tốc mục tiêu
-    // Sai số góc = Góc mục tiêu - Góc thực tế
-    float pitch_error_deg = target_pitch_angle - pitch_angle;
-    float pitch_error_rad = pitch_error_deg * (PI / 180.0f); // Chuẩn hóa về Radian
-    
-    // Đưa qua PID Vị trí -> Đầu ra là vận tốc góc mục tiêu (Target Velocity)
-    float target_vel_rad_s = FOC_PID_Update(&pid_pitch, pitch_error_rad, 0.01f); // Ts = 0.01s
-    
-    // 2. VÒNG LẶP TRONG (VELOCITY LOOP) & FOC UPDATE
+  
+    // BƯỚC 3 & 4: Cascade PID Gimbal
+    float target_pitch_angle = 0.0f;
+    float pitch_error_rad = (target_pitch_angle - pitch_angle) * (PI / 180.0f);
+    float target_vel_rad_s = FOC_PID_Update(&pid_pitch, pitch_error_rad, 0.01f);
     if (encoder_ready) {
       if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
-        // Chạy FOC: Vận tốc mục tiêu được truyền vào vòng lặp trong.
-        // LƯU Ý CHIỀU ĐỘNG CƠ:
-        // Nếu cầm gimbal nghiêng tới trước mà động cơ lại quặp xuống thêm (cùng chiều nghiêng),
-        // tức là đang bị chạy ngược (Positive Feedback).
-        // Giải pháp: Bạn chỉ cần thêm dấu trừ: target_vel_rad_s = -target_vel_rad_s;
         FOC_RunVelocity(&foc, encoder.angle_rad, target_vel_rad_s);
-
-        /* Log để quan sát — TẮT KHI CHẠY THẬT vì printf rất chậm (~1-5ms/lần).
-         * Với Ts=10ms, printf ăn hết >50% thời gian, khiến vòng điều khiển mất ổn định.
-         * Chỉ bật để debug, sau đó comment lại ngay! */
         // printf("[GIMBAL] pitch=%.1f | vel_set=%.2f | vel_meas=%.2f | Vq=%.3f\r\n",
         //        pitch_angle, target_vel_rad_s, foc.velocity_mech, foc.Vq_ref);
       }
     }
-
-    HAL_Delay(10); /* Ts = 10ms — khớp với FOC_Init Ts=0.01f */
+    HAL_Delay(10);
   }
   /* USER CODE END 3 */
 }
