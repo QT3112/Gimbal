@@ -64,6 +64,8 @@ uint8_t imu_ready = 0;
 /* --- IMU Filter --- */
 MahonyFilter_t ahrs;
 float pitch_angle = 0.0f;
+float roll_angle = 0.0f;
+float yaw_angle = 0.0f;
 
 /* --- Gimbal Angle PID --- */
 FOC_PID_t pid_pitch;
@@ -166,8 +168,8 @@ int main(void) {
 
   // --- CẤU HÌNH PID & LPF ---
   // LPF alpha=0.85: lọc vừa đủ, phản ứng nhanh hơn alpha=0.9
-  FOC_SetLPF_Vel(&foc, 0.85f);
-  FOC_SetPID_Vel(&foc, 0.05f, 0.01f, 0.0f, -foc.voltage_limit, foc.voltage_limit);
+  FOC_SetLPF_Vel(&foc, 0.9f);
+  FOC_SetPID_Vel(&foc, 0.1f, 0.01f, 0.0f, -foc.voltage_limit, foc.voltage_limit);
 
   pid_pitch.Kp = 2.0f;
   pid_pitch.Ki = 0.0f;
@@ -204,6 +206,8 @@ int main(void) {
         Mahony_Update(&ahrs, gx, gy, gz, imu.accel_x, imu.accel_y, imu.accel_z,
                       0.01f);
         pitch_angle = ahrs.pitch * (180.0f / PI);
+        roll_angle = ahrs.roll * (180.0f / PI);
+        yaw_angle = ahrs.yaw * (180.0f / PI);
       }
     }
 
@@ -215,8 +219,8 @@ int main(void) {
       if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
         FOC_RunVelocity(&foc, encoder.angle_rad, target_vel_rad_s);
         printf(
-            "[GIMBAL] pitch=%.1f | vel_set=%.2f | vel_meas=%.2f | Vq=%.3f\r\n",
-            pitch_angle, target_vel_rad_s, foc.velocity_mech, foc.Vq_ref);
+            " pitch=%.1f | roll=%.1f | yaw=%.1f | vel_set=%.2f | vel_meas=%.2f | Vq=%.3f\r\n",
+            pitch_angle, roll_angle, yaw_angle, target_vel_rad_s, foc.velocity_mech, foc.Vq_ref);
       }
     }
     HAL_Delay(10);

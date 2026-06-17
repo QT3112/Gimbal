@@ -447,8 +447,8 @@ void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
     float ua = 0.5f + ua_c * inv_vmax * 0.5f;
     float ub = 0.5f + ub_c * inv_vmax * 0.5f;
     float uc = 0.5f + uc_c * inv_vmax * 0.5f;
-    printf("target_vel=%.2f | velocity_mech=%.2f | Vq=%.2f | angle_mech=%.2f | angle_elec=%.2f | ua= %.2f | ub=%.2f | uc=%.2f \r\n", 
-        target_vel_rad_s, hfoc->velocity_mech, hfoc->Vq_ref, hfoc->angle_mech, hfoc->angle_elec, ua, ub, uc);
+    // printf("tgt_vel=%.2f | vel_mech=%.2f | Vq=%.2f | agl_mech=%.2f | agl_elec=%.2f | ua= %.2f | ub=%.2f | uc=%.2f |", 
+    //     target_vel_rad_s, hfoc->velocity_mech, hfoc->Vq_ref, hfoc->angle_mech, hfoc->angle_elec, ua, ub, uc);
 
     _apply_pwm(hfoc, ua, ub, uc);
 }
