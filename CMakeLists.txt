@@ -52,6 +52,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     UserLibs/encoder_as5048a/Src/as5048a.c
     UserLibs/foc/Src/foc.c
     UserLibs/imu_filter/Src/imu_filter.c
+    UserLibs/attitude/Src/attitude.c
     UserLibs/examples/Src/examples.c
 )
 
@@ -64,6 +65,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     UserLibs/encoder_as5048a/Inc
     UserLibs/foc/Inc
     UserLibs/imu_filter/Inc
+    UserLibs/attitude/Inc
     UserLibs/examples/Inc
 )
 

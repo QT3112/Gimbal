@@ -58,8 +58,10 @@
 
 /* USER CODE BEGIN PV */
 /* --- MPU6050 --- */
-MPU6050_Handle_t imu;
-uint8_t imu_ready = 0;
+MPU6050_Handle_t imu_frame;
+MPU6050_Handle_t imu_payload;
+uint8_t imu_frame_ready = 0;
+uint8_t imu_payload_ready = 0;
 
 /* --- IMU Filter --- */
 MahonyFilter_t ahrs;
