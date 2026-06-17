@@ -250,9 +250,54 @@ int main(void) {
         float roll_deg = roll * RAD_TO_DEG;
         float yaw_deg = yaw * RAD_TO_DEG;
 
-        // // 4. Kiểm tra dữ liệu
-        // printf("Pitch: %.2f | Roll: %.2f | Yaw: %.2f\r\n", pitch_deg, roll_deg,
-        //        yaw_deg);
+        // 4. Cascade PID Control (Điều khiển Vị trí + Vận tốc)
+        float target_pitch_angle =
+            0.0f; // Góc mong muốn của Camera (0 độ = cân bằng)
+
+        // --- Vòng ngoài (Outer Loop): Trình điều khiển Góc ---
+        // Sai số góc = Góc mong muốn - Góc thực tế (Lưu ý: phải dùng Radian)
+        float pitch_error_rad = target_pitch_angle - pitch;
+
+        // Đầu ra của vòng Góc là Tốc độ quay mong muốn (target_velocity)
+        float target_vel_rad_s =
+            FOC_PID_Update(&pid_pitch, pitch_error_rad, 0.01f);
+
+        // --- Vòng trong (Inner Loop): Trình điều khiển Vận tốc + Feedforward
+        // --- Lấy vận tốc hiện tại của camera (Feedback)
+        float cam_rate = Attitude_GetPayloadPitchRate(&att);
+
+        // Lấy vận tốc hiện tại của khung (Feedforward)
+        float frame_rate = Attitude_GetFramePitchRate(&att);
+
+        // Sai số vận tốc = Vận tốc mục tiêu - Vận tốc thực tế
+        float vel_error = target_vel_rad_s - cam_rate;
+
+        // Thêm Feedforward: Tùy chiều gắn cảm biến mà ta cộng hay trừ
+        // frame_rate. Tạm thời trừ trực tiếp frame_rate để bù nhiễu.
+        float K_ff = 1.0f; // Hệ số feedforward (từ 0.0 -> 1.0)
+        vel_error -= (K_ff * frame_rate);
+
+        // --- Cập nhật giá trị vào FOC ---
+        // Tính Điện áp trục Q (Lực kéo) từ vòng PID vận tốc của FOC
+        float Vq_ref = FOC_PID_Update(&foc.pid_vel, vel_error, 0.01f);
+
+        // Lấy góc điện từ bộ lọc Attitude (Thay thế hoàn toàn Encoder)
+        foc.angle_elec =
+            Attitude_GetElecAngle(&att, foc.pole_pairs, foc.angle_offset);
+
+        // Bơm lệnh điện áp (Vd = 0, Vq = Vq_ref)
+        FOC_SetVoltage(&foc, 0.0f, Vq_ref);
+
+        // Tính toán SVPWM và xuất ra các kênh Timer
+        FOC_Update(&foc);
+
+        // 5. Kiểm tra dữ liệu qua UART (Tần suất thấp để không block vòng lặp)
+        static int print_cnt = 0;
+        if (++print_cnt >= 10) { // Cứ 100ms in 1 lần
+          printf("Pitch: %.2f | TarVel: %.2f | MeasVel: %.2f | Vq: %.2f\r\n",
+                 pitch_deg, target_vel_rad_s, cam_rate, Vq_ref);
+          print_cnt = 0;
+        }
       }
     }
     /* USER CODE END WHILE */
