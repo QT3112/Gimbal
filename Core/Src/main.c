@@ -26,16 +26,12 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "as5048a.h"
-#include "examples.h"
+#include "attitude.h"
 #include "foc.h"
-#include "imu_filter.h"
 #include "math.h"
 #include "mpu6050.h"
 #include "stdint.h"
 #include "stdio.h"
-
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,6 +43,8 @@
 /* USER CODE BEGIN PD */
 #define PWM_PERIOD 4249.0f
 #define PI 3.14159265359f
+#define DEG_TO_RAD (PI / 180.0f)
+#define RAD_TO_DEG (180.0f / PI)
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -63,18 +61,12 @@ MPU6050_Handle_t imu_payload;
 uint8_t imu_frame_ready = 0;
 uint8_t imu_payload_ready = 0;
 
-/* --- IMU Filter --- */
-MahonyFilter_t ahrs;
-float pitch_angle = 0.0f;
-float roll_angle = 0.0f;
-float yaw_angle = 0.0f;
+/* --- Attitude Estimator --- */
+Attitude_Handle_t att;
 
-/* --- Gimbal Angle PID --- */
+/* --- Gimbal Controllers --- */
 FOC_PID_t pid_pitch;
-
-/* --- AS5048A Encoder --- */
-AS5048A_Handle_t encoder;
-uint8_t encoder_ready = 0;
+FOC_PID_t pid_vel;
 
 /* --- FOC Controller --- */
 FOC_Handle_t foc;
@@ -133,98 +125,139 @@ int main(void) {
   /* PC6: Enable driver (nếu có gate driver) */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
 
-  // --- KHỞI TẠO FOC ---
-  FOC_Init(&foc, &htim2, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
-           4249.0f, /* PWM Period (ARR) */
-           7,       /* 12N14P = 7 cặp cực */
-           0.5f,   /* voltage_limit [V] - tăng dần nếu motor không xoay */
-           0.01f); /* Ts = 10ms - PHẢI khớp với HAL_Delay(10) */
-
-  // --- KHỞI TẠO MPU6050 ---
-  if (MPU6050_Init(&imu, &hi2c3, MPU6050_ADDR_LOW) == MPU6050_OK) {
-    imu_ready = 1;
-    MPU6050_CalibrateGyro(&imu, 500);
-    printf("[MPU6050] Calibrate xong! Offset X:%.2f, Y:%.2f, Z:%.2f\r\n",
-           imu.gyro_offset_x, imu.gyro_offset_y, imu.gyro_offset_z);
-    Mahony_Init(&ahrs, 1.5f, 0.005f);
+  // --- BƯỚC 1: KHỞI TẠO MPU6050 (FRAME & PAYLOAD) ---
+  printf("Dang khoi tao IMU Frame (0x68)...\r\n");
+  if (MPU6050_Init(&imu_frame, &hi2c3, MPU6050_ADDR_LOW) == MPU6050_OK) {
+    imu_frame_ready = 1;
+    printf("[IMU Frame] Khoi tao thanh cong! Dang calibrate...\r\n");
+    MPU6050_CalibrateGyro(&imu_frame, 500);
+    printf("[IMU Frame] Calibrate xong! Offset X:%.2f, Y:%.2f, Z:%.2f\r\n",
+           imu_frame.gyro_offset_x, imu_frame.gyro_offset_y,
+           imu_frame.gyro_offset_z);
   } else {
-    printf("[MPU6050] Loi khoi tao!\r\n");
+    printf("[IMU Frame] Loi khoi tao!\r\n");
   }
 
-  // --- KHỞI TẠO AS5048A ---
-  {
-    AS5048A_Status_t enc_ret =
-        AS5048A_Init(&encoder, &hspi1, GPIOC, GPIO_PIN_4);
-    printf("[AS5048A_Init] ma tra ve = %d "
-           "(0=OK, 1=SPI_ERR, 2=PARITY_ERR, 3=EF, 4=CORDIC)\r\n",
-           enc_ret);
-
-    if (enc_ret == AS5048A_OK) {
-      encoder_ready = 1;
-      AS5048A_ReadDiagnostics(&encoder);
-      printf("[AS5048A] AGC=%u | CompH=%u CompL=%u | COF=%u | OCF=%u\r\n",
-             encoder.agc_value, encoder.comp_high, encoder.comp_low,
-             encoder.cordic_overflow, encoder.offset_comp_finished);
-    }
+  printf("Dang khoi tao IMU Payload (0x69)...\r\n");
+  if (MPU6050_Init(&imu_payload, &hi2c3, MPU6050_ADDR_HIGH) == MPU6050_OK) {
+    imu_payload_ready = 1;
+    printf("[IMU Payload] Khoi tao thanh cong! Dang calibrate...\r\n");
+    MPU6050_CalibrateGyro(&imu_payload, 500);
+    printf("[IMU Payload] Calibrate xong! Offset X:%.2f, Y:%.2f, Z:%.2f\r\n",
+           imu_payload.gyro_offset_x, imu_payload.gyro_offset_y,
+           imu_payload.gyro_offset_z);
+  } else {
+    printf("[IMU Payload] Loi khoi tao!\r\n");
   }
 
-  // --- CẤU HÌNH PID & LPF ---
-  // LPF alpha=0.85: lọc vừa đủ, phản ứng nhanh hơn alpha=0.9
+  // Khởi tạo Attitude Estimator (Mahony filter cho 2 IMU)
+  Attitude_Init(&att, 2.0f, 0.005f);
+
+  // --- BƯỚC 2: KHỞI TẠO & CĂN CHỈNH FOC ---
+  FOC_Init(&foc, &htim2, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+           4249.0f, /* PWM Period */
+           7,       /* Số cặp cực (ví dụ 12N14P -> 7) */
+           0.5f, /* Giới hạn điện áp [V] - Vd dùng để căn chỉnh */
+           0.01f); /* Ts = 10ms */
+
+  // LPF cho tốc độ vòng trong
   FOC_SetLPF_Vel(&foc, 0.9f);
-  FOC_SetPID_Vel(&foc, 0.1f, 0.01f, 0.0f, -foc.voltage_limit, foc.voltage_limit);
-
+  // Cấu hình PID vận tốc (vòng trong)
+  FOC_SetPID_Vel(&foc, 0.1f, 0.01f, 0.0f, -foc.voltage_limit,
+                 foc.voltage_limit);
+  // Cấu hình PID góc (vòng ngoài)
   pid_pitch.Kp = 2.0f;
   pid_pitch.Ki = 0.0f;
   pid_pitch.Kd = 0.0f;
-  pid_pitch.output_min = -10.0f;
+  pid_pitch.output_min = -10.0f; // max target_vel [rad/s]
   pid_pitch.output_max = 10.0f;
   FOC_PID_Reset(&pid_pitch);
 
-  // --- ALIGNMENT ---
   FOC_Start(&foc);
-  for (int i = 0; i < 50; i++) {
-    FOC_AlignD(&foc, foc.voltage_limit);
+  printf("Dang can chinh Rotor (Alignment). Vui long khong cham vao "
+         "Gimbal...\r\n");
+
+  // Khóa Rotor bằng Vd và cập nhật bộ lọc Mahony để tìm góc Offset
+  for (int i = 0; i < 100; i++) {
+    FOC_AlignD(&foc, foc.voltage_limit); // Áp điện áp Vd để khóa rotor
+
+    // Đồng thời cập nhật IMU để bộ lọc Mahony hội tụ góc
+    if (MPU6050_ReadAll(&imu_frame) == MPU6050_OK &&
+        MPU6050_ReadAll(&imu_payload) == MPU6050_OK) {
+
+      Attitude_Update(
+          &att, imu_frame.gyro_x * DEG_TO_RAD, imu_frame.gyro_y * DEG_TO_RAD,
+          imu_frame.gyro_z * DEG_TO_RAD, imu_frame.accel_x, imu_frame.accel_y,
+          imu_frame.accel_z, imu_payload.gyro_x * DEG_TO_RAD,
+          imu_payload.gyro_y * DEG_TO_RAD, imu_payload.gyro_z * DEG_TO_RAD,
+          imu_payload.accel_x, imu_payload.accel_y, imu_payload.accel_z, 0.01f);
+    }
     HAL_Delay(10);
   }
-  if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
-    FOC_CalibrateAngle(&foc, encoder.angle_rad);
-    foc.prev_angle_mech = encoder.angle_rad;
-  }
+
+  // Lưu lại góc offset (điểm zero) bằng chính góc Pitch của Camera lúc đang
+  // khóa Rotor
+  float start_pitch = Attitude_GetPayloadPitch(&att);
+  FOC_CalibrateAngle(&foc, start_pitch);
+
+  printf(
+      "Can chinh xong! Pitch ban dau: %.2f deg, Offset goc dien: %.2f rad\r\n",
+      start_pitch * RAD_TO_DEG, foc.angle_offset);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1) {
+    if (imu_frame_ready && imu_payload_ready) {
+      // 1. Đọc dữ liệu từ 2 IMU
+      if (MPU6050_ReadAll(&imu_frame) == MPU6050_OK) {
+        // Đọc IMU Frame
+        float ax1 = imu_frame.accel_x;
+        float ay1 = imu_frame.accel_y;
+        float az1 = imu_frame.accel_z;
+        float gx1 = imu_frame.gyro_x * DEG_TO_RAD;
+        float gy1 = imu_frame.gyro_y * DEG_TO_RAD;
+        float gz1 = imu_frame.gyro_z * DEG_TO_RAD;
+
+        // Đọc IMU Payload
+        MPU6050_ReadAll(&imu_payload);
+        float ax2 = imu_payload.accel_x;
+        float ay2 = imu_payload.accel_y;
+        float az2 = imu_payload.accel_z;
+        float gx2 = imu_payload.gyro_x * DEG_TO_RAD;
+        float gy2 = imu_payload.gyro_y * DEG_TO_RAD;
+        float gz2 = imu_payload.gyro_z * DEG_TO_RAD;
+
+        // printf("ax1: %.2f | ay1: %.2f | az1: %.2f | gx1: %.2f | gy1: %.2f | "
+        //        "gz1: %.2f | ax2: %.2f | ay2: %.2f | az2: %.2f | gx2: %.2f | "
+        //        "gy2: %.2f | gz2: %.2f\r\n",
+        //        ax1, ay1, az1, gx1, gy1, gz1, ax2, ay2, az2, gx2, gy2, gz2);
+
+        // 2. Cập nhật Attitude Estimator
+        // Hàm này sẽ kết hợp dữ liệu 2 IMU và tính toán attitude
+        Attitude_Update(&att, gx1, gy1, gz1, ax1, ay1, az1, gx2, gy2, gz2, ax2,
+                        ay2, az2, 0.01f);
+
+        // 3. Lấy kết quả attitude
+        // pitch: roll: yaw theo radian
+        float pitch = Attitude_GetPayloadPitch(&att);
+        float roll = Attitude_GetPayloadRoll(&att);
+        float yaw = Attitude_GetPayloadYaw(&att);
+
+        // Chuyển sang độ để debug
+        float pitch_deg = pitch * RAD_TO_DEG;
+        float roll_deg = roll * RAD_TO_DEG;
+        float yaw_deg = yaw * RAD_TO_DEG;
+
+        // // 4. Kiểm tra dữ liệu
+        // printf("Pitch: %.2f | Roll: %.2f | Yaw: %.2f\r\n", pitch_deg, roll_deg,
+        //        yaw_deg);
+      }
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    // BƯỚC 2: Đọc IMU
-    if (imu_ready) {
-      if (MPU6050_ReadAll(&imu) == MPU6050_OK) {
-        float gx = imu.gyro_x * (PI / 180.0f);
-        float gy = imu.gyro_y * (PI / 180.0f);
-        float gz = imu.gyro_z * (PI / 180.0f);
-        Mahony_Update(&ahrs, gx, gy, gz, imu.accel_x, imu.accel_y, imu.accel_z,
-                      0.01f);
-        pitch_angle = ahrs.pitch * (180.0f / PI);
-        roll_angle = ahrs.roll * (180.0f / PI);
-        yaw_angle = ahrs.yaw * (180.0f / PI);
-      }
-    }
-
-    // BƯỚC 3 & 4: Cascade PID Gimbal
-    float target_pitch_angle = 0.0f;
-    float pitch_error_rad = (target_pitch_angle - pitch_angle) * (PI / 180.0f);
-    float target_vel_rad_s = FOC_PID_Update(&pid_pitch, pitch_error_rad, 0.01f);
-    if (encoder_ready) {
-      if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
-        FOC_RunVelocity(&foc, encoder.angle_rad, target_vel_rad_s);
-        printf(
-            " pitch=%.1f | roll=%.1f | yaw=%.1f | vel_set=%.2f | vel_meas=%.2f | Vq=%.3f\r\n",
-            pitch_angle, roll_angle, yaw_angle, target_vel_rad_s, foc.velocity_mech, foc.Vq_ref);
-      }
-    }
     HAL_Delay(10);
   }
   /* USER CODE END 3 */
