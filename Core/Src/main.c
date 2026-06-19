@@ -173,15 +173,12 @@ int main(void) {
   pid_pitch.output_max = 10.0f;
   FOC_PID_Reset(&pid_pitch);
 
-  FOC_Start(&foc);
-  printf("Dang can chinh Rotor (Alignment). Vui long khong cham vao "
-         "Gimbal...\r\n");
-
-  // Khóa Rotor bằng Vd và cập nhật bộ lọc Mahony để tìm góc Offset
-  for (int i = 0; i < 100; i++) {
-    FOC_AlignD(&foc, foc.voltage_limit); // Áp điện áp Vd để khóa rotor
-
-    // Đồng thời cập nhật IMU để bộ lọc Mahony hội tụ góc
+  // *** MẸO 2: Cho bộ lọc Mahony "chạy nháp" TRƯỚC khi bật motor ***
+  // Motor OFF hoàn toàn trong giai đoạn này (FOC_Start chưa được gọi).
+  // 500 vòng x 10ms = 5 giây để Mahony hội tụ từ quaternion (1,0,0,0)
+  // về góc thực tế chính xác của thiết bị.
+  printf("Dang khoi tao bo loc Mahony (5s). Vui long giu yen Gimbal...\r\n");
+  for (int i = 0; i < 500; i++) {
     if (MPU6050_ReadAll(&imu_frame) == MPU6050_OK &&
         MPU6050_ReadAll(&imu_payload) == MPU6050_OK) {
 
@@ -192,6 +189,25 @@ int main(void) {
           imu_payload.gyro_y * DEG_TO_RAD, imu_payload.gyro_z * DEG_TO_RAD,
           imu_payload.accel_x, imu_payload.accel_y, imu_payload.accel_z, 0.01f);
     }
+    // In tiến trình mỗi giây để người dùng biết hệ thống đang chạy
+    if (i % 100 == 0) {
+      printf("  Mahony warm-up: %d%%\r\n", i / 5);
+    }
+    HAL_Delay(10);
+  }
+  printf("Bo loc Mahony hoi tu! Pitch=%.2f Roll=%.2f\r\n",
+         Attitude_GetPayloadPitch(&att) * RAD_TO_DEG,
+         Attitude_GetPayloadRoll(&att) * RAD_TO_DEG);
+
+  // *** Bật motor và Căn chỉnh Rotor (Alignment) ***
+  // Lúc này bộ lọc Mahony đã hội tụ, góc đo được sẽ rất chính xác.
+  FOC_Start(&foc);
+  printf("Dang can chinh Rotor (Alignment). Vui long khong cham vao "
+         "Gimbal...\r\n");
+
+  // Khóa Rotor bằng Vd trong 1 giây để rotor chốt vào trục D của stator
+  for (int i = 0; i < 100; i++) {
+    FOC_AlignD(&foc, foc.voltage_limit);
     HAL_Delay(10);
   }
 
@@ -251,16 +267,14 @@ int main(void) {
         float yaw_deg = yaw * RAD_TO_DEG;
 
         // 4. Cascade PID Control (Điều khiển Vị trí + Vận tốc)
-        float target_pitch_angle =
-            0.0f; // Góc mong muốn của Camera (0 độ = cân bằng)
+        float target_pitch_angle = 0.0f; // Góc mong muốn của Camera (0 độ = cân bằng)
 
         // --- Vòng ngoài (Outer Loop): Trình điều khiển Góc ---
         // Sai số góc = Góc mong muốn - Góc thực tế (Lưu ý: phải dùng Radian)
         float pitch_error_rad = target_pitch_angle - pitch;
 
         // Đầu ra của vòng Góc là Tốc độ quay mong muốn (target_velocity)
-        float target_vel_rad_s =
-            FOC_PID_Update(&pid_pitch, pitch_error_rad, 0.01f);
+        float target_vel_rad_s = FOC_PID_Update(&pid_pitch, pitch_error_rad, 0.01f);
 
         // --- Vòng trong (Inner Loop): Trình điều khiển Vận tốc + Feedforward
         // --- Lấy vận tốc hiện tại của camera (Feedback)
