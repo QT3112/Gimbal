@@ -6,36 +6,50 @@
  * Thư viện này đóng gói toàn bộ pipeline ước lượng tư thế cho hệ thống
  * gimbal dùng 2 IMU (không cần encoder), bao gồm:
  *
- *  - Attitude_Init():   Khởi tạo 2 bộ lọc Mahony (frame + payload)
- *  - Attitude_Update(): Cập nhật tư thế từ raw IMU data mỗi chu kỳ Ts
- *  - Attitude_GetPayloadAngle(): Góc camera (dùng cho feedback PID)
- *  - Attitude_GetFrameRate():   Tốc độ góc khung (dùng cho feedforward)
+ *  - Attitude_Init():              Khởi tạo 2 bộ lọc Mahony (frame + payload)
+ *  - Attitude_Update():            Cập nhật tư thế từ raw IMU data mỗi chu kỳ Ts
+ *  - Attitude_GetPayloadAngle():   Góc tuyệt đối camera (dùng cho feedback PID)
+ *  - Attitude_GetFrameRate():      Tốc độ góc khung (dùng cho feedforward)
+ *  - Attitude_GetRelativePitch():  Góc cơ học motor Pitch [= q_err → Euler]
+ *  - Attitude_GetRelativeRoll():   Góc cơ học motor Roll  [= q_err → Euler]
  *
  * Kiến trúc 2-IMU Gimbal:
  *
- *   IMU_frame (trên drone)   → ước lượng tư thế khung
+ *   IMU_frame (trên drone)   → ước lượng tư thế khung  → q_frame
  *                              → cung cấp disturbance rate (feedforward)
  *
- *   IMU_payload (trên camera)→ ước lượng tư thế camera tuyệt đối
+ *   IMU_payload (trên camera)→ ước lượng tư thế camera → q_payload
  *                              → cung cấp feedback angle cho PID
  *
- *   Electrical angle cho FOC:
- *     angle_elec = payload_pitch_rad * pole_pairs
- *     (thay thế hoàn toàn encoder)
+ *   Quaternion Error Pipeline:
+ *     q_error     = q_frame* ⊗ q_payload    (Conjugate của frame × payload)
+ *     rel_pitch   = q_error → Euler Pitch   (Góc cơ học motor Pitch)
+ *     rel_roll    = q_error → Euler Roll    (Góc cơ học motor Roll)
+ *
+ *   Electrical angle cho FOC (thay thế hoàn toàn encoder vật lý):
+ *     angle_elec_pitch = rel_pitch * pole_pairs
+ *     angle_elec_roll  = rel_roll  * pole_pairs
  *
  * Cách sử dụng:
  * @code
  *   Attitude_Handle_t att;
  *   Attitude_Init(&att, 2.0f, 0.005f);   // Kp=2.0, Ki=0.005
  *
- *   // Mỗi Ts (ví dụ 10ms):
+ *   // Mỗi Ts (ví dụ 1ms trong TIM ISR):
  *   Attitude_Update(&att,
- *       frame_gyro, frame_accel,          // IMU trên drone
- *       payload_gyro, payload_accel,      // IMU trên camera
- *       0.01f);                           // dt = 10ms
+ *       f_gx, f_gy, f_gz, f_ax, f_ay, f_az,   // IMU trên drone
+ *       p_gx, p_gy, p_gz, p_ax, p_ay, p_az,   // IMU trên camera
+ *       0.001f);                                // dt = 1ms
  *
- *   float cam_pitch   = Attitude_GetPayloadPitch(&att);  // feedback
- *   float frame_rate  = Attitude_GetFramePitchRate(&att); // feedforward
+ *   // Feedback cho PID Angle (góc tuyệt đối camera so với mặt đất)
+ *   float cam_pitch  = Attitude_GetPayloadPitch(&att);
+ *
+ *   // Góc cơ học motor (thay encoder) — dùng để tính electrical angle FOC
+ *   float rel_pitch  = Attitude_GetRelativePitch(&att);
+ *   float rel_roll   = Attitude_GetRelativeRoll(&att);
+ *
+ *   // Feedforward từ IMU khung
+ *   float frame_rate = Attitude_GetFramePitchRate(&att);
  * @endcode
  ******************************************************************************
  */
@@ -87,6 +101,20 @@ typedef struct {
     float payload_rate_x;  /**< Angular rate trục X của camera [rad/s] */
     float payload_rate_y;  /**< Angular rate trục Y của camera [rad/s] */
     float payload_rate_z;  /**< Angular rate trục Z của camera [rad/s] */
+
+    /* =========================================================================
+     * QUATERNION ERROR PIPELINE
+     * =========================================================================
+     * q_error = conjugate(q_frame) ⊗ q_payload
+     *
+     * Biểu diễn "từ góc nhìn của tay cầm, camera đang lệch bao nhiêu".
+     * Đây là góc cơ học thực tế của khớp motor, thay thế hoàn toàn encoder.
+     * ========================================================================= */
+
+    float q_error[4];       /**< Sai số Quaternion [w, x, y, z] giữa frame và payload */
+
+    float relative_pitch;   /**< Góc cơ học motor Pitch [rad] — tách từ q_error */
+    float relative_roll;    /**< Góc cơ học motor Roll  [rad] — tách từ q_error */
 
     /* --- Trạng thái khởi tạo --- */
     uint8_t initialized;    /**< 1 nếu đã init thành công */
@@ -168,31 +196,67 @@ float Attitude_GetPayloadPitchRate(const Attitude_Handle_t *hatt);
 float Attitude_GetPayloadRollRate(const Attitude_Handle_t *hatt);
 
 /* ---------------------------------------------------------------------------
- * Utility
+ * Getter: Góc cơ học tương đối của motor (Quaternion Error → Euler)
+ *
+ * Đây là kết quả của pipeline:  q_error = q_frame* ⊗ q_payload
+ * Các giá trị này là góc thực tế của khớp cơ khí, thay thế encoder vật lý.
+ * Dùng để:
+ *   1. Tính góc điện cho FOC (nhân với pole_pairs)
+ *   2. Dùng làm feedback cho outer angle PID
+ * --------------------------------------------------------------------------- */
+
+/** @return Góc cơ học motor Pitch [rad] — tách từ q_error */
+float Attitude_GetRelativePitch(const Attitude_Handle_t *hatt);
+
+/** @return Góc cơ học motor Roll [rad] — tách từ q_error */
+float Attitude_GetRelativeRoll(const Attitude_Handle_t *hatt);
+
+/* ---------------------------------------------------------------------------
+ * Utility: Tính góc điện cho FOC
  * --------------------------------------------------------------------------- */
 
 /**
- * @brief  Tính góc điện để đưa vào FOC InvPark (thay encoder)
+ * @brief  Tính góc điện cho FOC motor Pitch dựa trên góc TƯƠNG ĐỐI (q_error).
  *
- * Trong gimbal 1 trục pitch: motor shaft angle ≈ payload_pitch_mech
- * → angle_elec = payload_pitch_mech × pole_pairs
+ * Đây là phiên bản chính xác hơn Attitude_GetElecAngle() vì nó dùng góc
+ * cơ học thực của khớp motor thay vì góc tuyệt đối của camera.
+ *
+ *   angle_elec = relative_pitch × pole_pairs - offset
  *
  * @param  hatt        Con trỏ đến Attitude_Handle_t
- * @param  pole_pairs  Số cặp cực của motor
- * @param  offset      Offset góc điện tại thời điểm khởi động [rad]
+ * @param  pole_pairs  Số cặp cực của motor (Ví dụ: 7 cho motor 14P)
+ * @param  offset      Offset góc điện lúc Homing [rad]
  * @return Góc điện [rad] đã chuẩn hóa về [0, 2π]
+ */
+float Attitude_GetElecAnglePitchRel(const Attitude_Handle_t *hatt,
+                                    uint8_t pole_pairs,
+                                    float offset);
+
+/**
+ * @brief  Tính góc điện cho FOC motor Roll dựa trên góc TƯƠNG ĐỐI (q_error).
+ *
+ *   angle_elec = relative_roll × pole_pairs - offset
+ *
+ * @param  hatt        Con trỏ đến Attitude_Handle_t
+ * @param  pole_pairs  Số cặp cực của motor Roll (Ví dụ: 7 cho motor 14P)
+ * @param  offset      Offset góc điện lúc Homing [rad]
+ * @return Góc điện [rad] đã chuẩn hóa về [0, 2π]
+ */
+float Attitude_GetElecAngleRollRel(const Attitude_Handle_t *hatt,
+                                   uint8_t pole_pairs,
+                                   float offset);
+
+/**
+ * @brief  [Legacy] Tính góc điện từ góc TUYỆT ĐỐI payload Pitch.
+ * @note   Khuyến nghị dùng Attitude_GetElecAnglePitchRel() thay thế.
  */
 float Attitude_GetElecAngle(const Attitude_Handle_t *hatt,
                             uint8_t pole_pairs,
                             float offset);
 
 /**
- * @brief  Tính góc điện cho FOC trục Roll từ góc roll của camera.
- *
- * @param  hatt        Con trỏ đến Attitude_Handle_t
- * @param  pole_pairs  Số cặp cực của motor Roll
- * @param  offset      Offset góc điện tại thời điểm khởi động [rad]
- * @return Góc điện [rad] đã chuẩn hóa về [0, 2π]
+ * @brief  [Legacy] Tính góc điện từ góc TUYỆT ĐỐI payload Roll.
+ * @note   Khuyến nghị dùng Attitude_GetElecAngleRollRel() thay thế.
  */
 float Attitude_GetElecAngleRoll(const Attitude_Handle_t *hatt,
                                 uint8_t pole_pairs,
