@@ -186,6 +186,18 @@ float Attitude_GetElecAngle(const Attitude_Handle_t *hatt,
                             uint8_t pole_pairs,
                             float offset);
 
+/**
+ * @brief  Tính góc điện cho FOC trục Roll từ góc roll của camera.
+ *
+ * @param  hatt        Con trỏ đến Attitude_Handle_t
+ * @param  pole_pairs  Số cặp cực của motor Roll
+ * @param  offset      Offset góc điện tại thời điểm khởi động [rad]
+ * @return Góc điện [rad] đã chuẩn hóa về [0, 2π]
+ */
+float Attitude_GetElecAngleRoll(const Attitude_Handle_t *hatt,
+                                uint8_t pole_pairs,
+                                float offset);
+
 #ifdef __cplusplus
 }
 #endif

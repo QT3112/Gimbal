@@ -174,3 +174,21 @@ float Attitude_GetElecAngle(const Attitude_Handle_t *hatt,
     float elec_angle  = mech_angle * (float)pole_pairs - offset;
     return _normalize_angle(elec_angle);
 }
+
+/* ===========================================================================
+ * Attitude_GetElecAngleRoll
+ *
+ * Tính góc điện cho FOC trục Roll từ góc roll của camera.
+ *
+ * Nguyên lý giống hệt Pitch:
+ *   camera_roll_mech ≡ motor_roll_shaft_angle_mech
+ *   → angle_elec = camera_roll_mech × pole_pairs - offset
+ * =========================================================================== */
+float Attitude_GetElecAngleRoll(const Attitude_Handle_t *hatt,
+                                uint8_t pole_pairs,
+                                float offset)
+{
+    float mech_angle = hatt->payload_roll;   /* [−π, +π] */
+    float elec_angle = mech_angle * (float)pole_pairs - offset;
+    return _normalize_angle(elec_angle);
+}
