@@ -72,15 +72,6 @@ FOC_PID_t pid_roll; /* PID vòng ngoài trục Roll */
 FOC_Handle_t foc;      /* FOC trục Pitch (TIM2) */
 FOC_Handle_t foc_roll; /* FOC trục Roll  (TIM3) */
 
-/* --- Debug Variables (shared between Interrupt & Main Loop) --- */
-volatile float debug_pitch_deg = 0.0f;
-volatile float debug_target_vel = 0.0f;
-volatile float debug_cam_rate = 0.0f;
-volatile float debug_vq_ref = 0.0f;
-volatile float debug_roll_deg = 0.0f;
-volatile float debug_roll_target_vel = 0.0f;
-volatile float debug_roll_cam_rate = 0.0f;
-volatile float debug_roll_vq_ref = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -170,21 +161,19 @@ int main(void) {
   // Khởi tạo Attitude Estimator (Mahony filter cho 2 IMU)
   Attitude_Init(&att, 2.0f, 0.005f);
 
-  // --- BƯỚC 2: KHỞI TẠO & CĂN CHỈNH FOC ---
+  // --- BƯỚC 2: KHỞI TẠO & CĂN CHỈNH FOC PITCH ---
   FOC_Init(&foc, &htim2, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
            4249.0f, /* PWM Period */
            7,       /* Số cặp cực (ví dụ 12N14P -> 7) */
-           0.5f, /* Giới hạn điện áp [V] - Vd dùng để căn chỉnh */
+           1.0f,    /* [TĂNG NHẸ ÁP]: Giới hạn điện áp Pitch (lên 0.8V) */
            0.002f); /* Ts = 2ms (500Hz) */
 
-  // LPF cho tốc độ vòng trong
   FOC_SetLPF_Vel(&foc, 0.98f);
-  // Cấu hình PID vận tốc (vòng trong)
-  FOC_SetPID_Vel(&foc, 0.1f, 0.01f, 0.0f, -foc.voltage_limit,
-                 foc.voltage_limit);
+  FOC_SetPID_Vel(&foc, 0.1f, 0.01f, 0.0f, -foc.voltage_limit, foc.voltage_limit);
+
   // Cấu hình PID góc (vòng ngoài) cho Pitch
-  pid_pitch.Kp = 2.0f;
-  pid_pitch.Ki = 0.0f;
+  pid_pitch.Kp = 2.0f; // Lực đàn hồi tức thời (Tăng nhẹ nếu thấy phản ứng chậm)
+  pid_pitch.Ki = 0.0f; // [MỚI]: Khâu tích phân kéo motor về đúng 0 nếu bị kẹt trọng lượng
   pid_pitch.Kd = 0.0f;
   pid_pitch.output_min = -10.0f; // max target_vel [rad/s]
   pid_pitch.output_max = 10.0f;
@@ -193,17 +182,16 @@ int main(void) {
   // --- KHỞI TẠO FOC ROLL (TIM3) ---
   FOC_Init(&foc_roll, &htim3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
            4249.0f, /* PWM Period - giống TIM2 */
-           7, /* Số cặp cực motor Roll (chỉnh lại nếu motor khác) */
-           0.5f,    /* Giới hạn điện áp */
+           7,       /* CHÚ Ý: Đếm lại nam châm motor Roll. Nếu 14 cực từ -> điền 7. 22 cực từ -> điền 11 */
+           1.0f,    /* [TĂNG ÁP MẠNH]: Roll chịu tải nặng, nới trần lên 1.5V (Tối đa chỉ nên 3.0V để test) */
            0.002f); /* Ts = 2ms (500Hz) */
 
   FOC_SetLPF_Vel(&foc_roll, 0.98f);
-  FOC_SetPID_Vel(&foc_roll, 0.1f, 0.01f, 0.0f, -foc_roll.voltage_limit,
-                 foc_roll.voltage_limit);
+  FOC_SetPID_Vel(&foc_roll, 0.1f, 0.01f, 0.0f, -foc_roll.voltage_limit, foc_roll.voltage_limit);
 
   // Cấu hình PID góc (vòng ngoài) cho Roll
-  pid_roll.Kp = 2.0f;
-  pid_roll.Ki = 0.0f;
+  pid_roll.Kp = 2.2f; // Lực đàn hồi (Tăng lên 3.0 để chống chọi lực cản tốt hơn)
+  pid_roll.Ki = 0.2f; // [MỚI]: Ki=0.5 sẽ tự động "bơm áp" tích lũy dần cho đến khi Roll về đúng số 0
   pid_roll.Kd = 0.0f;
   pid_roll.output_min = -10.0f;
   pid_roll.output_max = 10.0f;
@@ -332,25 +320,97 @@ int main(void) {
   FOC_Update(&foc_roll);
   printf("[SVPWM TEST] Hoan thanh. Bat dau dieu khien PID...\r\n");
 
-  // Kích hoạt ngắt TIM6 để chạy vòng lặp PID 500Hz
-  HAL_TIM_Base_Start_IT(&htim6);
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1) {
-    // In dữ liệu qua UART trong vòng lặp chính (không in trong ngắt)
-    printf("[P] Pitch:%.2f TarVel:%.2f Vel:%.2f Vq:%.2f | [R] Roll:%.2f "
-           "TarVel:%.2f Vel:%.2f Vq:%.2f\r\n",
-           debug_pitch_deg, debug_target_vel, debug_cam_rate, debug_vq_ref,
-           debug_roll_deg, debug_roll_target_vel, debug_roll_cam_rate,
-           debug_roll_vq_ref);
+    if (imu_frame_ready && imu_payload_ready) {
+      // ================================================================
+      // 1. ĐỌC DỮ LIỆU TỬ 2 IMU
+      // ================================================================
+      if (MPU6050_ReadAll(&imu_frame) == MPU6050_OK &&
+          MPU6050_ReadAll(&imu_payload) == MPU6050_OK) {
+
+        const float ax1 = imu_frame.accel_x, ay1 = imu_frame.accel_y,
+                    az1 = imu_frame.accel_z;
+        const float gx1 = imu_frame.gyro_x * DEG_TO_RAD;
+        const float gy1 = imu_frame.gyro_y * DEG_TO_RAD;
+        const float gz1 = imu_frame.gyro_z * DEG_TO_RAD;
+
+        const float ax2 = imu_payload.accel_x, ay2 = imu_payload.accel_y,
+                    az2 = imu_payload.accel_z;
+        const float gx2 = imu_payload.gyro_x * DEG_TO_RAD;
+        const float gy2 = imu_payload.gyro_y * DEG_TO_RAD;
+        const float gz2 = imu_payload.gyro_z * DEG_TO_RAD;
+
+        const float dt = 0.01f; /* Ts = 10ms → 100Hz (dùng HAL_Delay ở cuối) */
+
+        // ================================================================
+        // 2. CẬP NHẬT ATTITUDE ESTIMATOR
+        // ================================================================
+        Attitude_Update(&att, gx1, gy1, gz1, ax1, ay1, az1, gx2, gy2, gz2, ax2,
+                        ay2, az2, dt);
+
+        const float pitch_abs = Attitude_GetPayloadPitch(&att);
+        const float roll_abs  = Attitude_GetPayloadRoll(&att);
+
+        const float K_ff = 1.0f;
+
+        // ================================================================
+        // 3A. ĐIỀU KHIỂN TRỤC PITCH
+        // ================================================================
+        const float pitch_err    = 0.0f - pitch_abs;
+        const float target_vel_p = FOC_PID_Update(&pid_pitch, pitch_err, dt);
+
+        const float frame_pitch_rate = Attitude_GetFramePitchRate(&att);
+        const float ff_pitch = K_ff * frame_pitch_rate;
+
+        const float cam_pitch_rate = Attitude_GetPayloadPitchRate(&att);
+        const float vel_err_pitch  = (target_vel_p + ff_pitch) - cam_pitch_rate;
+        const float Vq_pitch = FOC_PID_Update(&foc.pid_vel, vel_err_pitch, dt);
+
+        foc.angle_elec = Attitude_GetElecAnglePitchRel(&att, foc.pole_pairs,
+                                                       foc.angle_offset);
+        FOC_SetVoltage(&foc, 0.0f, Vq_pitch);
+        FOC_Update(&foc);
+
+        // ================================================================
+        // 3B. ĐIỀU KHIỂN TRỤC ROLL
+        // ================================================================
+        const float roll_err     = 0.0f - roll_abs;
+        const float target_vel_r = FOC_PID_Update(&pid_roll, roll_err, dt);
+
+        const float frame_roll_rate = Attitude_GetFrameRollRate(&att);
+        const float ff_roll = K_ff * frame_roll_rate;
+
+        const float cam_roll_rate = Attitude_GetPayloadRollRate(&att);
+        const float vel_err_roll  = (target_vel_r + ff_roll) - cam_roll_rate;
+        const float Vq_roll = FOC_PID_Update(&foc_roll.pid_vel, vel_err_roll, dt);
+
+        foc_roll.angle_elec = Attitude_GetElecAngleRollRel(
+            &att, foc_roll.pole_pairs, foc_roll.angle_offset);
+        FOC_SetVoltage(&foc_roll, 0.0f, Vq_roll);
+        FOC_Update(&foc_roll);
+
+        // ================================================================
+        // 4. IN DEBUG RA UART (mỗi 10 vòng = 100ms)
+        // ================================================================
+        static int print_cnt = 0;
+        if (++print_cnt >= 10) {
+          printf("[P] Pitch:%.2f TarVel:%.2f Vel:%.2f Vq:%.2f | "
+                 "[R] Roll:%.2f TarVel:%.2f Vel:%.2f Vq:%.2f\r\n",
+                 pitch_abs * RAD_TO_DEG, target_vel_p, cam_pitch_rate, Vq_pitch,
+                 roll_abs  * RAD_TO_DEG, target_vel_r, cam_roll_rate,  Vq_roll);
+          print_cnt = 0;
+        }
+      }
+    }
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    HAL_Delay(100); // In chậm rãi 10Hz để dễ xem
+    HAL_Delay(10); /* Ts = 10ms → 100Hz */
   }
   /* USER CODE END 3 */
 }
@@ -401,124 +461,6 @@ void SystemClock_Config(void) {
 }
 
 /* USER CODE BEGIN 4 */
-// Khai báo extern để trình biên dịch không báo lỗi khi chưa config CubeMX.
-// (Sẽ được tự động định nghĩa trong tim.c khi bạn gen code từ CubeMX)
-extern TIM_HandleTypeDef htim6;
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-  if (htim->Instance == TIM6) {
-    if (imu_frame_ready && imu_payload_ready) {
-      // ================================================================
-      // 1. ĐỌC DỮ LIỆU TỪ 2 IMU — Cả 2 phải thành công mới tiếp tục
-      // ================================================================
-      if (MPU6050_ReadAll(&imu_frame) == MPU6050_OK &&
-          MPU6050_ReadAll(&imu_payload) == MPU6050_OK) {
-
-        const float ax1 = imu_frame.accel_x, ay1 = imu_frame.accel_y,
-                    az1 = imu_frame.accel_z;
-        const float gx1 = imu_frame.gyro_x * DEG_TO_RAD;
-        const float gy1 = imu_frame.gyro_y * DEG_TO_RAD;
-        const float gz1 = imu_frame.gyro_z * DEG_TO_RAD;
-
-        const float ax2 = imu_payload.accel_x, ay2 = imu_payload.accel_y,
-                    az2 = imu_payload.accel_z;
-        const float gx2 = imu_payload.gyro_x * DEG_TO_RAD;
-        const float gy2 = imu_payload.gyro_y * DEG_TO_RAD;
-        const float gz2 = imu_payload.gyro_z * DEG_TO_RAD;
-
-        const float dt = 0.002f; /* Ts = 2ms → 500Hz */
-
-        // ================================================================
-        // 2. CẬP NHẬT ATTITUDE ESTIMATOR (Bước 2 & 3)
-        //    → Chạy 2 bộ Mahony song song
-        //    → Yaw Lock: kéo Yaw payload về Yaw frame (chống trôi)
-        //    → Tính q_error = conj(q_frame) ⊗ q_payload
-        //    → Tách relative_pitch, relative_roll (góc cơ học motor)
-        // ================================================================
-        Attitude_Update(&att, gx1, gy1, gz1, ax1, ay1, az1, gx2, gy2, gz2, ax2,
-                        ay2, az2, dt);
-
-        /* Góc TUYỆT ĐỐI của Camera — dùng cho outer Angle PID.
-         * Mục tiêu: giữ camera nằm ngang (pitch_abs = 0, roll_abs = 0). */
-        const float pitch_abs = Attitude_GetPayloadPitch(&att);
-        const float roll_abs = Attitude_GetPayloadRoll(&att);
-
-        /* Hệ số Feedforward.
-         * K_ff = 1.0: Motor cộng TOÀN BỘ tốc độ của tay cầm vào target_vel.
-         * Giảm về 0.5~0.8 nếu gimbal rung do feedforward quá mạnh. */
-        const float K_ff = 1.0f;
-
-        // ================================================================
-        // BƯỚC 6A. TRỤC PITCH — Cascade PID + Feedforward + FOC SVPWM
-        //
-        //  Outer (Angle):  pitch_abs → [P_angle] → target_vel_p
-        //  Feedforward:    frame_pitch_rate × K_ff  (+, bù trước)
-        //  Inner (Rate):   (target_vel_p + ff) − cam_rate → [PI_vel] → Vq
-        //  FOC SVPWM:      pitch_rel × pole_pairs − offset → angle_elec → PWM
-        // ================================================================
-
-        /* Vòng ngoài — Angle PID */
-        const float pitch_err = 0.0f - pitch_abs;
-        const float target_vel_p = FOC_PID_Update(&pid_pitch, pitch_err, dt);
-
-        /* Feedforward: CỘNG tốc độ khung vào setpoint (không trừ).
-         * Khi tay cầm nghiêng → frame_pitch_rate > 0 → motor bơm lực
-         * cùng chiều TRƯỚC KHI camera kịp bị kéo đi. */
-        const float frame_pitch_rate = Attitude_GetFramePitchRate(&att);
-        const float ff_pitch = K_ff * frame_pitch_rate;
-
-        /* Vòng trong — Rate PID */
-        const float cam_pitch_rate = Attitude_GetPayloadPitchRate(&att);
-        const float vel_err_pitch = (target_vel_p + ff_pitch) - cam_pitch_rate;
-        const float Vq_pitch = FOC_PID_Update(&foc.pid_vel, vel_err_pitch, dt);
-
-        /* FOC SVPWM — dùng góc TƯƠNG ĐỐI (q_error) thay encoder */
-        foc.angle_elec = Attitude_GetElecAnglePitchRel(&att, foc.pole_pairs,
-                                                       foc.angle_offset);
-        FOC_SetVoltage(&foc, 0.0f, Vq_pitch);
-        FOC_Update(&foc);
-
-        // ================================================================
-        // BƯỚC 6B. TRỤC ROLL — Cascade PID + Feedforward + FOC SVPWM
-        // ================================================================
-
-        /* Vòng ngoài — Angle PID */
-        const float roll_err = 0.0f - roll_abs;
-        const float target_vel_r = FOC_PID_Update(&pid_roll, roll_err, dt);
-
-        /* Feedforward */
-        const float frame_roll_rate = Attitude_GetFrameRollRate(&att);
-        const float ff_roll = K_ff * frame_roll_rate;
-
-        /* Vòng trong — Rate PID */
-        const float cam_roll_rate = Attitude_GetPayloadRollRate(&att);
-        const float vel_err_roll = (target_vel_r + ff_roll) - cam_roll_rate;
-        const float Vq_roll =
-            FOC_PID_Update(&foc_roll.pid_vel, vel_err_roll, dt);
-
-        /* FOC SVPWM — Roll */
-        foc_roll.angle_elec = Attitude_GetElecAngleRollRel(
-            &att, foc_roll.pole_pairs, foc_roll.angle_offset);
-        FOC_SetVoltage(&foc_roll, 0.0f, Vq_roll);
-        FOC_Update(&foc_roll);
-
-        // ================================================================
-        // 3. LƯU BIẾN DEBUG
-        //    while(1) đọc và printf ra UART mỗi 100ms — KHÔNG printf ở đây!
-        // ================================================================
-        debug_pitch_deg = pitch_abs * RAD_TO_DEG;
-        debug_target_vel = target_vel_p;
-        debug_cam_rate = cam_pitch_rate;
-        debug_vq_ref = Vq_pitch;
-
-        debug_roll_deg = roll_abs * RAD_TO_DEG;
-        debug_roll_target_vel = target_vel_r;
-        debug_roll_cam_rate = cam_roll_rate;
-        debug_roll_vq_ref = Vq_roll;
-      }
-    }
-  }
-}
 /* USER CODE END 4 */
 
 /**
