@@ -394,14 +394,34 @@ int main(void) {
         FOC_Update(&foc_roll);
 
         // ================================================================
-        // 4. IN DEBUG RA UART (mỗi 10 vòng = 100ms)
+        // 4. GỬi DEBUG CSV RA USB (mỗi 2 vòng = 20ms = 50Hz)
+        // Format: $TAG,val1,val2,...\r\n
         // ================================================================
         static int print_cnt = 0;
-        if (++print_cnt >= 10) {
-          printf("[P] Pitch:%.2f TarVel:%.2f Vel:%.2f Vq:%.2f | "
-                 "[R] Roll:%.2f TarVel:%.2f Vel:%.2f Vq:%.2f\r\n",
-                 pitch_abs * RAD_TO_DEG, target_vel_p, cam_pitch_rate, Vq_pitch,
-                 roll_abs  * RAD_TO_DEG, target_vel_r, cam_roll_rate,  Vq_roll);
+        if (++print_cnt >= 2) {
+          // --- $IMU: Raw sensor data (2 IMU) ---
+          printf("$IMU,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f\r\n",
+                 imu_frame.accel_x,   imu_frame.accel_y,   imu_frame.accel_z,
+                 imu_frame.gyro_x,    imu_frame.gyro_y,    imu_frame.gyro_z,
+                 imu_payload.accel_x, imu_payload.accel_y, imu_payload.accel_z,
+                 imu_payload.gyro_x,  imu_payload.gyro_y,  imu_payload.gyro_z);
+
+          // --- $ATT: Attitude estimation output ---
+          printf("$ATT,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
+                 att.frame_pitch  * RAD_TO_DEG, att.frame_roll  * RAD_TO_DEG, att.frame_yaw  * RAD_TO_DEG,
+                 att.payload_pitch* RAD_TO_DEG, att.payload_roll* RAD_TO_DEG, att.payload_yaw* RAD_TO_DEG,
+                 att.relative_pitch * RAD_TO_DEG, att.relative_roll * RAD_TO_DEG);
+
+          // --- $PID: Cascade PID state (Pitch + Roll) ---
+          printf("$PID,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\r\n",
+                 pitch_err * RAD_TO_DEG, target_vel_p, ff_pitch, cam_pitch_rate, vel_err_pitch, Vq_pitch,
+                 roll_err  * RAD_TO_DEG, target_vel_r, ff_roll,  cam_roll_rate,  vel_err_roll,  Vq_roll);
+
+          // --- $FOC: FOC internal state ---
+          printf("$FOC,%.3f,%.3f,%.3f,%.3f\r\n",
+                 foc.angle_elec,      foc_roll.angle_elec,
+                 foc.angle_offset,    foc_roll.angle_offset);
+
           print_cnt = 0;
         }
       }
