@@ -308,31 +308,92 @@ float Attitude_GetRelativeRoll(const Attitude_Handle_t *hatt)
 }
 
 /* ===========================================================================
+ * Getters — Quaternion Error Components (dùng cho Outer PID, không bị ZYX coupling)
+ *
+ * Thay vì dùng Euler angles từ q_error (bị coupling lẫn nhau qua ZYX order),
+ * dùng trực tiếp thành phần ảo của quaternion:
+ *
+ *   q_error = [w, x, y, z]
+ *   pitch_err ≈ 2 * y  (thành phần trục Y — Pitch axis)
+ *   roll_err  ≈ 2 * x  (thành phần trục X — Roll axis)
+ *
+ * Tại sao tốt hơn ZYX Euler:
+ *   - ZYX Euler: relative_pitch phụ thuộc vào cả qx VÀ qy → coupling
+ *   - q_error[2] (qy): chủ yếu là Pitch, ảnh hưởng Roll rất nhỏ ở góc ±45°
+ *   - Không bao giờ bị gimbal lock
+ *   - Tính toán cực nhanh (không cần trig)
+ * =========================================================================== */
+float Attitude_GetQErrorPitch(const Attitude_Handle_t *hatt)
+{
+    /* pitch_err ≈ 2 × sin(pitch_half) ≈ 2 × q_error[2]
+     * Nhân 2 để scale về đơn vị radian (tương đương góc nhỏ) */
+    return 2.0f * hatt->q_error[2];
+}
+
+float Attitude_GetQErrorRoll(const Attitude_Handle_t *hatt)
+{
+    /* roll_err ≈ 2 × sin(roll_half) ≈ 2 × q_error[1] */
+    return 2.0f * hatt->q_error[1];
+}
+
+
+/* ===========================================================================
  * FOC Electrical Angle — Phiên bản TƯƠNG ĐỐI (dùng q_error, chính xác hơn)
  * =========================================================================== */
 
 /**
  * Attitude_GetElecAnglePitchRel
- * angle_elec = relative_pitch × pole_pairs - offset
+ *
+ * Trước đây dùng _normalize_angle() gây bước nhảy (discontinuity) mỗi
+ * 360°/pole_pairs cơ học. Giờ dùng angle unwrapping:
+ *   - Giữ biến tĩnh lưu giá trị lần trước.
+ *   - Tính delta giữa lần này và lần trước (rằng vào [-π, +π]).
+ *   - Cộng dồn delta vào giá trị liên tục → gióc điện LIÊN TỤC, không giật.
  */
 float Attitude_GetElecAnglePitchRel(const Attitude_Handle_t *hatt,
                                     uint8_t pole_pairs,
                                     float offset)
 {
-    float elec_angle = hatt->relative_pitch * (float)pole_pairs - offset;
-    return _normalize_angle(elec_angle);
+    /* Góc điện cơ bản (có thể nằm ngoài [0,2π]) */
+    float raw = hatt->relative_pitch * (float)pole_pairs - offset;
+
+    /* Chuẩn hóa vào [0, 2π] chỉ để đàu vào sin/cos — không dùng làm đầu ra */
+    static float prev_raw_p = 0.0f;
+    float delta = raw - prev_raw_p;
+
+    /* Bằng dặt delta vào [-π, +π] (xử lý wrap-around) */
+    while (delta >  ATT_PI)  delta -= ATT_TWO_PI;
+    while (delta < -ATT_PI)  delta += ATT_TWO_PI;
+
+    static float acc_p = 0.0f;
+    acc_p    += delta;
+    prev_raw_p = raw;
+
+    /* Trả về gióc điện đã tích lũy (liên tục) — FOC dùng sin/cos nên chỉ cần
+     * mó 2π không ảnh hưởng kết quả, nhưng việc đầu ra không nhảy giúp debug dễ hơn. */
+    return acc_p;
 }
 
 /**
- * Attitude_GetElecAngleRollRel
- * angle_elec = relative_roll × pole_pairs - offset
+ * Attitude_GetElecAngleRollRel  (phương pháp Continuous Angle Unwrapping)
  */
 float Attitude_GetElecAngleRollRel(const Attitude_Handle_t *hatt,
                                    uint8_t pole_pairs,
                                    float offset)
 {
-    float elec_angle = hatt->relative_roll * (float)pole_pairs - offset;
-    return _normalize_angle(elec_angle);
+    float raw = hatt->relative_roll * (float)pole_pairs - offset;
+
+    static float prev_raw_r = 0.0f;
+    float delta = raw - prev_raw_r;
+
+    while (delta >  ATT_PI)  delta -= ATT_TWO_PI;
+    while (delta < -ATT_PI)  delta += ATT_TWO_PI;
+
+    static float acc_r = 0.0f;
+    acc_r    += delta;
+    prev_raw_r = raw;
+
+    return acc_r;
 }
 
 /* ===========================================================================

@@ -138,27 +138,40 @@ void FOC_InvClarke(FOC_AlphaBeta_t ab, float *ua, float *ub, float *uc)
  * =========================================================================== */
 
 /**
- * @brief  Tính một bước PID với anti-windup (clamping)
+ * @brief  Tính một bước PID với Back-Calculation Anti-Windup
  *
- * output = Kp*e + Ki*∫e*dt + Kd*de/dt
- * Anti-windup: không tích phân nếu output đã bị bão hòa
+ * Chỉ tích phân khi output CHƯA bão hòa.
+ * Tránh hoàn toàn hiện tượng giật khi motor bị kẹt rồi được giải phóng.
  */
 float FOC_PID_Update(FOC_PID_t *pid, float error, float Ts)
 {
     /* Thành phần tỉ lệ */
     float p_term = pid->Kp * error;
 
-    /* Thành phần tích phân (chỉ update khi chưa bão hòa - anti-windup) */
-    pid->integral += pid->Ki * error * Ts;
-    pid->integral  = _clamp(pid->integral, pid->output_min, pid->output_max);
+    /* Tích phân tạm (chưa clamp) */
+    float integral_candidate = pid->integral + pid->Ki * error * Ts;
 
-    /* Thành phần vi phân (trên sai số, không phải output để tránh derivative kick) */
+    /* Thành phần vi phân */
     float d_term = pid->Kd * (error - pid->prev_error) / Ts;
     pid->prev_error = error;
 
-    /* Tổng và clamp */
-    float output = p_term + pid->integral + d_term;
-    return _clamp(output, pid->output_min, pid->output_max);
+    /* Tầm tính output với integral tạm */
+    float output_unlim = p_term + integral_candidate + d_term;
+    float output_lim   = _clamp(output_unlim, pid->output_min, pid->output_max);
+
+    /* Back-calculation anti-windup:
+     * Chỉ chấp nhận tích phân mới nếu output CHƯA bão hòa.
+     * Nếu đang bão hòa, giữ nguyên integral cũ (không để nó tiếp tục tăng). */
+    if (output_unlim == output_lim) {
+        pid->integral = integral_candidate;
+    }
+    /* Nếu output đang vượt ngưỡng và error cùng dấu với độ bão hòa:
+     * chủ động decay nhẹ integral để thoát bão hòa nhanh hơn. */
+    else {
+        pid->integral *= 0.95f;
+    }
+
+    return output_lim;
 }
 
 void FOC_PID_Reset(FOC_PID_t *pid)

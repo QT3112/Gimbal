@@ -183,15 +183,15 @@ int main(void) {
   FOC_Init(&foc_roll, &htim3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
            4249.0f, /* PWM Period - giống TIM2 */
            7,       /* CHÚ Ý: Đếm lại nam châm motor Roll. Nếu 14 cực từ -> điền 7. 22 cực từ -> điền 11 */
-           1.0f,    /* [TĂNG ÁP MẠNH]: Roll chịu tải nặng, nới trần lên 1.5V (Tối đa chỉ nên 3.0V để test) */
+           0.5f,    /* [TĂNG ÁP MẠNH]: Roll chịu tải nặng, nới trần lên 1.5V (Tối đa chỉ nên 3.0V để test) */
            0.002f); /* Ts = 2ms (500Hz) */
 
   FOC_SetLPF_Vel(&foc_roll, 0.98f);
-  FOC_SetPID_Vel(&foc_roll, 0.1f, 0.01f, 0.0f, -foc_roll.voltage_limit, foc_roll.voltage_limit);
+  FOC_SetPID_Vel(&foc_roll, 0.1f, 0.0f, 0.0f, -foc_roll.voltage_limit, foc_roll.voltage_limit);
 
   // Cấu hình PID góc (vòng ngoài) cho Roll
-  pid_roll.Kp = 2.2f; // Lực đàn hồi (Tăng lên 3.0 để chống chọi lực cản tốt hơn)
-  pid_roll.Ki = 0.2f; // [MỚI]: Ki=0.5 sẽ tự động "bơm áp" tích lũy dần cho đến khi Roll về đúng số 0
+  pid_roll.Kp = 1.0f; // Lực đàn hồi (Tăng lên 3.0 để chống chọi lực cản tốt hơn)
+  pid_roll.Ki = 0.0f; // [MỚI]: Ki=0.5 sẽ tự động "bơm áp" tích lũy dần cho đến khi Roll về đúng số 0
   pid_roll.Kd = 0.0f;
   pid_roll.output_min = -10.0f;
   pid_roll.output_max = 10.0f;
@@ -352,16 +352,30 @@ int main(void) {
         Attitude_Update(&att, gx1, gy1, gz1, ax1, ay1, az1, gx2, gy2, gz2, ax2,
                         ay2, az2, dt);
 
-        const float pitch_abs = Attitude_GetPayloadPitch(&att);
-        const float roll_abs  = Attitude_GetPayloadRoll(&att);
+        /* ===================================================================
+         * Outer PID Feedback — Dùng QUATERNION ERROR COMPONENTS (không phải Euler):
+         *
+         *   pitch_err = 2 × q_error[2]  (qy — trục Pitch, ĐỘC LẬP với Roll)
+         *   roll_err  = 2 × q_error[1]  (qx — trục Roll,  ĐỘC LẬP với Pitch)
+         *
+         * Lý do KHÔNG dùng relative_pitch/roll (ZYX Euler):
+         *   ZYX decomp của q_error chứa cross-term qz*qx trong pitch formula →
+         *   khi Roll lệch, Pitch PID thấy "lỗi ảo" → 2 trục đánh chéo nhau.
+         *
+         * Electrical angle vẫn dùng relative_pitch/roll (Euler) vì cần
+         * giá trị góc cơ học đúng để commutate motor.
+         * =================================================================== */
+        const float pitch_err_fb = Attitude_GetQErrorPitch(&att); /* [rad] */
+        const float roll_err_fb  = Attitude_GetQErrorRoll(&att);  /* [rad] */
 
         const float K_ff = 1.0f;
 
         // ================================================================
         // 3A. ĐIỀU KHIỂN TRỤC PITCH
         // ================================================================
-        const float pitch_err    = 0.0f - pitch_abs;
+        const float pitch_err    = 0.0f - pitch_err_fb;
         const float target_vel_p = FOC_PID_Update(&pid_pitch, pitch_err, dt);
+
 
         const float frame_pitch_rate = Attitude_GetFramePitchRate(&att);
         const float ff_pitch = K_ff * frame_pitch_rate;
@@ -378,7 +392,7 @@ int main(void) {
         // ================================================================
         // 3B. ĐIỀU KHIỂN TRỤC ROLL
         // ================================================================
-        const float roll_err     = 0.0f - roll_abs;
+        const float roll_err     = 0.0f - roll_err_fb;   /* Setpoint = 0 (nằm ngang) */
         const float target_vel_r = FOC_PID_Update(&pid_roll, roll_err, dt);
 
         const float frame_roll_rate = Attitude_GetFrameRollRate(&att);
@@ -398,12 +412,13 @@ int main(void) {
         // ================================================================
         static int print_cnt = 0;
         if (++print_cnt >= 10) {
-          printf("[P] Pitch:%.2f TarVel:%.2f Vel:%.2f Vq:%.2f | "
-                 "[R] Roll:%.2f TarVel:%.2f Vel:%.2f Vq:%.2f\r\n",
-                 pitch_abs * RAD_TO_DEG, target_vel_p, cam_pitch_rate, Vq_pitch,
-                 roll_abs  * RAD_TO_DEG, target_vel_r, cam_roll_rate,  Vq_roll);
+          printf("[P] Err:%.2f TarVel:%.2f Rate:%.2f Vq:%.2f | "
+                 "[R] Err:%.2f TarVel:%.2f Rate:%.2f Vq:%.2f\r\n",
+                 pitch_err_fb * RAD_TO_DEG, target_vel_p, cam_pitch_rate, Vq_pitch,
+                 roll_err_fb  * RAD_TO_DEG, target_vel_r, cam_roll_rate,  Vq_roll);
           print_cnt = 0;
         }
+
       }
     }
 

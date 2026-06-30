@@ -211,6 +211,30 @@ float Attitude_GetRelativePitch(const Attitude_Handle_t *hatt);
 /** @return Góc cơ học motor Roll [rad] — tách từ q_error */
 float Attitude_GetRelativeRoll(const Attitude_Handle_t *hatt);
 
+/**
+ * @brief  Trả về sai số Pitch theo Quaternion Error (dùng cho Outer PID).
+ *
+ * Thay vì dùng relative_pitch (ZYX Euler) vốn bị coupling với Roll,
+ * dùng trực tiếp thành phần ảo q_error[2] (qy):
+ *
+ *   pitch_err ≈ 2 × q_error[2]
+ *
+ * Ở các góc nhỏ (´45° trong vùng hoạt động của gimbal), thành phần này
+ * chủ yếu biểu diễn sai số Pitch và độc lập với Roll.
+ *
+ * @return Sai số Pitch tưᨏng đối [rad] — dùng cho outer Angle PID
+ */
+float Attitude_GetQErrorPitch(const Attitude_Handle_t *hatt);
+
+/**
+ * @brief  Trả về sai số Roll theo Quaternion Error (dùng cho Outer PID).
+ *
+ *   roll_err ≈ 2 × q_error[1]
+ *
+ * @return Sai số Roll tưᨏng đối [rad] — dùng cho outer Angle PID
+ */
+float Attitude_GetQErrorRoll(const Attitude_Handle_t *hatt);
+
 /* ---------------------------------------------------------------------------
  * Utility: Tính góc điện cho FOC
  * --------------------------------------------------------------------------- */
