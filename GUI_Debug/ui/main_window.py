@@ -261,11 +261,12 @@ class MainWindow(QMainWindow):
 
         self.lbl_status = QLabel("● Chưa kết nối")
         self.lbl_status.setObjectName("status_idle")
+        self.lbl_gimbal = QLabel("Gimbal: ---")
         self.lbl_fps    = QLabel("FPS: ---")
         self.lbl_bytes  = QLabel("Bytes: 0")
         self.lbl_record = QLabel("")
 
-        for lbl in (self.lbl_status, self.lbl_fps, self.lbl_bytes, self.lbl_record):
+        for lbl in (self.lbl_status, self.lbl_gimbal, self.lbl_fps, self.lbl_bytes, self.lbl_record):
             lbl.setFont(QFont("Monospace", 8))
             lbl.setStyleSheet("color:#888888;")
             layout.addWidget(lbl)
@@ -324,6 +325,7 @@ class MainWindow(QMainWindow):
             self.reader.disconnected.connect(self._on_disconnected)
             self.reader.error_msg.connect(self._on_error)
             self.reader.new_frame.connect(self._on_new_frame)
+            self.reader.sys_msg.connect(self._on_sys_msg)
             self.reader.start()
             self.btn_demo.setEnabled(False)
 
@@ -341,6 +343,7 @@ class MainWindow(QMainWindow):
             self.reader.disconnected.connect(self._on_disconnected)
             self.reader.error_msg.connect(self._on_error)
             self.reader.new_frame.connect(self._on_new_frame)
+            self.reader.sys_msg.connect(self._on_sys_msg)
             self.reader.start()
             self.btn_connect.setEnabled(False)
             self.btn_demo.setText("⏹  Stop Demo")
@@ -416,6 +419,15 @@ class MainWindow(QMainWindow):
 
     def _on_error(self, msg: str):
         self._set_status(f"✗ {msg}", "err")
+
+    def _on_sys_msg(self, msg: str):
+        self.lbl_gimbal.setText(f"Gimbal: {msg}")
+        if "Loi" in msg or "ERROR" in msg:
+            self.lbl_gimbal.setStyleSheet("color:#FF6B6B; font-weight:bold;")
+        elif "RUNNING" in msg or "thanh cong" in msg:
+            self.lbl_gimbal.setStyleSheet("color:#4ECDC4;")
+        else:
+            self.lbl_gimbal.setStyleSheet("color:#E0E0E0;")
 
     def _on_new_frame(self):
         self._frame_count += 1

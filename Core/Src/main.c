@@ -134,28 +134,28 @@ int main(void) {
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
 
   // --- BƯỚC 1: KHỞI TẠO MPU6050 (FRAME & PAYLOAD) ---
-  printf("Dang khoi tao IMU Frame (0x68)...\r\n");
+  printf("$SYS,INIT,IMU Frame...\r\n");
   if (MPU6050_Init(&imu_frame, &hi2c3, MPU6050_ADDR_LOW) == MPU6050_OK) {
     imu_frame_ready = 1;
-    printf("[IMU Frame] Khoi tao thanh cong! Dang calibrate...\r\n");
+    printf("$SYS,INIT,IMU Frame OK, calibrating...\r\n");
     MPU6050_CalibrateGyro(&imu_frame, 500);
-    printf("[IMU Frame] Calibrate xong! Offset X:%.2f, Y:%.2f, Z:%.2f\r\n",
+    printf("$SYS,INIT,IMU Frame Calibrated (X:%.2f Y:%.2f Z:%.2f)\r\n",
            imu_frame.gyro_offset_x, imu_frame.gyro_offset_y,
            imu_frame.gyro_offset_z);
   } else {
-    printf("[IMU Frame] Loi khoi tao!\r\n");
+    printf("$SYS,ERROR,IMU Frame Init Failed\r\n");
   }
 
-  printf("Dang khoi tao IMU Payload (0x69)...\r\n");
+  printf("$SYS,INIT,IMU Payload...\r\n");
   if (MPU6050_Init(&imu_payload, &hi2c3, MPU6050_ADDR_HIGH) == MPU6050_OK) {
     imu_payload_ready = 1;
-    printf("[IMU Payload] Khoi tao thanh cong! Dang calibrate...\r\n");
+    printf("$SYS,INIT,IMU Payload OK, calibrating...\r\n");
     MPU6050_CalibrateGyro(&imu_payload, 500);
-    printf("[IMU Payload] Calibrate xong! Offset X:%.2f, Y:%.2f, Z:%.2f\r\n",
+    printf("$SYS,INIT,IMU Payload Calibrated (X:%.2f Y:%.2f Z:%.2f)\r\n",
            imu_payload.gyro_offset_x, imu_payload.gyro_offset_y,
            imu_payload.gyro_offset_z);
   } else {
-    printf("[IMU Payload] Loi khoi tao!\r\n");
+    printf("$SYS,ERROR,IMU Payload Init Failed\r\n");
   }
 
   // Khởi tạo Attitude Estimator (Mahony filter cho 2 IMU)
@@ -190,7 +190,7 @@ int main(void) {
   FOC_SetPID_Vel(&foc_roll, 0.1f, 0.01f, 0.0f, -foc_roll.voltage_limit, foc_roll.voltage_limit);
 
   // Cấu hình PID góc (vòng ngoài) cho Roll
-  pid_roll.Kp = 2.2f; // Lực đàn hồi (Tăng lên 3.0 để chống chọi lực cản tốt hơn)
+  pid_roll.Kp = 2.5f; // Lực đàn hồi (Tăng lên 3.0 để chống chọi lực cản tốt hơn)
   pid_roll.Ki = 0.2f; // [MỚI]: Ki=0.5 sẽ tự động "bơm áp" tích lũy dần cho đến khi Roll về đúng số 0
   pid_roll.Kd = 0.0f;
   pid_roll.output_min = -10.0f;
@@ -201,7 +201,7 @@ int main(void) {
   // Motor OFF hoàn toàn trong giai đoạn này (FOC_Start chưa được gọi).
   // 500 vòng x 10ms = 5 giây để Mahony hội tụ từ quaternion (1,0,0,0)
   // về góc thực tế chính xác của thiết bị.
-  printf("Dang khoi tao bo loc Mahony (5s). Vui long giu yen Gimbal...\r\n");
+  printf("$SYS,INIT,Mahony warm-up (5s)\r\n");
   for (int i = 0; i < 500; i++) {
     if (MPU6050_ReadAll(&imu_frame) == MPU6050_OK &&
         MPU6050_ReadAll(&imu_payload) == MPU6050_OK) {
@@ -215,11 +215,11 @@ int main(void) {
     }
     // In tiến trình mỗi giây để người dùng biết hệ thống đang chạy
     if (i % 100 == 0) {
-      printf("  Mahony warm-up: %d%%\r\n", i / 5);
+      printf("$SYS,INIT,Mahony warm-up %d%%\r\n", (i * 100) / 500);
     }
     HAL_Delay(10);
   }
-  printf("Bo loc Mahony hoi tu! Pitch=%.2f Roll=%.2f\r\n",
+  printf("$SYS,INIT,Mahony converged! Pitch=%.2f Roll=%.2f\r\n",
          Attitude_GetPayloadPitch(&att) * RAD_TO_DEG,
          Attitude_GetPayloadRoll(&att) * RAD_TO_DEG);
 
@@ -237,7 +237,7 @@ int main(void) {
   // =========================================================================
   FOC_Start(&foc);
   FOC_Start(&foc_roll);
-  printf("[HOMING] Bat dau can chinh Rotor (1.5s). Khong cham vao Gimbal!\r\n");
+  printf("$SYS,HOMING,Aligning Rotor (1.5s)...\r\n");
 
   // --- Giai đoạn 1: Khóa Rotor (150 × 10ms = 1.5 giây) ---
   // Motor bơm Vd cố định để kéo rotor về hướng từ trường stator tại theta=0.
@@ -270,10 +270,8 @@ int main(void) {
   FOC_CalibrateAngle(&foc, start_pitch);
   FOC_CalibrateAngle(&foc_roll, start_roll);
 
-  printf("[HOMING] Xong! RelPitch=%.2f deg | RelRoll=%.2f deg\r\n"
-         "         ElecOffset_Pitch=%.3f rad | ElecOffset_Roll=%.3f rad\r\n",
-         start_pitch * RAD_TO_DEG, start_roll * RAD_TO_DEG, foc.angle_offset,
-         foc_roll.angle_offset);
+  printf("$SYS,HOMING,Done! RelPitch=%.2f deg | RelRoll=%.2f deg\r\n",
+         start_pitch * RAD_TO_DEG, start_roll * RAD_TO_DEG);
 
   // =========================================================================
   // BƯỚC 5: TEST OPEN-LOOP (Xác nhận SVPWM hoạt động đúng)
@@ -288,7 +286,7 @@ int main(void) {
   //   - Nếu Gimbal bị kéo ra khỏi vị trí ngang trong test này là bình thường.
   //   - Bỏ test này (comment out) sau khi đã xác nhận 1 lần thành công.
   // =========================================================================
-  printf("[SVPWM TEST] Chay open-loop 0.5s...\r\n");
+  printf("$SYS,TEST,SVPWM Open-loop 0.5s...\r\n");
   for (int i = 0; i < 50; i++) {
     // Cập nhật góc điện từ q_error mới nhất
     if (MPU6050_ReadAll(&imu_frame) == MPU6050_OK &&
@@ -318,7 +316,7 @@ int main(void) {
   FOC_SetVoltage(&foc_roll, 0.0f, 0.0f);
   FOC_Update(&foc);
   FOC_Update(&foc_roll);
-  printf("[SVPWM TEST] Hoan thanh. Bat dau dieu khien PID...\r\n");
+  printf("$SYS,TEST,Done. Starting PID...\r\n");
 
   /* USER CODE END 2 */
 
@@ -355,7 +353,7 @@ int main(void) {
         const float pitch_abs = Attitude_GetPayloadPitch(&att);
         const float roll_abs  = Attitude_GetPayloadRoll(&att);
 
-        const float K_ff = 1.0f;
+        const float K_ff = 0.0f;
 
         // ================================================================
         // 3A. ĐIỀU KHIỂN TRỤC PITCH
@@ -424,6 +422,24 @@ int main(void) {
 
           print_cnt = 0;
         }
+
+        static int run_cnt = 0;
+        if (++run_cnt >= 50) {
+          printf("$SYS,RUNNING\r\n");
+          run_cnt = 0;
+        }
+      } else {
+        static int err_cnt = 0;
+        if (++err_cnt >= 50) {
+          printf("$SYS,ERROR,IMU Read Failed\r\n");
+          err_cnt = 0;
+        }
+      }
+    } else {
+      static int err_cnt = 0;
+      if (++err_cnt >= 50) {
+        printf("$SYS,ERROR,IMU Not Ready\r\n");
+        err_cnt = 0;
       }
     }
 

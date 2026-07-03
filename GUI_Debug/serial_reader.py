@@ -39,6 +39,7 @@ class SerialReaderThread(QThread):
     error_msg    = pyqtSignal(str)
     connected    = pyqtSignal(str)       # arg: port name
     disconnected = pyqtSignal()
+    sys_msg      = pyqtSignal(str)       # arg: system status message
 
     EXPECTED_TAGS = {'$IMU', '$ATT', '$PID', '$FOC'}
 
@@ -93,7 +94,11 @@ class SerialReaderThread(QThread):
                 if not line.startswith('$'):
                     continue
 
-                tag = line.split(',')[0]
+                tag, _, body = line.partition(',')
+                if tag == '$SYS':
+                    self.sys_msg.emit(body)
+                    continue
+
                 if tag not in self.EXPECTED_TAGS:
                     continue
 
@@ -127,6 +132,7 @@ class DemoThread(QThread):
     error_msg    = pyqtSignal(str)
     connected    = pyqtSignal(str)
     disconnected = pyqtSignal()
+    sys_msg      = pyqtSignal(str)
 
     def __init__(self, store, parent=None):
         super().__init__(parent)

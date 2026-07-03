@@ -1,0 +1,1 @@
+time_s,imu_f_ax,imu_f_ay,imu_f_az,imu_f_gx,imu_f_gy,imu_f_gz,imu_p_ax,imu_p_ay,imu_p_az,imu_p_gx,imu_p_gy,imu_p_gz,frame_pitch,frame_roll,frame_yaw,pay_pitch,pay_roll,pay_yaw,rel_pitch,rel_roll,p_err,t_vel_p,ff_pitch,cam_pr,vel_err_p,vq_pitch,r_err,t_vel_r,ff_roll,cam_rr,vel_err_r,vq_roll,elec_p,elec_r,off_p,off_r

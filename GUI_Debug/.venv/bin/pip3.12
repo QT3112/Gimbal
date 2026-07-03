@@ -1,4 +1,4 @@
-#!/home/qtoan/dev/workspaces/stm/Gimbal/GUI_Debug/.venv/bin/python3
+#!/home/qtoan/dev/Workspaces/stm/Gimbal/GUI_Debug/.venv/bin/python
 # -*- coding: utf-8 -*-
 import re
 import sys

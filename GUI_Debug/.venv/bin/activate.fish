@@ -33,7 +33,7 @@ end
 # Unset irrelevant variables.
 deactivate nondestructive
 
-set -gx VIRTUAL_ENV /home/qtoan/dev/workspaces/stm/Gimbal/GUI_Debug/.venv
+set -gx VIRTUAL_ENV /home/qtoan/dev/Workspaces/stm/Gimbal/GUI_Debug/.venv
 
 set -gx _OLD_VIRTUAL_PATH $PATH
 set -gx PATH "$VIRTUAL_ENV/"bin $PATH
