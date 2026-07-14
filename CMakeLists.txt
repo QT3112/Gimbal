@@ -54,6 +54,8 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     UserLibs/imu_filter/Src/imu_filter.c
     UserLibs/attitude/Src/attitude.c
     UserLibs/examples/Src/examples.c
+    UserLibs/pid_lib/Src/pid_lib.c
+    # UserLibs/foc_v1/Src/foc_v1.c
 )
 
 # Add include paths
@@ -67,6 +69,8 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     UserLibs/imu_filter/Inc
     UserLibs/attitude/Inc
     UserLibs/examples/Inc
+    UserLibs/pid_lib/Inc
+    # UserLibs/foc_v1/Inc
 )
 
 # Add project symbols (macros)

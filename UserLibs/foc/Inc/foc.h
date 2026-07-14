@@ -212,9 +212,11 @@ void FOC_Update(FOC_Handle_t *hfoc);
 void FOC_Stop(FOC_Handle_t *hfoc);
 
 /**
- * @brief  Bật FOC output
+ * @brief  Bật FOC output — PHẢI truyền góc encoder hiện tại để tránh velocity spike
+ * @param  hfoc          Con trỏ FOC_Handle_t
+ * @param  current_angle Góc cơ học hiện tại từ encoder [rad]
  */
-void FOC_Start(FOC_Handle_t *hfoc);
+void FOC_Start(FOC_Handle_t *hfoc, float current_angle);
 
 /**
  * @brief  Hiệu chỉnh góc zero (align encoder với rotor)

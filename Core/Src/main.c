@@ -31,6 +31,7 @@
 #include "stdint.h"
 #include "stdio.h"
 #include "as5048a.h"
+#include "pid_lib.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -61,7 +62,7 @@
 #define POS_VEL_MAX         2.0f    /* Tốc độ cơ học tối đa ra PID [rad/s] */
 
 /* --- PID vòng tốc độ (inner loop) --- */
-#define VEL_KP              0.10f
+#define VEL_KP              0.08f
 #define VEL_KI              0.02f
 #define VEL_KD              0.0f
 #define VEL_LPF_ALPHA       0.85f   /* Lọc nhiễu tốc độ encoder */
@@ -87,7 +88,7 @@ uint8_t encoder_ready = 0;
 FOC_Handle_t foc;
 
 /* --- PID vòng vị trí (position loop) --- */
-FOC_PID_t pid_pos;
+PID_Handle_t pid_pos;
 
 /* USER CODE END PV */
 
@@ -121,6 +122,28 @@ static float wrap_angle(float a)
     while (a < -PI) a += 2.0f * PI;
     return a;
 }
+
+// float voltage_limit = 0.05f;
+// volatile float theta = 0.0f;
+// float velocity = 5.0f; // rad/s điện
+// float Ts = 0.0001f;    // 100us
+
+// void setPhaseVoltage(float theta) {
+//   float Ua, Ub, Uc;
+
+//   Ua = 0.5f + voltage_limit * sinf(theta);
+//   Ub = 0.5f + voltage_limit * sinf(theta - 2.0f * PI / 3.0f);
+//   Uc = 0.5f + voltage_limit * sinf(theta - 4.0f * PI / 3.0f);
+
+//   uint16_t dutyA = (uint16_t)(Ua * PWM_PERIOD);
+//   uint16_t dutyB = (uint16_t)(Ub * PWM_PERIOD);
+//   uint16_t dutyC = (uint16_t)(Uc * PWM_PERIOD);
+
+//   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, dutyA);
+//   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, dutyB);
+//   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, dutyC);
+// }
+
 
 /* USER CODE END 0 */
 
@@ -203,23 +226,14 @@ int main(void)
   FOC_SetLPF_Vel(&foc, VEL_LPF_ALPHA);
 
   /* Cài PID vị trí (position loop — ngoài FOC) */
-  pid_pos.Kp         = POS_KP;
-  pid_pos.Ki         = POS_KI;
-  pid_pos.Kd         = POS_KD;
-  pid_pos.integral   = 0.0f;
-  pid_pos.prev_error = 0.0f;
-  pid_pos.output_min = -POS_VEL_MAX;
-  pid_pos.output_max =  POS_VEL_MAX;
+  PID_Init(&pid_pos, POS_KP, POS_KI, POS_KD, -POS_VEL_MAX, POS_VEL_MAX);
 
   /* =========================================================================
    * PHASE 1: ALIGN — Lock rotor về D-axis để hiệu chỉnh offset encoder
    * =========================================================================
-   * Áp Vd tại angle_elec=0 trong ALIGN_DURATION_MS ms.
-   * Sau khi rotor đứng yên, đọc encoder → lưu làm angle_offset.
-   * Không cần encoder sẵn sàng cho bước này (chỉ dùng Vd cố định).
    */
-  printf("[ALIGN] Bat dau align encoder...\r\n");
-  FOC_Start(&foc);
+  printf("[ALIGN] Bat dau khoa motor de can chinh...\r\n");
+  FOC_Start(&foc, encoder.angle_rad);  /* Truyền góc hiện tại để tránh spike */
 
   uint32_t align_start = HAL_GetTick();
   while ((HAL_GetTick() - align_start) < ALIGN_DURATION_MS) {
@@ -231,86 +245,62 @@ int main(void)
   if (encoder_ready) {
     if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
       FOC_CalibrateAngle(&foc, encoder.angle_rad);
-      printf("[ALIGN] Hoan thanh. angle_offset=%.4f rad (%.2f deg)\r\n",
+      printf("[ALIGN] Thanh cong! Offset = %.4f rad (%.2f deg)\r\n",
              foc.angle_offset, foc.angle_offset * RAD_TO_DEG);
     } else {
-      printf("[ALIGN] Loi doc encoder! Dung chuong trinh.\r\n");
-      FOC_Stop(&foc);
-      Error_Handler();
+      printf("[ALIGN] Loi doc encoder! Khong the lay offset.\r\n");
     }
   } else {
-    /* Không có encoder → không thể chạy closed-loop */
-    printf("[ALIGN] Encoder chua san sang! Dung chuong trinh.\r\n");
-    FOC_Stop(&foc);
-    Error_Handler();
+    printf("[ALIGN] Encoder chua san sang!\r\n");
   }
 
-  printf("[HOME] Bat dau ve 0 do...\r\n");
-  /* USER CODE END 2 */
+  /* --- Chuyển sang test Vòng Vị Trí (Position/Gimbal Loop) --- */
+  printf("[POS] Bat dau test vong vi tri. Target: 0 rad\r\n");
 
-  /* =========================================================================
-   * PHASE 2: HOME → 0° và giữ vị trí (Position Hold Loop)
-   * =========================================================================
-   *
-   * Kiến trúc cascade:
-   *
-   *  Target = 0 rad
-   *       │
-   *       ▼
-   *   [PID_pos]  ← error = wrap(0 - angle_mech)
-   *       │  target_vel [rad/s]
-   *       ▼
-   *   [FOC_RunVelocity]  ← angle_mech từ encoder
-   *       │
-   *       ▼
-   *     PWM → Motor
-   *
-   * Khi motor đã trong ngưỡng HOLD_THRESHOLD_RAD thì in "[HOLD]".
-   */
+  /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t print_counter = 0;
   while (1) {
 
+    /* --- Đọc AS5048A Encoder --- */
+    if (encoder_ready) {
+      AS5048A_Status_t ret = AS5048A_ReadAngle(&encoder);
+      if (ret == AS5048A_OK) {
+        
+        /* 1. Tính sai số vị trí theo đường ngắn nhất (Target = 0.0 rad) */
+        float pos_error = wrap_angle(0.0f - encoder.angle_rad);
+
+        /* 2. Đưa sai số vào PID vị trí để suy ra vận tốc mục tiêu cần thiết */
+        float target_vel = PID_Update(&pid_pos, pos_error, TS_S);
+
+        /* 3. Đưa vận tốc mục tiêu vào vòng FOC 
+         * LƯU Ý QUAN TRỌNG: Nếu khi bật lên motor quay tít thò lò cắm đầu đi xa khỏi gốc,
+         * nghĩa là dấu bị ngược. Bạn hãy thêm dấu trừ: -target_vel
+         */
+        FOC_RunVelocity(&foc, encoder.angle_rad, target_vel);
+
+        /* In ra trạng thái (mỗi 200ms) */
+        print_counter++;
+        if (print_counter >= 20) {
+            printf("[POS] Err: %6.2f deg | Vel_cmd: %5.2f | Vq: %5.3f\r\n", 
+                   pos_error * RAD_TO_DEG, target_vel, foc.Vq_ref);
+            print_counter = 0;
+        }
+
+      } else {
+        /* Có lỗi: đọc và xóa error register */
+        uint16_t err_bits = 0;
+        AS5048A_ClearErrors(&encoder, &err_bits);
+        printf("[ENC] Loi doc: status=%d | err_bits=0x%04X\r\n", ret, err_bits);
+      }
+    }
+
+    HAL_Delay(10); /* Tần số điều khiển 100Hz (Ts = 0.01s) */
+
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
-
-    /* --- Đọc encoder --- */
-    AS5048A_Status_t enc_ret = AS5048A_ReadAngle(&encoder);
-    if (enc_ret != AS5048A_OK) {
-      /* Lỗi đọc: xóa lỗi, bỏ qua chu kỳ này để không gây giật motor */
-      uint16_t err_bits = 0;
-      AS5048A_ClearErrors(&encoder, &err_bits);
-      printf("[ENC] Loi: status=%d err=0x%04X\r\n", enc_ret, err_bits);
-      HAL_Delay(10);
-      continue;
-    }
-
-    float angle_mech = encoder.angle_rad;  /* [0, 2π) */
-
-    /* --- PID vòng vị trí: sai số theo đường ngắn nhất (shortest path) --- */
-    float pos_error  = wrap_angle(0.0f - angle_mech);  /* target = 0 rad */
-    float target_vel = FOC_PID_Update(&pid_pos, pos_error, TS_S);
-    target_vel = clamp_f(target_vel, -POS_VEL_MAX, POS_VEL_MAX);
-
-    /* --- Vòng tốc độ + FOC transforms → PWM --- */
-    /* NOTE: Đảo dấu velocity vì chiều quay điện (FOC) ngược chiều encoder.
-     *       Nếu motor vẫn dao động sau khi flash, thử bỏ dấu trừ hoặc
-     *       hoán đổi 2 dây pha (B↔C) trên phần cứng. */
-    FOC_RunVelocity(&foc, angle_mech, -target_vel);
-
-    /* --- Log trạng thái --- */
-    float err_deg = pos_error * RAD_TO_DEG;
-    if (fabsf(pos_error) < HOLD_THRESHOLD_RAD) {
-      printf("[HOLD] angle=%.2f deg | err=%.2f deg | vel=%.3f rad/s\r\n",
-             encoder.angle_deg, err_deg, target_vel);
-    } else {
-      printf("[HOME] angle=%.2f deg | err=%.2f deg | vel=%.3f rad/s\r\n",
-             encoder.angle_deg, err_deg, target_vel);
-    }
-
-    HAL_Delay(10);  /* Chu kỳ 10ms = TS_S */
   }
   /* USER CODE END 3 */
 }

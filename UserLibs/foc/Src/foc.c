@@ -116,21 +116,36 @@ FOC_AlphaBeta_t FOC_InvPark(FOC_DQ_t dq, float theta_e)
 }
 
 /**
- * @brief  Clarke ngược: (α, β) → (ua, ub, uc) chuẩn hóa [0.0, 1.0]
+ * @brief  Clarke ngược + SVPWM centering: (α, β) → (ua, ub, uc) centered
  *
- * Công thức 3-phase từ tọa độ αβ:
- *   Ua_centered =  Vα
- *   Ub_centered = -Vα/2 + Vβ*√3/2
- *   Uc_centered = -Vα/2 - Vβ*√3/2
+ * Bước 1 — Tính sóng sin 3-pha chuẩn (SPWM):
+ *   Ua =  Vα
+ *   Ub = -Vα/2 + Vβ*√3/2
+ *   Uc = -Vα/2 - Vβ*√3/2
  *
- * Sau đó thêm offset 0.5 để đưa về [0, 1] (centered modulation):
- *   Ua = 0.5 + Ua_centered / voltage_limit
+ * Bước 2 — SVPWM Min-Max Centering (Zero-Sequence Injection):
+ *   Thêm thành phần common-mode = -(Vmax + Vmin) / 2
+ *   Điều này tái căn giữa các sóng điện áp quanh điểm 0, cho phép biên độ
+ *   tối đa tăng thêm 15.5% so với SPWM thuần mà không bị méo dạng.
+ *   Đây là kỹ thuật tương đương Space Vector PWM trong miền thời gian.
+ *
+ * Output: điện áp centered quanh 0, cần normalize và +0.5 trước khi áp PWM.
  */
 void FOC_InvClarke(FOC_AlphaBeta_t ab, float *ua, float *ub, float *uc)
 {
-    *ua =  ab.alpha;
-    *ub = -ab.alpha * 0.5f + ab.beta * FOC_SQRT3_2;
-    *uc = -ab.alpha * 0.5f - ab.beta * FOC_SQRT3_2;
+    /* Bước 1: Clarke ngược chuẩn → sóng 3-pha */
+    float a =  ab.alpha;
+    float b = -ab.alpha * 0.5f + ab.beta * FOC_SQRT3_2;
+    float c = -ab.alpha * 0.5f - ab.beta * FOC_SQRT3_2;
+
+    /* Bước 2: SVPWM — tiêm sóng common-mode (min-max centering) */
+    float v_min = (a < b) ? ((a < c) ? a : c) : ((b < c) ? b : c);
+    float v_max = (a > b) ? ((a > c) ? a : c) : ((b > c) ? b : c);
+    float v_center = (v_min + v_max) * 0.5f;
+
+    *ua = a - v_center;
+    *ub = b - v_center;
+    *uc = c - v_center;
 }
 
 /* ===========================================================================
@@ -141,19 +156,24 @@ void FOC_InvClarke(FOC_AlphaBeta_t ab, float *ua, float *ub, float *uc)
  * @brief  Tính một bước PID với anti-windup (clamping)
  *
  * output = Kp*e + Ki*∫e*dt + Kd*de/dt
- * Anti-windup: không tích phân nếu output đã bị bão hòa
+ *
+ * Anti-windup: tích phân bị clamp trong [output_min, output_max].
+ * Lưu ý về Derivative Kick: công thức vi phân trên ERROR (d(error)/dt)
+ * sẽ tạo spike khi setpoint thay đổi đột ngột. Để triệt tiêu hoàn toàn
+ * Derivative Kick, cần vi phân trên MEASUREMENT: -Kd * d(measurement)/dt.
+ * Với Gimbal, setpoint thay đổi mượt nên cách hiện tại là chấp nhận được.
  */
 float FOC_PID_Update(FOC_PID_t *pid, float error, float Ts)
 {
     /* Thành phần tỉ lệ */
     float p_term = pid->Kp * error;
 
-    /* Thành phần tích phân (chỉ update khi chưa bão hòa - anti-windup) */
+    /* Thành phần tích phân với anti-windup clamp */
     pid->integral += pid->Ki * error * Ts;
     pid->integral  = _clamp(pid->integral, pid->output_min, pid->output_max);
 
-    /* Thành phần vi phân (trên sai số, không phải output để tránh derivative kick) */
-    float d_term = pid->Kd * (error - pid->prev_error) / Ts;
+    /* Thành phần vi phân (d(error)/dt) */
+    float d_term = (Ts > 1e-9f) ? (pid->Kd * (error - pid->prev_error) / Ts) : 0.0f;
     pid->prev_error = error;
 
     /* Tổng và clamp */
@@ -254,13 +274,13 @@ void FOC_Update(FOC_Handle_t *hfoc)
     FOC_DQ_t dq_ref = { hfoc->Vd_ref, hfoc->Vq_ref };
     hfoc->V_ab = FOC_InvPark(dq_ref, theta_e);
 
-    /* Bước 2: Clarke Inverse → 3 pha centered (centered around 0) */
+    /* Bước 2: Clarke Inverse + SVPWM → 3 pha centered quanh 0 */
     float ua_c, ub_c, uc_c;
     FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
 
-    /* Bước 3: Normalize điện áp về duty cycle [0, 1]
-     * ua_c, ub_c, uc_c nằm trong [-voltage_limit, +voltage_limit]
-     * Chia cho voltage_limit để về [-1, 1], rồi thêm 0.5 để về [0, 1] */
+    /* Bước 3: Normalize về duty cycle [0, 1]
+     * SVPWM tận dụng được đến 1/sqrt(3) ≈ 0.577 × Vdc (so với SPWM là 0.5 × Vdc)
+     * Dùng voltage_limit làm mốc scale để giữ tương thích với cài đặt hiện tại */
     float inv_vmax = 1.0f / hfoc->voltage_limit;
     float ua = 0.5f + ua_c * inv_vmax * 0.5f;
     float ub = 0.5f + ub_c * inv_vmax * 0.5f;
@@ -283,10 +303,26 @@ void FOC_Stop(FOC_Handle_t *hfoc)
     __HAL_TIM_SET_COMPARE(hfoc->htim, hfoc->ch_c, mid);
 }
 
-void FOC_Start(FOC_Handle_t *hfoc)
+/**
+ * @brief  Bật FOC output — PHẢI truyền góc encoder hiện tại
+ *
+ * Lý do cần current_angle: khi bắt đầu, prev_angle_mech = 0.
+ * Nếu encoder thực tế đang ở 3.14 rad, chu kỳ đầu tiên của
+ * FOC_RunVelocity sẽ tính d_angle = 3.14 / Ts → velocity spike 314 rad/s.
+ * Bằng cách khởi tạo prev_angle_mech với góc hiện tại, d_angle ≈ 0 và
+ * PID tốc độ khởi động êm ái.
+ *
+ * @param  hfoc          Con trỏ FOC_Handle_t
+ * @param  current_angle Góc cơ học hiện tại từ encoder [rad]
+ */
+void FOC_Start(FOC_Handle_t *hfoc, float current_angle)
 {
     FOC_PID_Reset(&hfoc->pid_d);
     FOC_PID_Reset(&hfoc->pid_q);
+    FOC_PID_Reset(&hfoc->pid_vel);
+    hfoc->lpf_vel.output   = 0.0f;
+    hfoc->velocity_mech    = 0.0f;
+    hfoc->prev_angle_mech  = current_angle;  /* <-- Fix velocity spike */
     hfoc->enabled = 1;
 }
 
@@ -436,7 +472,7 @@ void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
     hfoc->angle_mech = angle_mech_rad;
     hfoc->angle_elec = _normalize_angle(elec);
 
-    /* --- Bước 5: FOC transforms → PWM --- */
+    /* --- Bước 5: FOC transforms → PWM (dùng SVPWM qua FOC_InvClarke) --- */
     FOC_DQ_t dq_ref = { hfoc->Vd_ref, hfoc->Vq_ref };
     hfoc->V_ab = FOC_InvPark(dq_ref, hfoc->angle_elec);
 
@@ -447,8 +483,6 @@ void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
     float ua = 0.5f + ua_c * inv_vmax * 0.5f;
     float ub = 0.5f + ub_c * inv_vmax * 0.5f;
     float uc = 0.5f + uc_c * inv_vmax * 0.5f;
-    // printf("tgt_vel=%.2f | vel_mech=%.2f | Vq=%.2f | agl_mech=%.2f | agl_elec=%.2f | ua= %.2f | ub=%.2f | uc=%.2f |", 
-    //     target_vel_rad_s, hfoc->velocity_mech, hfoc->Vq_ref, hfoc->angle_mech, hfoc->angle_elec, ua, ub, uc);
 
     _apply_pwm(hfoc, ua, ub, uc);
 }
