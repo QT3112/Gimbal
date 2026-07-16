@@ -2,23 +2,30 @@
 /**
  ******************************************************************************
  * @file           : main.c
- * @brief          : Main program body — Motor homing to 0° and hold
- ******************************************************************************
- * @attention
+ * @brief          : FOC Motor Control — Cascade 3-Loop (Position/Velocity/Current)
  *
- * Copyright (c) 2026 STMicroelectronics.
- * All rights reserved.
+ * Kiến trúc điều khiển:
  *
- * This software is licensed under terms that can be found in the LICENSE file
- * in the root directory of this software component.
- * If no LICENSE file comes with this software, it is provided AS-IS.
+ *   [TIM6 Ngắt @1ms]  — Vòng ngoài
+ *        ├─ Đọc encoder AS5048A (Blocking SPI)
+ *        ├─ PID vị trí → target_vel
+ *        └─ FOC_RunVelocity() → tính Iq_ref (KHÔNG xuất PWM)
  *
+ *   [ADC Injected ISR @~8.5kHz]  — Vòng trong (Current Loop)
+ *        ├─ Đọc SO1, SO2 → Ia, Ib
+ *        └─ FOC_UpdateCurrentLoop() → Clarke→Park→PID_dq→InvPark→SVPWM→PWM
+ *
+ *   [while(1)] — Chỉ in Serial (100ms), không chạm vào motor
+ *
+ * ⚠️  FOC_CURRENT_SENSING_ENABLED: Bật/tắt Current Loop
+ *     Khi tắt: Voltage-Mode fallback (tương thích code cũ)
  ******************************************************************************
  */
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
-#include "i2c.h"
+#include "adc.h"
+#include "dma.h"
 #include "spi.h"
 #include "tim.h"
 #include "usb_device.h"
@@ -48,27 +55,65 @@
 
 /* --- Thông số motor --- */
 #define MOTOR_POLE_PAIRS    14       /* Số cặp cực — chỉnh theo motor thực tế */
-#define VOLTAGE_LIMIT       0.15f   /* Giới hạn điện áp [V] — tăng nếu motor yếu */
-#define TS_S                0.01f   /* Chu kỳ điều khiển: 10ms (phù hợp HAL_Delay(10)) */
+#define VOLTAGE_LIMIT       6.0f     /* Giới hạn điện áp phase [V] = 1/2 V_BUS. Nếu nguồn 12V -> 6.0f */
+#define TS_S                0.001f   /* Chu kỳ điều khiển: 1ms (TIM6 ngắt @ 1000Hz) */
 
 /* --- Align encoder --- */
-#define ALIGN_VD            0.10f   /* Điện áp Vd khi align [V] */
-#define ALIGN_DURATION_MS   600U    /* Thời gian giữ Vd để rotor lock [ms] */
+#define ALIGN_VD            3.0f     /* Điện áp Vd khi align [V]. 3.0V là đủ cho motor ~10 ohm */
+#define ALIGN_DURATION_MS   600U     /* Thời gian giữ Vd để rotor lock [ms] */
 
-/* --- PID vòng vị trí --- */
-#define POS_KP              3.0f    /* Tỉ lệ: tăng nếu đáp ứng chậm */
-#define POS_KI              0.05f   /* Tích phân: triệt sai số xác lập */
-#define POS_KD              0.0f    /* Vi phân: tăng nếu overshoot nhiều */
-#define POS_VEL_MAX         2.0f    /* Tốc độ cơ học tối đa ra PID [rad/s] */
+/* --- PID vòng vị trí (outer loop) --- */
+/* LƯU Ý KIẾN TRÚC CASCADE:                                                  */
+/*   Vòng current bên trong FOC đóng vai trò Damping tự nhiên rất tốt.       */
+/*   KHÔNG dùng KD ở outer loop — sẽ tạo "double-derivative" gây mất ổn định */
+#define POS_KP              0.8f     /* Tăng nếu về chậm, giảm nếu dao động */
+#define POS_KI              0.0f     /* Chỉ bật sau khi KP đã ổn định */
+#define POS_KD              0.0f     /* Tắt — inner current loop đã damping */
+#define POS_VEL_MAX         1.5f     /* Giới hạn vận tốc [rad/s] */
 
-/* --- PID vòng tốc độ (inner loop) --- */
-#define VEL_KP              0.08f
-#define VEL_KI              0.02f
+/* --- PID vòng tốc độ (middle loop) --- */
+/* Khi CURRENT_SENSING_ENABLED: out_min/max là giới hạn Iq [A]               */
+/* Khi không: out_min/max là giới hạn Vq [V] (Voltage-Mode fallback)         */
+#define VEL_KP              3.20f    /* Đã được nhân 40 lần do VOLTAGE_LIMIT tăng từ 0.15 lên 6.0 */
+#define VEL_KI              0.0f
 #define VEL_KD              0.0f
-#define VEL_LPF_ALPHA       0.85f   /* Lọc nhiễu tốc độ encoder */
+#define VEL_LPF_ALPHA       0.95f    /* Lọc nhiễu tốc độ (0=không lọc, 0.99=lọc mạnh) */
 
-/* --- Ngưỡng "đã về 0°" --- */
-#define HOLD_THRESHOLD_RAD  (2.0f * DEG_TO_RAD)   /* ±2° = coi như đến nơi */
+/* --- PID vòng dòng điện (inner loop) --- */
+/* Điểm khởi đầu an toàn: Kp=0.5, Ki=100.0 */
+#define CUR_KP              0.5f
+#define CUR_KI              100.0f
+#define CUR_KD              0.0f
+
+/* --- Cấu hình cảm biến dòng DRV8302 --- */
+/* Bỏ comment dòng dưới khi phần cứng ADC đã sẵn sàng (SO1/SO2 đã hàn dây)  */
+#define FOC_CURRENT_SENSING_ENABLED
+#define SHUNT_RESISTANCE    0.005f   /* Điện trở shunt [Ω] — đo lại trên board */
+#define CURRENT_SENSE_GAIN  10.0f    /* Hệ số khuếch đại DRV8302 GAIN=GND: 10, GAIN=VCC: 40 */
+#define CURRENT_LIMIT_A     1.0f     /* Giới hạn dòng tối đa bảo vệ [A] - Hạ xuống 1.0A để test an toàn */
+
+/* Chu kỳ Current Loop = 1 / f_PWM
+ * f_PWM = f_TIM / (2 * ARR) với Center-Aligned = 170MHz / (2 * 10000) = 8500Hz */
+#define TS_CURRENT_S        (1.0f / 8500.0f)
+
+/* --- Ngưỡng giữ vị trí --- */
+#define HOLD_THRESHOLD_RAD  (2.0f * DEG_TO_RAD)   /* ±2° = coi như đến đích */
+
+/* ==========================================================================
+ * CHẾ ĐỘ TEST ĐỌC DÒNG ĐIỆN
+ * Bỏ comment dòng dưới để bật test mode:
+ *   - Motor tắt hoàn toàn (không phát PWM)
+ *   - ADC Injected đọc SO1/SO2 liên tục
+ *   - In Ia, Ib, offset thực tế ra Serial mỗi 200ms
+ * Mục tiêu: Xác nhận Ia ≈ 0A, Ib ≈ 0A khi motor đứng yên
+ * ========================================================================== */
+// #define TEST_CURRENT_SENSE
+
+/* --- AS5048A SPI: lệnh đọc góc (2 frame pipeline theo datasheet) --- */
+/* Frame 1: gửi READ 0x3FFF, Frame 2: gửi NOP 0xC000 để lấy dữ liệu frame 1 */
+#define AS5048A_CMD_READ_ANGLE   0xFFFFU   /* READ(1) + Addr(0x3FFF) + parity tính sẵn */
+#define AS5048A_CMD_NOP          0xC000U
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -82,67 +127,62 @@
 
 /* --- AS5048A Encoder --- */
 AS5048A_Handle_t encoder;
-uint8_t encoder_ready = 0;
+volatile uint8_t encoder_ready = 0;
 
-/* --- FOC Handle --- */
+/* --- Trạng thái điều khiển --- */
+typedef enum {
+    STATE_ALIGN = 0,    /* Đang khóa rotor */
+    STATE_RUN,          /* Vòng vị trí đang hoạt động */
+} CtrlState_t;
+volatile CtrlState_t ctrl_state = STATE_ALIGN;
+
+/* --- FOC & PID handles --- */
 FOC_Handle_t foc;
-
-/* --- PID vòng vị trí (position loop) --- */
 PID_Handle_t pid_pos;
+
+/* --- Biến chia sẻ giữa ISR và while(1) (volatile để tránh lỗi cache) --- */
+volatile float g_angle_rad  = 0.0f;
+volatile float g_pos_error  = 0.0f;
+volatile float g_target_vel = 0.0f;
+volatile float g_Vq_ref     = 0.0f;
+
+/* --- Biến debug Current Loop --- */
+volatile float g_Ia     = 0.0f;   /* Dòng pha A đo được [A] */
+volatile float g_Ib     = 0.0f;   /* Dòng pha B đo được [A] */
+volatile float g_Id     = 0.0f;   /* Dòng d-axis sau Park [A] */
+volatile float g_Iq     = 0.0f;   /* Dòng q-axis sau Park [A] */
+
+/* Biến dùng cho test mode: lưu ADC raw và điện áp thực tế */
+volatile uint32_t g_raw_A   = 0;      /* ADC thô kênh A (0-4095) */
+volatile uint32_t g_raw_B   = 0;      /* ADC thô kênh B (0-4095) */
+volatile float    g_vsen_A  = 0.0f;   /* Điện áp SO1 [V] */
+volatile float    g_vsen_B  = 0.0f;   /* Điện áp SO2 [V] */
+
+/* Offset tự động calib lúc khởi động */
+volatile float g_offset_A   = 1.65f;
+volatile float g_offset_B   = 1.65f;
 
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 /* USER CODE BEGIN PFP */
-static float clamp_f(float v, float mn, float mx);
-static float wrap_angle(float a);          /* Chuẩn hóa về [-π, +π] */
+static inline float wrap_angle(float a);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 /**
- * @brief  Clamp float trong [mn, mx]
+ * @brief  Đưa góc về [-π, +π] (shortest path)
  */
-static float clamp_f(float v, float mn, float mx)
-{
-    if (v < mn) return mn;
-    if (v > mx) return mx;
-    return v;
-}
-
-/**
- * @brief  Đưa góc về phạm vi [-π, +π]
- *         Dùng để tính sai số vị trí ngắn nhất (shortest path)
- */
-static float wrap_angle(float a)
+static inline float wrap_angle(float a)
 {
     while (a >  PI) a -= 2.0f * PI;
     while (a < -PI) a += 2.0f * PI;
     return a;
 }
 
-// float voltage_limit = 0.05f;
-// volatile float theta = 0.0f;
-// float velocity = 5.0f; // rad/s điện
-// float Ts = 0.0001f;    // 100us
-
-// void setPhaseVoltage(float theta) {
-//   float Ua, Ub, Uc;
-
-//   Ua = 0.5f + voltage_limit * sinf(theta);
-//   Ub = 0.5f + voltage_limit * sinf(theta - 2.0f * PI / 3.0f);
-//   Uc = 0.5f + voltage_limit * sinf(theta - 4.0f * PI / 3.0f);
-
-//   uint16_t dutyA = (uint16_t)(Ua * PWM_PERIOD);
-//   uint16_t dutyB = (uint16_t)(Ub * PWM_PERIOD);
-//   uint16_t dutyC = (uint16_t)(Uc * PWM_PERIOD);
-
-//   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, dutyA);
-//   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, dutyB);
-//   __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_3, dutyC);
-// }
 
 
 /* USER CODE END 0 */
@@ -176,28 +216,41 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_USB_Device_Init();
-  MX_I2C3_Init();
-  MX_TIM2_Init();
   MX_SPI1_Init();
   MX_TIM6_Init();
   MX_TIM3_Init();
+  MX_ADC1_Init();
+  MX_ADC2_Init();
+  MX_TIM1_Init();
+  MX_TIM8_Init();
   /* USER CODE BEGIN 2 */
 
   /* --- Khởi động PWM 3 pha --- */
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_3);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+#ifndef TEST_CURRENT_SENSE
+  /* Chế độ bình thường: bật PWM */
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4); /* Bật Channel 4 để làm trigger ADC (TRGO) */
+  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);
+#else
+  /* Test mode: CHỈ cần TIM1 chạy để phát TRGO trigger cho ADC.
+   * KHÔNG bật PWM channel → motor không quay, an toàn tuyệt đối.
+   * TIM1 Base phải chạy để TRGO hoạt động. */
+  HAL_TIM_Base_Start(&htim1);  /* Chỉ chạy bộ đếm, không phát PWM ra chân */
+  printf("[TEST] Current Sense Test Mode — Motor OFF\r\n");
+#endif
 
   /* Enable gate driver */
   HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6,  GPIO_PIN_SET);
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_15, GPIO_PIN_SET);
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);  // M-OC
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_9,  GPIO_PIN_SET);    // OC-ADJ
-  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);    // M-PWM
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_14, GPIO_PIN_RESET);  /* M-OC */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_13,  GPIO_PIN_SET);    /* OC-ADJ */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);    /* M-PWM */
 
   /* --- Khởi tạo AS5048A Encoder (SPI1, CS=PC4) --- */
   {
@@ -214,26 +267,63 @@ int main(void)
 
   /* --- Khởi tạo FOC --- */
   FOC_Init(&foc,
-           &htim2,
+           &htim1,
            TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
            PWM_PERIOD,
            MOTOR_POLE_PAIRS,
            VOLTAGE_LIMIT,
            TS_S);
 
-  /* Cài PID tốc độ bên trong FOC */
+#ifdef FOC_CURRENT_SENSING_ENABLED
+  /* True FOC: Velocity PID xuất Iq [A], giới hạn bởi CURRENT_LIMIT_A */
+  FOC_SetPID_Vel(&foc, VEL_KP, VEL_KI, VEL_KD, -CURRENT_LIMIT_A, CURRENT_LIMIT_A);
+  /* Current PID (trục d và q) */
+  FOC_SetPID_D(&foc, CUR_KP, CUR_KI, CUR_KD, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetPID_Q(&foc, CUR_KP, CUR_KI, CUR_KD, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetCurrentLimit(&foc, CURRENT_LIMIT_A);
+  /* TẠM THỜI TẮT CURRENT LOOP ĐỂ CHẠY VOLTAGE-MODE NHƯNG VẪN ĐO DÒNG */
+  // FOC_EnableCurrentLoop(&foc, TS_CURRENT_S);
+  /* Hiệu chỉnh ADC nội bộ của STM32G4 */
+  HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
+  /* Khởi động ADC Injected một lần */
+  HAL_ADCEx_InjectedStart_IT(&hadc1);
+
+  /* =========================================================================
+   * CALIBRATE CURRENT SENSOR OFFSET (Auto-Calibration)
+   * ========================================================================= */
+  printf("[ISNS] Calibrating zero-current offset...\r\n");
+  float sum_A = 0.0f, sum_B = 0.0f;
+  for (int i = 0; i < 500; i++) {
+      sum_A += g_vsen_A;  /* Mẫu được ADC ISR cập nhật liên tục ở background */
+      sum_B += g_vsen_B;
+      HAL_Delay(1);
+  }
+  g_offset_A = sum_A / 500.0f;
+  g_offset_B = sum_B / 500.0f;
+  printf("[ISNS] Offset A: %.3fV | Offset B: %.3fV\r\n", g_offset_A, g_offset_B);
+
+#else
+  /* Voltage-Mode: Velocity PID xuất Vq [V] trực tiếp (fallback) */
   FOC_SetPID_Vel(&foc, VEL_KP, VEL_KI, VEL_KD, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+#endif
   FOC_SetLPF_Vel(&foc, VEL_LPF_ALPHA);
 
-  /* Cài PID vị trí (position loop — ngoài FOC) */
+  /* --- Khởi tạo PID vị trí --- */
   PID_Init(&pid_pos, POS_KP, POS_KI, POS_KD, -POS_VEL_MAX, POS_VEL_MAX);
 
   /* =========================================================================
-   * PHASE 1: ALIGN — Lock rotor về D-axis để hiệu chỉnh offset encoder
+   * PHASE 1: ALIGN — Lock rotor, dùng Blocking SPI (trước khi bật DMA)
    * =========================================================================
+   * Quá trình Align cần SPI Blocking thông thường vì ta cần đọc góc
+   * chính xác ngay sau khi rotor lock. Sau khi Align xong mới bật DMA.
    */
   printf("[ALIGN] Bat dau khoa motor de can chinh...\r\n");
-  FOC_Start(&foc, encoder.angle_rad);  /* Truyền góc hiện tại để tránh spike */
+
+  /* Đọc lần đầu để lấy góc hiện tại, tránh velocity spike */
+  if (encoder_ready) {
+    AS5048A_ReadAngle(&encoder);
+  }
+  FOC_Start(&foc, encoder.angle_rad);
 
   uint32_t align_start = HAL_GetTick();
   while ((HAL_GetTick() - align_start) < ALIGN_DURATION_MS) {
@@ -241,67 +331,89 @@ int main(void)
     HAL_Delay(5);
   }
 
-  /* Đọc góc encoder sau khi rotor đã lock */
-  if (encoder_ready) {
-    if (AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
-      FOC_CalibrateAngle(&foc, encoder.angle_rad);
-      printf("[ALIGN] Thanh cong! Offset = %.4f rad (%.2f deg)\r\n",
-             foc.angle_offset, foc.angle_offset * RAD_TO_DEG);
-    } else {
-      printf("[ALIGN] Loi doc encoder! Khong the lay offset.\r\n");
-    }
+  /* Đọc góc sau khi rotor lock và lưu offset */
+  if (encoder_ready && AS5048A_ReadAngle(&encoder) == AS5048A_OK) {
+    FOC_CalibrateAngle(&foc, encoder.angle_rad);
+    printf("[ALIGN] Thanh cong! Offset = %.4f rad (%.2f deg)\r\n",
+           foc.angle_offset, foc.angle_offset * RAD_TO_DEG);
   } else {
-    printf("[ALIGN] Encoder chua san sang!\r\n");
+    printf("[ALIGN] Loi doc encoder sau khi lock!\r\n");
   }
 
-  /* --- Chuyển sang test Vòng Vị Trí (Position/Gimbal Loop) --- */
-  printf("[POS] Bat dau test vong vi tri. Target: 0 rad\r\n");
+  /* =========================================================================
+   * PHASE 2: Bật TIM6 để kích hoạt vòng điều khiển thời gian thực
+   * =========================================================================
+   * Từ đây, mọi việc tính toán đều diễn ra trong các hàm Callback ngắt,
+   * không cần làm gì thêm trong while(1) ngoài việc in Serial.
+   */
+  ctrl_state = STATE_RUN;
+  printf("[RUN] Bat dau dieu khien vi tri. Target: 0.0 rad\r\n");
+
+  /* Bật TIM6: sẽ gọi HAL_TIM_PeriodElapsedCallback mỗi 1ms */
+  HAL_TIM_Base_Start_IT(&htim6);
 
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-  uint32_t print_counter = 0;
+#ifdef TEST_CURRENT_SENSE
+  /* =========================================================================
+   * TEST MODE: Đọc và in dòng điện mỗi 200ms
+   * Motor TẮT — chỉ quan sát ADC
+   *
+   * Kết quả kỳ vọng khi motor đứng yên (Duty=50%):
+   *   Ia ≈ 0.00 A  (±0.05A là chấp nhận được)
+   *   Ib ≈ 0.00 A
+   *   V_SO1 ≈ 1.65V, V_SO2 ≈ 1.65V (= VREF/2)
+   *
+   * Nếu lệch nhiều (±0.2A trở lên):
+   *   → Đo V_SO1, V_SO2 bằng đồng hồ → cập nhật VREF_OFFSET
+   *   → Kiểm tra GAIN pin DRV8302 (GND=10V/V, VCC=40V/V)
+   *   → Kiểm tra giá trị SHUNT_RESISTANCE
+   * ========================================================================= */
+  printf("[TEST] ADC Calibration done. Waiting for readings...\r\n");
+  HAL_Delay(500);
+  while (1) {
+      /* Đọc snapshot an toàn từ các biến volatile */
+      uint32_t ra   = g_raw_A;
+      uint32_t rb   = g_raw_B;
+      float    va   = g_vsen_A;
+      float    vb   = g_vsen_B;
+      float    ia   = g_Ia;
+      float    ib   = g_Ib;
+
+      printf("[ISNS] RAW: A=%4lu B=%4lu | V_SO: A=%.3fV B=%.3fV | I: A=%+6.3fA B=%+6.3fA\r\n",
+             ra, rb, va, vb, ia, ib);
+
+      HAL_Delay(200);
+      /* USER CODE END WHILE */
+      /* USER CODE BEGIN 3 */
+  }
+#else
   while (1) {
 
-    /* --- Đọc AS5048A Encoder --- */
-    if (encoder_ready) {
-      AS5048A_Status_t ret = AS5048A_ReadAngle(&encoder);
-      if (ret == AS5048A_OK) {
-        
-        /* 1. Tính sai số vị trí theo đường ngắn nhất (Target = 0.0 rad) */
-        float pos_error = wrap_angle(0.0f - encoder.angle_rad);
+    /* Đọc các biến volatile được ISR cập nhật và in ra Serial */
+    /* In chậm (100ms) để không chiếm CPU của vòng điều khiển */
+    float angle  = g_angle_rad;
+    float err    = g_pos_error;
+    float vel    = g_target_vel;
+    float vq     = g_Vq_ref;
 
-        /* 2. Đưa sai số vào PID vị trí để suy ra vận tốc mục tiêu cần thiết */
-        float target_vel = PID_Update(&pid_pos, pos_error, TS_S);
-
-        /* 3. Đưa vận tốc mục tiêu vào vòng FOC 
-         * LƯU Ý QUAN TRỌNG: Nếu khi bật lên motor quay tít thò lò cắm đầu đi xa khỏi gốc,
-         * nghĩa là dấu bị ngược. Bạn hãy thêm dấu trừ: -target_vel
-         */
-        FOC_RunVelocity(&foc, encoder.angle_rad, target_vel);
-
-        /* In ra trạng thái (mỗi 200ms) */
-        print_counter++;
-        if (print_counter >= 20) {
-            printf("[POS] Err: %6.2f deg | Vel_cmd: %5.2f | Vq: %5.3f\r\n", 
-                   pos_error * RAD_TO_DEG, target_vel, foc.Vq_ref);
-            print_counter = 0;
-        }
-
-      } else {
-        /* Có lỗi: đọc và xóa error register */
-        uint16_t err_bits = 0;
-        AS5048A_ClearErrors(&encoder, &err_bits);
-        printf("[ENC] Loi doc: status=%d | err_bits=0x%04X\r\n", ret, err_bits);
-      }
+    if (fabsf(err) < HOLD_THRESHOLD_RAD) {
+      printf("[HOLD] Ang: %6.2f | Ia: %5.2f | Ib: %5.2f | Ic: %5.2f | Id: %5.2f | Iq: %5.2f\r\n",
+             angle * RAD_TO_DEG, g_Ia, g_Ib, -(g_Ia + g_Ib), g_Id, g_Iq);
+    } else {
+      printf("[HOME] Ang: %6.2f | Ia: %5.2f | Ib: %5.2f | Ic: %5.2f | Id: %5.2f | Iq: %5.2f\r\n",
+             angle * RAD_TO_DEG, g_Ia, g_Ib, -(g_Ia + g_Ib), g_Id, g_Iq);
     }
 
-    HAL_Delay(10); /* Tần số điều khiển 100Hz (Ts = 0.01s) */
+    HAL_Delay(100); /* 10Hz in Serial, không ảnh hưởng đến FOC đang chạy ở 1000Hz */
 
     /* USER CODE END WHILE */
+
     /* USER CODE BEGIN 3 */
   }
+#endif /* TEST_CURRENT_SENSE */
   /* USER CODE END 3 */
 }
 
@@ -353,6 +465,100 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+/**
+ * @brief  TIM6 Period Elapsed Callback — Chạy mỗi 1ms (Vòng Velocity + Position)
+ *
+ * Nhiệm vụ:
+ *   1. Đọc góc encoder AS5048A (Blocking SPI, ~20µs)
+ *   2. PID vị trí (outer) → target_vel
+ *   3. FOC_RunVelocity() → tính Iq_ref (True FOC) hoặc xuất PWM (Voltage-Mode)
+ *
+ * Lưu ý: Khi FOC_CURRENT_SENSING_ENABLED, PWM được quản lý bởi ADC ISR.
+ */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance != TIM6) return;
+    if (ctrl_state != STATE_RUN) return;
+
+    /* --- Bước 1: Đọc góc encoder (Blocking SPI) --- */
+    /* BỎ QUA ĐỂ TEST OPEN LOOP */
+    // if (!encoder_ready || AS5048A_ReadAngle(&encoder) != AS5048A_OK) return;
+    // float angle_rad = encoder.angle_rad;
+
+    /* --- Bước 2: PID vòng vị trí (outer loop) --- */
+    /* BỎ QUA */
+    // float pos_error  = wrap_angle(0.0f - angle_rad);
+    // float target_vel = PID_Update(&pid_pos, pos_error, TS_S);
+
+    /* --- Bước 3: FOC velocity loop --- */
+    /* BỎ QUA */
+    // FOC_RunVelocity(&foc, angle_rad, target_vel);
+
+    /* === TEST OPEN LOOP THEO YÊU CẦU === */
+    float target_vel_elec = 20.0f; /* Vận tốc điện: 10 rad/s */
+    float target_vq = 0.5f;        /* Điện áp: 1.0V (chỉnh tùy motor) */
+    FOC_RunOpenLoop(&foc, target_vel_elec, target_vq);
+
+    /* Cập nhật biến chia sẻ để while(1) in ra */
+    g_angle_rad  = foc.angle_elec; /* Hiển thị góc điện thay vì góc cơ */
+    g_pos_error  = 0.0f;
+    g_target_vel = target_vel_elec;
+    g_Vq_ref     = foc.Vq_ref;
+}
+
+#ifdef FOC_CURRENT_SENSING_ENABLED
+/**
+ * @brief  ADC Injected Conversion Complete Callback — Vòng Current (~20kHz)
+ *
+ * Được kích hoạt tự động bởi TIM1 TRGO (Center-Aligned Update Event)
+ * đúng lúc Counter = 0 (Mosfet cầu dưới mở hoàn toàn) → ADC sạch nhất.
+ *
+ * Pipeline (cả 2 chân đều trên ADC1):
+ *   ADC1 INJECTED_RANK_1 → PA0 (ADC1_IN1) → Ia (SO1, Phase A)
+ *   ADC1 INJECTED_RANK_2 → PA1 (ADC1_IN2) → Ib (SO2, Phase B)
+ *   FOC_UpdateCurrentLoop() → Clarke→Park→PID_dq→InvPark→SVPWM→PWM
+ *
+ * KHÔNG cần gọi HAL_ADCEx_InjectedStart_IT() lại ở cuối:
+ * TIM1 TRGO sẽ tự động kích hoạt lần đọc tiếp theo mỗi chu kỳ PWM.
+ */
+void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc)
+{
+    if (hadc->Instance != ADC1) return;
+
+    /* --- Đọc ADC thô — cả 2 rank đều từ ADC1 (PA0 và PA1) --- */
+    uint32_t raw_A = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_1); /* PA0 → Ia */
+    uint32_t raw_B = HAL_ADCEx_InjectedGetValue(&hadc1, ADC_INJECTED_RANK_2); /* PA1 → Ib */
+
+    /* --- Quy đổi ADC → Điện áp → Dòng điện [A] ---
+     * V_sense = (raw / 4095) * 3.3V
+     * DRV8302 shunt voltage drops when current flows OUT to the motor.
+     * Therefore, Ia = - (V_sense - V_offset) / (Gain * R_shunt)
+     */
+    float v_A = ((float)raw_A / 4095.0f) * 3.3f;
+    float v_B = ((float)raw_B / 4095.0f) * 3.3f;
+
+    float Ia = -(v_A - g_offset_A) / (CURRENT_SENSE_GAIN * SHUNT_RESISTANCE);
+    float Ib = -(v_B - g_offset_B) / (CURRENT_SENSE_GAIN * SHUNT_RESISTANCE);
+
+    /* Lưu giá trị thô và điện áp để while(1) có thể in ra debug */
+    g_raw_A  = raw_A;
+    g_raw_B  = raw_B;
+    g_vsen_A = v_A;
+    g_vsen_B = v_B;
+    g_Ia     = Ia;
+    g_Ib     = Ib;
+
+#ifndef TEST_CURRENT_SENSE
+    /* Chế độ bình thường: chạy Current Loop FOC */
+    FOC_UpdateCurrentLoop(&foc, Ia, Ib);
+    g_Id = foc.Id_meas;
+    g_Iq = foc.Iq_meas;
+#endif
+    /* KHÔNG gọi HAL_ADCEx_InjectedStart_IT() — TIM1 TRGO tự trigger */
+}
+#endif /* FOC_CURRENT_SENSING_ENABLED */
+
 /* USER CODE END 4 */
 
 /**
@@ -362,7 +568,6 @@ void SystemClock_Config(void)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1) {
   }
@@ -379,9 +584,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line
-     number, ex: printf("Wrong parameters value: file %s on line %d\r\n", file,
-     line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */

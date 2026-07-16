@@ -1,15 +1,26 @@
 /**
  ******************************************************************************
  * @file    foc.c
- * @brief   Field Oriented Control (FOC) implementation
+ * @brief   Field Oriented Control (FOC) implementation — Cascade 3-Loop
  *
- * === LUỒNG THỰC THI FOC_Update() ===
+ * === KIẾN TRÚC CASCADE ===
  *
- *  1. Tính góc điện: θe = (θ_mech - offset) * pole_pairs
- *  2. Tính sin/cos của θe
- *  3. Park Inverse: (Vd, Vq) → (Vα, Vβ) dùng sin/cos
- *  4. Clarke Inverse: (Vα, Vβ) → (Ua, Ub, Uc) normalized [0.0, 1.0]
- *  5. Áp duty cycle vào TIM PWM
+ *  [Vòng Ngoài — 1kHz, TIM6 ISR]
+ *   FOC_RunVelocity():
+ *     angle_mech → dθ/dt → LPF → velocity_mech
+ *     vel_error  → PID_vel → Iq_ref   (chỉ tính, KHÔNG xuất PWM)
+ *
+ *  [Vòng Trong — ~8kHz, ADC Injected ISR]
+ *   FOC_UpdateCurrentLoop():
+ *     Ia, Ib → Clarke → Park → Id_meas, Iq_meas
+ *     PID_d(Id_ref=0 − Id_meas) → Vd
+ *     PID_q(Iq_ref  − Iq_meas) → Vq
+ *     InvPark(Vd,Vq,θe) → Vα,Vβ
+ *     InvClarke (SVPWM) → Ua,Ub,Uc → PWM
+ *
+ * === VOLTAGE-MODE FALLBACK ===
+ *  Khi current_loop_enabled = 0, FOC_RunVelocity() xuất PWM trực tiếp
+ *  (hành vi tương thích với phiên bản cũ).
  ******************************************************************************
  */
 
@@ -59,6 +70,27 @@ static void _apply_pwm(FOC_Handle_t *hfoc, float ua, float ub, float uc)
     __HAL_TIM_SET_COMPARE(hfoc->htim, hfoc->ch_c, ccrC);
 }
 
+/**
+ * @brief  Pipeline chung: (Vd, Vq, θe) → PWM
+ *         Dùng chung cho cả Voltage-Mode và Current-Mode để tránh trùng code.
+ */
+static void _vdq_to_pwm(FOC_Handle_t *hfoc, float Vd, float Vq, float theta_e)
+{
+    FOC_DQ_t dq_ref = { Vd, Vq };
+    hfoc->V_ab = FOC_InvPark(dq_ref, theta_e);
+
+    float ua_c, ub_c, uc_c;
+    FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
+
+    /* Normalize điện áp centered về duty cycle [0, 1] */
+    float inv_vmax = 1.0f / hfoc->voltage_limit;
+    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
+    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
+    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
+
+    _apply_pwm(hfoc, ua, ub, uc);
+}
+
 /* ===========================================================================
  * Biến đổi tọa độ (Clarke & Park)
  * =========================================================================== */
@@ -66,13 +98,9 @@ static void _apply_pwm(FOC_Handle_t *hfoc, float ua, float ub, float uc)
 /**
  * @brief  Clarke thuận: (ia, ib, ic) → (α, β)
  *
- * Công thức (giả sử ia + ib + ic = 0):
+ * Công thức (amplitude invariant, giả sử ia + ib + ic = 0):
  *   Iα =  ia
  *   Iβ = (ia + 2*ib) / sqrt(3)
- *
- * Dạng ma trận chuẩn (amplitude invariant):
- *   [Iα]   [ 1       0    ] [ia]
- *   [Iβ] = [ 1/√3   2/√3  ] [ib]
  */
 FOC_AlphaBeta_t FOC_Clarke(float ia, float ib, float ic)
 {
@@ -125,9 +153,7 @@ FOC_AlphaBeta_t FOC_InvPark(FOC_DQ_t dq, float theta_e)
  *
  * Bước 2 — SVPWM Min-Max Centering (Zero-Sequence Injection):
  *   Thêm thành phần common-mode = -(Vmax + Vmin) / 2
- *   Điều này tái căn giữa các sóng điện áp quanh điểm 0, cho phép biên độ
- *   tối đa tăng thêm 15.5% so với SPWM thuần mà không bị méo dạng.
- *   Đây là kỹ thuật tương đương Space Vector PWM trong miền thời gian.
+ *   Tăng biên độ tối đa thêm 15.5% so với SPWM thuần.
  *
  * Output: điện áp centered quanh 0, cần normalize và +0.5 trước khi áp PWM.
  */
@@ -158,10 +184,6 @@ void FOC_InvClarke(FOC_AlphaBeta_t ab, float *ua, float *ub, float *uc)
  * output = Kp*e + Ki*∫e*dt + Kd*de/dt
  *
  * Anti-windup: tích phân bị clamp trong [output_min, output_max].
- * Lưu ý về Derivative Kick: công thức vi phân trên ERROR (d(error)/dt)
- * sẽ tạo spike khi setpoint thay đổi đột ngột. Để triệt tiêu hoàn toàn
- * Derivative Kick, cần vi phân trên MEASUREMENT: -Kd * d(measurement)/dt.
- * Với Gimbal, setpoint thay đổi mượt nên cách hiện tại là chấp nhận được.
  */
 float FOC_PID_Update(FOC_PID_t *pid, float error, float Ts)
 {
@@ -188,7 +210,7 @@ void FOC_PID_Reset(FOC_PID_t *pid)
 }
 
 /* ===========================================================================
- * API công khai
+ * API công khai — Khởi tạo
  * =========================================================================== */
 
 void FOC_Init(FOC_Handle_t *hfoc,
@@ -211,9 +233,15 @@ void FOC_Init(FOC_Handle_t *hfoc,
     hfoc->Ts            = Ts;
     hfoc->enabled       = 0;
 
-    /* Mặc định: Id_ref = 0 (không từ hóa thêm), Iq_ref = 0 (dừng) */
+    /* Mặc định: Voltage-Mode (tương thích ngược) */
+    hfoc->current_loop_enabled = 0;
+    hfoc->current_limit        = 5.0f;  /* 5A mặc định an toàn */
+    hfoc->Ts_current           = Ts;    /* Sẽ được ghi đè bởi FOC_EnableCurrentLoop() */
+
     hfoc->Vd_ref = 0.0f;
     hfoc->Vq_ref = 0.0f;
+    hfoc->Id_ref = 0.0f;
+    hfoc->Iq_ref = 0.0f;
 
     /* Đặt PWM về 50% (trạng thái an toàn = không dòng) */
     FOC_Stop(hfoc);
@@ -241,6 +269,23 @@ void FOC_SetPID_Q(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
     FOC_PID_Reset(&hfoc->pid_q);
 }
 
+void FOC_EnableCurrentLoop(FOC_Handle_t *hfoc, float Ts_current)
+{
+    hfoc->Ts_current           = Ts_current;
+    hfoc->current_loop_enabled = 1;
+    FOC_PID_Reset(&hfoc->pid_d);
+    FOC_PID_Reset(&hfoc->pid_q);
+}
+
+void FOC_SetCurrentLimit(FOC_Handle_t *hfoc, float limit_A)
+{
+    hfoc->current_limit = (limit_A > 0.0f) ? limit_A : 0.0f;
+}
+
+/* ===========================================================================
+ * API điều khiển
+ * =========================================================================== */
+
 void FOC_SetAngle(FOC_Handle_t *hfoc, float angle_mech_rad)
 {
     hfoc->angle_mech = _normalize_angle(angle_mech_rad);
@@ -257,37 +302,50 @@ void FOC_SetVoltage(FOC_Handle_t *hfoc, float Vd, float Vq)
 }
 
 /**
- * @brief  Hàm cập nhật FOC 1 chu kỳ (core loop)
- *
- * Thực hiện:
- *   1. Park Inverse:   (Vd, Vq) → (Vα, Vβ)  dùng góc điện hiện tại
- *   2. Clarke Inverse: (Vα, Vβ) → (Ua, Ub, Uc) centered [−1, +1]
- *   3. Normalize về [0, 1] và áp vào PWM
+ * @brief  Hàm cập nhật FOC 1 chu kỳ ở Voltage-Mode
+ *         Chỉ dùng khi current_loop_enabled = 0
  */
 void FOC_Update(FOC_Handle_t *hfoc)
 {
     if (!hfoc->enabled) return;
+    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+}
 
-    float theta_e = hfoc->angle_elec;
+/**
+ * @brief  Current Loop — Trái tim của True FOC
+ *         GỌI TRONG NGẮT ADC INJECTED (tần số cao, = tần số PWM)
+ */
+void FOC_UpdateCurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib)
+{
+    if (!hfoc->enabled) return;
 
-    /* Bước 1: Park Inverse → tọa độ αβ */
-    FOC_DQ_t dq_ref = { hfoc->Vd_ref, hfoc->Vq_ref };
-    hfoc->V_ab = FOC_InvPark(dq_ref, theta_e);
+    /* Lưu dòng điện thực tế */
+    hfoc->Ia = Ia;
+    hfoc->Ib = Ib;
+    hfoc->Ic = -(Ia + Ib);
 
-    /* Bước 2: Clarke Inverse + SVPWM → 3 pha centered quanh 0 */
-    float ua_c, ub_c, uc_c;
-    FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
+    /* === Bước 1: Clarke thuận → tọa độ αβ === */
+    FOC_AlphaBeta_t I_ab = FOC_Clarke(hfoc->Ia, hfoc->Ib, hfoc->Ic);
 
-    /* Bước 3: Normalize về duty cycle [0, 1]
-     * SVPWM tận dụng được đến 1/sqrt(3) ≈ 0.577 × Vdc (so với SPWM là 0.5 × Vdc)
-     * Dùng voltage_limit làm mốc scale để giữ tương thích với cài đặt hiện tại */
-    float inv_vmax = 1.0f / hfoc->voltage_limit;
-    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
-    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
-    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
+    /* === Bước 2: Park thuận → tọa độ dq (dùng góc điện hiện tại) === */
+    FOC_DQ_t I_dq = FOC_Park(I_ab, hfoc->angle_elec);
+    hfoc->Id_meas = I_dq.d;
+    hfoc->Iq_meas = I_dq.q;
 
-    /* Bước 4: Áp vào PWM */
-    _apply_pwm(hfoc, ua, ub, uc);
+    /* === Bước 3: PID Current Loop ===
+     * Trục D: Id_ref = 0 (không kích từ thêm với SPMSM)
+     * Trục Q: Iq_ref được đặt bởi Velocity PID
+     */
+    if (!hfoc->current_loop_enabled) return;
+
+    float err_d = hfoc->Id_ref - hfoc->Id_meas;  /* Id_ref luôn = 0 */
+    float err_q = hfoc->Iq_ref - hfoc->Iq_meas;
+
+    hfoc->Vd_ref = FOC_PID_Update(&hfoc->pid_d, err_d, hfoc->Ts_current);
+    hfoc->Vq_ref = FOC_PID_Update(&hfoc->pid_q, err_q, hfoc->Ts_current);
+
+    /* === Bước 4: InvPark + SVPWM → PWM === */
+    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }
 
 void FOC_Stop(FOC_Handle_t *hfoc)
@@ -295,6 +353,11 @@ void FOC_Stop(FOC_Handle_t *hfoc)
     hfoc->enabled = 0;
     FOC_PID_Reset(&hfoc->pid_d);
     FOC_PID_Reset(&hfoc->pid_q);
+    FOC_PID_Reset(&hfoc->pid_vel);
+
+    /* Reset current references */
+    hfoc->Iq_ref = 0.0f;
+    hfoc->Id_ref = 0.0f;
 
     /* Đặt tất cả PWM về 50% duty = không dòng (floating) */
     uint16_t mid = (uint16_t)(hfoc->pwm_period * 0.5f);
@@ -303,18 +366,6 @@ void FOC_Stop(FOC_Handle_t *hfoc)
     __HAL_TIM_SET_COMPARE(hfoc->htim, hfoc->ch_c, mid);
 }
 
-/**
- * @brief  Bật FOC output — PHẢI truyền góc encoder hiện tại
- *
- * Lý do cần current_angle: khi bắt đầu, prev_angle_mech = 0.
- * Nếu encoder thực tế đang ở 3.14 rad, chu kỳ đầu tiên của
- * FOC_RunVelocity sẽ tính d_angle = 3.14 / Ts → velocity spike 314 rad/s.
- * Bằng cách khởi tạo prev_angle_mech với góc hiện tại, d_angle ≈ 0 và
- * PID tốc độ khởi động êm ái.
- *
- * @param  hfoc          Con trỏ FOC_Handle_t
- * @param  current_angle Góc cơ học hiện tại từ encoder [rad]
- */
 void FOC_Start(FOC_Handle_t *hfoc, float current_angle)
 {
     FOC_PID_Reset(&hfoc->pid_d);
@@ -322,32 +373,22 @@ void FOC_Start(FOC_Handle_t *hfoc, float current_angle)
     FOC_PID_Reset(&hfoc->pid_vel);
     hfoc->lpf_vel.output   = 0.0f;
     hfoc->velocity_mech    = 0.0f;
-    hfoc->prev_angle_mech  = current_angle;  /* <-- Fix velocity spike */
-    hfoc->enabled = 1;
+    hfoc->prev_angle_mech  = current_angle;  /* Fix velocity spike */
+    hfoc->Iq_ref           = 0.0f;
+    hfoc->Id_ref           = 0.0f;
+    hfoc->enabled          = 1;
 }
 
 void FOC_AlignD(FOC_Handle_t *hfoc, float Vd)
 {
     if (!hfoc->enabled) return;
 
-    /* Áp điện áp vào trục D (từ thông) và Vq = 0 (không tạo torque quay ngoài)
-     * Góc điện = 0 (D-axis absolute) */
-    hfoc->Vd_ref = _clamp(Vd, 0.0f, hfoc->voltage_limit);
-    hfoc->Vq_ref = 0.0f;
+    /* Áp điện áp vào trục D tại góc điện = 0 để kéo rotor về vị trí chuẩn */
+    hfoc->Vd_ref    = _clamp(Vd, 0.0f, hfoc->voltage_limit);
+    hfoc->Vq_ref    = 0.0f;
     hfoc->angle_elec = 0.0f;
 
-    FOC_DQ_t dq_ref = { hfoc->Vd_ref, hfoc->Vq_ref };
-    hfoc->V_ab = FOC_InvPark(dq_ref, hfoc->angle_elec);
-
-    float ua_c, ub_c, uc_c;
-    FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
-
-    float inv_vmax = 1.0f / hfoc->voltage_limit;
-    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
-    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
-    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
-
-    _apply_pwm(hfoc, ua, ub, uc);
+    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }
 
 void FOC_CalibrateAngle(FOC_Handle_t *hfoc, float current_angle_mech)
@@ -360,15 +401,10 @@ void FOC_CalibrateAngle(FOC_Handle_t *hfoc, float current_angle_mech)
     );
 }
 
-/**
- * @brief  Open-loop velocity: quét góc điện liên tục để motor quay
- *
- * Nguyên lý: mỗi lần gọi, tự cộng thêm (velocity * Ts) vào angle_elec,
- * sau đó áp vector điện áp (Vd=0, Vq) theo góc đó.
- * Motor sẽ đồng bộ theo từ trường quay, giống như stepper motor.
- *
- * Lưu ý: Hàm này KHÔNG dùng encoder. angle_elec được quản lý nội bộ.
- */
+/* ===========================================================================
+ * Open-loop
+ * =========================================================================== */
+
 void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq)
 {
     if (!hfoc->enabled) return;
@@ -379,28 +415,13 @@ void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq)
     hfoc->Vq_ref = _clamp(Vq, -hfoc->voltage_limit, hfoc->voltage_limit);
     hfoc->Vd_ref = 0.0f;
 
-    FOC_DQ_t dq_ref = { hfoc->Vd_ref, hfoc->Vq_ref };
-    hfoc->V_ab = FOC_InvPark(dq_ref, hfoc->angle_elec);
-
-    float ua_c, ub_c, uc_c;
-    FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
-
-    float inv_vmax = 1.0f / hfoc->voltage_limit;
-    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
-    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
-    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
-
-    _apply_pwm(hfoc, ua, ub, uc);
+    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }
 
 /* ===========================================================================
  * Closed-loop Velocity Control
  * =========================================================================== */
 
-/**
- * @brief  Tính 1 bước LPF bậc 1
- *         y[n] = α * y[n-1] + (1-α) * x[n]
- */
 float FOC_LPF_Update(FOC_LPF_t *lpf, float input)
 {
     lpf->output = lpf->alpha * lpf->output + (1.0f - lpf->alpha) * input;
@@ -425,22 +446,17 @@ void FOC_SetPID_Vel(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
 }
 
 /**
- * @brief  Closed-loop velocity control — 1 chu kỳ điều khiển
+ * @brief  Closed-loop Velocity Control — 1 chu kỳ
  *
- * Bước 1: Ước lượng tốc độ cơ học từ encoder (vi phân góc)
- *   vel_raw = (angle_now - angle_prev) / Ts
- *   Xử lý wrap-around: nếu ∆θ > π thì ∆θ -= 2π (và ngược lại)
+ * Hành vi phụ thuộc vào current_loop_enabled:
  *
- * Bước 2: Lọc nhiễu qua LPF
- *   vel_filtered = α * vel_filtered_prev + (1-α) * vel_raw
+ * [Voltage-Mode, current_loop_enabled = 0]:
+ *   vel_error → PID_vel → Vq → InvPark → SVPWM → PWM
+ *   (Tương thích ngược với code cũ)
  *
- * Bước 3: PID vòng tốc độ → Vq
- *   error = target_vel - vel_filtered
- *   Vq = Kp*error + Ki*∫error*dt + Kd*d(error)/dt
- *
- * Bước 4: FOC transforms → PWM (dùng góc encoder thực)
- *   angle_elec = angle_mech * pole_pairs - offset
- *   InvPark(Vd=0, Vq) → Vα,Vβ → InvClarke → Ua,Ub,Uc → PWM
+ * [True FOC, current_loop_enabled = 1]:
+ *   vel_error → PID_vel → Iq_ref  (KHÔNG xuất PWM)
+ *   PWM được quản lý bởi FOC_UpdateCurrentLoop() trong ngắt ADC
  */
 void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
                      float target_vel_rad_s)
@@ -460,29 +476,29 @@ void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
     /* --- Bước 2: Lọc LPF --- */
     hfoc->velocity_mech = FOC_LPF_Update(&hfoc->lpf_vel, vel_raw);
 
-    /* --- Bước 3: PID vòng tốc độ → Vq --- */
-    float vel_error = target_vel_rad_s - hfoc->velocity_mech;
-    float Vq = FOC_PID_Update(&hfoc->pid_vel, vel_error, hfoc->Ts);
-
-    hfoc->Vq_ref = Vq;  /* đã clamp trong PID */
-    hfoc->Vd_ref = 0.0f;
-
-    /* --- Bước 4: Cập nhật góc điện từ encoder --- */
-    float elec = angle_mech_rad * (float)hfoc->pole_pairs - hfoc->angle_offset;
+    /* --- Bước 3: Cập nhật góc điện từ encoder --- */
     hfoc->angle_mech = angle_mech_rad;
+    float elec = angle_mech_rad * (float)hfoc->pole_pairs - hfoc->angle_offset;
     hfoc->angle_elec = _normalize_angle(elec);
 
-    /* --- Bước 5: FOC transforms → PWM (dùng SVPWM qua FOC_InvClarke) --- */
-    FOC_DQ_t dq_ref = { hfoc->Vd_ref, hfoc->Vq_ref };
-    hfoc->V_ab = FOC_InvPark(dq_ref, hfoc->angle_elec);
+    /* --- Bước 4: PID vòng tốc độ --- */
+    float vel_error = target_vel_rad_s - hfoc->velocity_mech;
+    float pid_out   = FOC_PID_Update(&hfoc->pid_vel, vel_error, hfoc->Ts);
 
-    float ua_c, ub_c, uc_c;
-    FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
-
-    float inv_vmax = 1.0f / hfoc->voltage_limit;
-    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
-    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
-    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
-
-    _apply_pwm(hfoc, ua, ub, uc);
+    if (hfoc->current_loop_enabled) {
+        /* ============================================================
+         * TRUE FOC MODE: PID_vel xuất Iq_ref [A]
+         * PWM sẽ được xử lý bởi FOC_UpdateCurrentLoop() trong ISR ADC
+         * ============================================================ */
+        hfoc->Iq_ref = _clamp(pid_out, -hfoc->current_limit, hfoc->current_limit);
+        hfoc->Id_ref = 0.0f;
+        /* KHÔNG gọi _vdq_to_pwm() ở đây */
+    } else {
+        /* ============================================================
+         * VOLTAGE-MODE: PID_vel xuất Vq [V] (fallback, tương thích cũ)
+         * ============================================================ */
+        hfoc->Vq_ref = pid_out;  /* đã clamp trong PID */
+        hfoc->Vd_ref = 0.0f;
+        _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+    }
 }

@@ -3,37 +3,41 @@
  * @file    foc.h
  * @brief   Thư viện Field Oriented Control (FOC) cho động cơ BLDC/PMSM
  *
- * === KIẾN TRÚC FOC ===
+ * === KIẾN TRÚC FOC (Cascade 3 vòng) ===
  *
- *  [Encoder]──> angle_mech ──> angle_elec
- *                                    │
- *  [Setpoint] ──> Iq_ref             ▼
- *                          ┌─────────────────┐
- *   Id_ref=0 ──────────────►  Park Inverse   ◄──── [PID_d] ◄── Id (from Park)
- *                          │  (dq → αβ)      ◄──── [PID_q] ◄── Iq (from Park)
- *                          └────────┬────────┘
- *                                   │ Vα, Vβ
- *                          ┌────────▼────────┐
- *                          │ Clarke Inverse  │
- *                          │ (αβ → abc)      │
- *                          └────────┬────────┘
- *                                   │ Ua, Ub, Uc
- *                          ┌────────▼────────┐
- *                          │   TIM PWM       │
- *                          └─────────────────┘
+ *  [Encoder] ──► angle_mech ──► angle_elec
+ *
+ *  [Vòng Ngoài — 1kHz, TIM6 ISR]
+ *   pos_error ──► PID_pos ──► target_vel ──► PID_vel ──► Iq_ref
+ *                                                          │
+ *  [Vòng Trong — ~8kHz, ADC Injected ISR]                 │
+ *   [SO1,SO2] ──► Ia, Ib                                  │
+ *       │                                                  │
+ *       ▼                                                  ▼
+ *   Clarke ──► Iα,Iβ ──► Park ──► Id_meas, Iq_meas
+ *                                       │
+ *                         (Id_ref=0) ─► PID_d ──► Vd
+ *                              Iq_ref ─► PID_q ──► Vq
+ *                                                   │
+ *                              InvPark(Vd,Vq,θe) ──► Vα,Vβ
+ *                                                   │
+ *                              InvClarke (SVPWM) ──► Ua,Ub,Uc
+ *                                                   │
+ *                                                 PWM
  *
  * === BIẾN ĐỔI ĐƯỢC SỬ DỤNG ===
  *
- *  Clarke:  (Ia, Ib, Ic) → (Iα, Iβ)    [abc → stationary frame]
- *  Park:    (Iα, Iβ)     → (Id, Iq)    [stationary → rotating frame]
- *  InvPark: (Vd, Vq)     → (Vα, Vβ)   [rotating → stationary frame]
- *  InvClarke:(Vα, Vβ)   → (Ua,Ub,Uc)  [stationary → abc]
+ *  Clarke:    (Ia, Ib, Ic) → (Iα, Iβ)   [abc → stationary frame]
+ *  Park:      (Iα, Iβ)    → (Id, Iq)    [stationary → rotating frame]
+ *  InvPark:   (Vd, Vq)    → (Vα, Vβ)   [rotating → stationary frame]
+ *  InvClarke: (Vα, Vβ)   → (Ua,Ub,Uc)  [stationary → abc, SVPWM]
  *
  * === CHÚ THÍCH PHẦN CỨNG (dự án Gimbal) ===
- *  PWM Timer:   TIM2, Channel 1/2/3
- *  PWM Period:  4249 (ARR)
+ *  PWM Timer:   TIM1, Channel 1/2/3
+ *  PWM Period:  4249 (ARR), Center-Aligned → tần số ngắt ADC = tần số PWM
  *  Encoder:     AS5048A (14-bit, SPI1)
- *  Pole pairs:  Cấu hình tại khởi tạo (mặc định 7)
+ *  Current Sense: DRV8302 SO1 (ADC1_IN1), SO2 (ADC2_IN2)
+ *  Pole pairs:  Cấu hình tại khởi tạo (mặc định 14)
  ******************************************************************************
  */
 
@@ -95,8 +99,8 @@ typedef struct {
  * Cấu trúc trạng thái tọa độ dq (rotating frame)
  * =========================================================================== */
 typedef struct {
-    float d;   /*!< Thành phần trục d (flux, cần điều khiển về 0) */
-    float q;   /*!< Thành phần trục q (torque, điều khiển moment) */
+    float d;   /*!< Thành phần trục d (flux, điều khiển về 0) */
+    float q;   /*!< Thành phần trục q (torque) */
 } FOC_DQ_t;
 
 /* ===========================================================================
@@ -126,20 +130,46 @@ typedef struct {
     FOC_LPF_t lpf_vel;       /*!< Bộ lọc LPF cho tín hiệu tốc độ */
 
     /* --- Setpoint điều khiển --- */
-    float Vd_ref;
-    float Vq_ref;
+    float Vd_ref;            /*!< Điện áp trục d [V] — do Current PID tính */
+    float Vq_ref;            /*!< Điện áp trục q [V] — do Current PID tính */
+
+    /* =======================================================================
+     * Current Loop (Closed-Loop Current Control)
+     * ======================================================================= */
+
+    /* Dòng điện đo được (raw từ ADC, đã quy đổi sang [A]) */
+    float Ia;                /*!< Dòng pha A đo từ SO1 [A] */
+    float Ib;                /*!< Dòng pha B đo từ SO2 [A] */
+    float Ic;                /*!< Dòng pha C = -(Ia+Ib) [A] */
+
+    /* Dòng sau biến đổi Park thuận (feedback của Current Loop) */
+    float Id_meas;           /*!< Thành phần dòng từ thông (d-axis) [A] */
+    float Iq_meas;           /*!< Thành phần dòng momen (q-axis) [A] */
+
+    /* Setpoint dòng điện (đầu ra của Velocity PID) */
+    float Id_ref;            /*!< Dòng từ thông mục tiêu — luôn = 0 với SPMSM [A] */
+    float Iq_ref;            /*!< Dòng momen mục tiêu từ velocity PID [A] */
+
+    /* Giới hạn bảo vệ */
+    float current_limit;     /*!< Giới hạn dòng tối đa |Iq_ref| [A] */
+
+    /* Chu kỳ Current Loop (thường = 1/f_PWM) */
+    float Ts_current;        /*!< Chu kỳ lấy mẫu của Current Loop [s] */
+
+    /* Flag bật/tắt Current Loop */
+    uint8_t current_loop_enabled; /*!< 1 = True FOC, 0 = Voltage-Mode fallback */
 
     /* --- Trạng thái biến đổi tọa độ --- */
     FOC_AlphaBeta_t V_ab;
     FOC_DQ_t        V_dq;
 
     /* --- PID Controllers --- */
-    FOC_PID_t pid_d;    /*!< PID trục d (từ thông, thường Kp=0) */
-    FOC_PID_t pid_q;    /*!< PID trục q (moment) */
-    FOC_PID_t pid_vel;  /*!< PID vòng tốc độ: vel_error → Vq */
+    FOC_PID_t pid_d;    /*!< PID trục d (điều khiển Id → 0) — chạy trong Current Loop */
+    FOC_PID_t pid_q;    /*!< PID trục q (điều khiển Iq → Iq_ref) — chạy trong Current Loop */
+    FOC_PID_t pid_vel;  /*!< PID vòng tốc độ: vel_error → Iq_ref — chạy trong Velocity Loop */
 
     /* --- Trạng thái vòng lặp --- */
-    float Ts;
+    float Ts;            /*!< Chu kỳ Velocity Loop [s] */
     uint8_t enabled;
 } FOC_Handle_t;
 
@@ -155,7 +185,7 @@ typedef struct {
  * @param  pwm_period   Giá trị ARR (ví dụ: 4249.0f)
  * @param  pole_pairs   Số cặp cực của motor
  * @param  voltage_lim  Giới hạn điện áp [V]
- * @param  Ts           Chu kỳ điều khiển [s] (ví dụ: 0.0001f = 100µs)
+ * @param  Ts           Chu kỳ Velocity Loop [s] (ví dụ: 0.001f = 1ms)
  */
 void FOC_Init(FOC_Handle_t *hfoc,
               TIM_HandleTypeDef *htim,
@@ -166,16 +196,42 @@ void FOC_Init(FOC_Handle_t *hfoc,
               float Ts);
 
 /**
- * @brief  Cấu hình PID trục D (điều khiển từ thông, thường Id_ref = 0)
+ * @brief  Cấu hình PID trục D (điều khiển từ thông, Id_ref = 0)
+ *
+ * Điểm khởi đầu: Kp = 0.5~2.0, Ki = 50~500, Kd = 0
+ * out_min/max = ±voltage_limit
  */
 void FOC_SetPID_D(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
                   float out_min, float out_max);
 
 /**
- * @brief  Cấu hình PID trục Q (điều khiển moment/tốc độ)
+ * @brief  Cấu hình PID trục Q (điều khiển moment, Iq → Iq_ref)
+ *
+ * Điểm khởi đầu: Kp = 0.5~2.0, Ki = 50~500, Kd = 0
+ * out_min/max = ±voltage_limit
  */
 void FOC_SetPID_Q(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
                   float out_min, float out_max);
+
+/**
+ * @brief  Bật chế độ Current Loop (True FOC)
+ *
+ * Cần gọi sau FOC_Init(). Nếu không gọi hàm này, FOC hoạt động ở
+ * chế độ Voltage-Mode (tương thích ngược với code cũ).
+ *
+ * @param  hfoc       Con trỏ FOC_Handle_t
+ * @param  Ts_current Chu kỳ Current Loop = 1/f_PWM [s]
+ *                    Ví dụ: f_PWM=8.5kHz (Center-Aligned, ARR=4999) → Ts = 1/8500
+ */
+void FOC_EnableCurrentLoop(FOC_Handle_t *hfoc, float Ts_current);
+
+/**
+ * @brief  Cấu hình giới hạn dòng điện bảo vệ
+ *
+ * Giới hạn |Iq_ref| để bảo vệ driver và motor.
+ * @param  limit_A  Dòng tối đa [A]. Ví dụ: 3.0f cho gimbal nhỏ.
+ */
+void FOC_SetCurrentLimit(FOC_Handle_t *hfoc, float limit_A);
 
 /* ===========================================================================
  * API điều khiển chính
@@ -197,14 +253,40 @@ void FOC_SetAngle(FOC_Handle_t *hfoc, float angle_mech_rad);
 void FOC_SetVoltage(FOC_Handle_t *hfoc, float Vd, float Vq);
 
 /**
- * @brief  Hàm chạy 1 chu kỳ FOC (gọi trong timer interrupt hoặc vòng lặp chính)
+ * @brief  Hàm cập nhật FOC 1 chu kỳ ở Voltage-Mode (không có Current Loop)
  *
- * Thực hiện toàn bộ pipeline:
- *   angle_elec → sin/cos → InvPark(Vd,Vq→Vα,Vβ) → InvClarke(Vα,Vβ→Ua,Ub,Uc) → PWM
+ * Chỉ dùng khi current_loop_enabled = 0 (Voltage-Mode fallback).
+ * Thực hiện: InvPark(Vd,Vq) → InvClarke (SVPWM) → PWM
  *
  * @param  hfoc  Con trỏ FOC_Handle_t
  */
 void FOC_Update(FOC_Handle_t *hfoc);
+
+/**
+ * @brief  Hàm chạy Current Loop — GỌI TRONG NGẮT ADC INJECTED
+ *
+ * Đây là trái tim của True FOC. Hàm này phải được gọi tại tần số
+ * cao (bằng tần số PWM, thông qua trigger từ Timer).
+ *
+ * Pipeline:
+ *   Ia, Ib ──► Clarke ──► Park ──► Id_meas, Iq_meas
+ *                                       │
+ *           PID_d(Id_ref=0 - Id_meas) ──► Vd
+ *           PID_q(Iq_ref   - Iq_meas) ──► Vq
+ *                                       │
+ *                        InvPark(Vd,Vq) ──► Vα,Vβ
+ *                        InvClarke(SVPWM) ──► PWM
+ *
+ * @param  hfoc  Con trỏ FOC_Handle_t (đã FOC_Start() và EnableCurrentLoop())
+ * @param  Ia    Dòng pha A đo được từ SO1 [A]
+ * @param  Ib    Dòng pha B đo được từ SO2 [A]
+ *
+ * @note   Góc điện (angle_elec) phải được cập nhật bởi FOC_RunVelocity()
+ *         trước khi hàm này chạy. Trong thực tế, do FOC_RunVelocity chạy
+ *         ở 1kHz và Current Loop ở ~8kHz, góc điện có thể cũ hơn vài µs
+ *         — điều này là chấp nhận được với gimbal tốc độ thấp.
+ */
+void FOC_UpdateCurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib);
 
 /**
  * @brief  Tắt output PWM về 50% duty (trạng thái thả nổi an toàn)
@@ -249,8 +331,8 @@ FOC_DQ_t FOC_Park(FOC_AlphaBeta_t ab, float theta_e);
 FOC_AlphaBeta_t FOC_InvPark(FOC_DQ_t dq, float theta_e);
 
 /**
- * @brief  Biến đổi Clarke ngược (3-phase modulation): (α, β) → (a, b, c)
- *         Output là duty cycle normalize [0.0, 1.0]
+ * @brief  Biến đổi Clarke ngược + SVPWM centering: (α, β) → (a, b, c)
+ *         Output là điện áp centered quanh 0 (chưa normalize về duty cycle).
  */
 void FOC_InvClarke(FOC_AlphaBeta_t ab, float *ua, float *ub, float *uc);
 
@@ -274,21 +356,15 @@ void FOC_PID_Reset(FOC_PID_t *pid);
  * ĐÂY LÀ BƯỚC BẮT BUỘC trước khi chạy closed-loop FOC.
  * Không có alignment → angle_elec sai → FOC áp lực sai hướng → rung + nóng.
  *
- * Nguyên lý:
- *   - Áp Vd tại theta_elec = 0 (KHÔNG dùng encoder)
- *   - Vd kéo rotor về vị trí D-axis tuyệt đối (phụ thuộc vật lý motor)
- *   - Sau khi rotor ổn định, đọc encoder → đó chính là góc "D-axis"
- *   - Gọi FOC_CalibrateAngle() với góc đó để lưu offset
- *
  * Quy trình sử dụng trong main.c:
  *   1. Gọi FOC_AlignD() lặp lại trong ~500ms (rotor kéo về vị trí)
  *   2. Đọc encoder.angle_rad
  *   3. Gọi FOC_CalibrateAngle(&foc, encoder.angle_rad)
- *   4. Khởi động velocity control bình thường
+ *   4. Gọi FOC_EnableCurrentLoop() nếu dùng True FOC
+ *   5. Khởi động velocity control bình thường
  *
  * @param  hfoc  Con trỏ FOC_Handle_t
  * @param  Vd    Điện áp căn chỉnh [V] — dùng 0.3×voltage_limit đến voltage_limit
- *               Đủ lớn để kéo rotor nhưng không gây quá nhiệt
  */
 void FOC_AlignD(FOC_Handle_t *hfoc, float Vd);
 
@@ -298,60 +374,41 @@ void FOC_AlignD(FOC_Handle_t *hfoc, float Vd);
 void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq);
 
 /* ===========================================================================
- * API Closed-loop Velocity Control (bộ lọc tốc độ + PID)
+ * API Closed-loop Velocity Control
  * =========================================================================== */
 
 /**
  * @brief  Tính 1 bước LPF
- * @param  lpf    Con trỏ FOC_LPF_t
- * @param  input  Giá trị đầu vào thô (tốc độ chưa lọc [rad/s])
- * @retval Giá trị đã lọc [rad/s]
  */
 float FOC_LPF_Update(FOC_LPF_t *lpf, float input);
 
 /**
  * @brief  Cài hệ số LPF cho bộ lọc tốc độ
- * @param  alpha  Hệ số [0.0, 1.0]:
- *                0.9 = lọc mạnh (dùng khi nhiễu lớn, encoder rung)
- *                0.7 = lọc vừa (đáp ứng nhanh hơn)
  */
 void FOC_SetLPF_Vel(FOC_Handle_t *hfoc, float alpha);
 
 /**
  * @brief  Cấu hình PID vòng tốc độ (velocity loop)
- * @param  Kp/Ki/Kd    Hệ số PID
- * @param  out_min/max Giới hạn Vq output [V] — thường = ±voltage_limit
  *
- * Điểm khởi đầu điều chỉnh:
- *   Kp = 0.05 ~ 0.3  (tăng nếu đáp ứng chậm, giảm nếu dao động)
- *   Ki = 0.01 ~ 0.1  (tăng để triệt sai số xác lập, giảm nếu rung)
- *   Kd = 0            (thường không cần, thêm nếu overshoot nhiều)
+ * Khi current_loop_enabled = 1: out_min/max là giới hạn Iq [A]
+ * Khi current_loop_enabled = 0: out_min/max là giới hạn Vq [V]
  */
 void FOC_SetPID_Vel(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
                     float out_min, float out_max);
 
 /**
- * @brief  Chạy 1 chu kỳ Closed-loop Velocity Control
+ * @brief  Chạy 1 chu kỳ Velocity Control
  *
- * Pipeline đầy đủ:
+ * Khi current_loop_enabled = 0 (Voltage-Mode):
+ *   → Pipeline cũ: vel_error → PID_vel → Vq → InvPark → SVPWM → PWM
  *
- *   [Encoder angle] ──> dθ/dt ──> LPF ──> velocity_mech
- *                                              │
- *                              (target - velocity_mech)
- *                                              │
- *                                           PID_vel
- *                                              │ Vq
- *                                         InvPark(Vd=0,Vq)
- *                                              │ Vα,Vβ
- *                                         InvClarke
- *                                              │ Ua,Ub,Uc
- *                                            PWM
+ * Khi current_loop_enabled = 1 (True FOC):
+ *   → Chỉ tính: vel_error → PID_vel → Iq_ref
+ *   → KHÔNG xuất PWM — PWM được điều khiển bởi FOC_UpdateCurrentLoop()
  *
  * @param  hfoc              Con trỏ FOC_Handle_t (đã FOC_Start())
  * @param  angle_mech_rad    Góc cơ học từ encoder [rad], range [0, 2π)
  * @param  target_vel_rad_s  Tốc độ cơ học mục tiêu [rad/s]
- *                           Dương = chiều thuận, Âm = ngược chiều
- *                           Ví dụ: 2*PI ≈ 1 vòng/giây
  */
 void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
                      float target_vel_rad_s);
