@@ -354,3 +354,113 @@ float Attitude_GetElecAngleRoll(const Attitude_Handle_t *hatt,
     float elec_angle = hatt->payload_roll * (float)pole_pairs - offset;
     return _normalize_angle(elec_angle);
 }
+
+void Attitude_Update_ICM42688(Attitude_Handle_t *hatt,
+                              const ICM42688_Handle_t *imu_frame,
+                              const ICM42688_Handle_t *imu_payload,
+                              float dt)
+{
+    float f_gx = imu_frame->gyro_x_dps * ATT_DEG2RAD;
+    float f_gy = imu_frame->gyro_y_dps * ATT_DEG2RAD;
+    float f_gz = imu_frame->gyro_z_dps * ATT_DEG2RAD;
+    float f_ax = imu_frame->accel_x_g;
+    float f_ay = imu_frame->accel_y_g;
+    float f_az = imu_frame->accel_z_g;
+
+    float p_gx = imu_payload->gyro_x_dps * ATT_DEG2RAD;
+    float p_gy = imu_payload->gyro_y_dps * ATT_DEG2RAD;
+    float p_gz = imu_payload->gyro_z_dps * ATT_DEG2RAD;
+    float p_ax = imu_payload->accel_x_g;
+    float p_ay = imu_payload->accel_y_g;
+    float p_az = imu_payload->accel_z_g;
+
+    Attitude_Update(hatt,
+                    f_gx, f_gy, f_gz, f_ax, f_ay, f_az,
+                    p_gx, p_gy, p_gz, p_ax, p_ay, p_az,
+                    dt);
+}
+
+static void _mahony_reset_with_accel(MahonyFilter_t *mahony, float ax, float ay, float az)
+{
+    if (ax == 0.0f && ay == 0.0f && az == 0.0f) return;
+
+    // Chuẩn hóa vector gia tốc
+    float norm = 1.0f / sqrtf(ax * ax + ay * ay + az * az);
+    ax *= norm;
+    ay *= norm;
+    az *= norm;
+
+    // Tính Pitch và Roll theo quy ước ZYX Euler của bộ lọc Mahony
+    float pitch = atan2f(ax, sqrtf(ay * ay + az * az));
+    float roll  = atan2f(ay, az);
+
+    // Tính Quaternion từ Roll-Pitch-Yaw (với Yaw = 0)
+    float cosR = cosf(roll * 0.5f);
+    float sinR = sinf(roll * 0.5f);
+    float cosP = cosf(pitch * 0.5f);
+    float sinP = sinf(pitch * 0.5f);
+
+    mahony->q0 = cosR * cosP;
+    mahony->q1 = sinR * cosP;
+    mahony->q2 = cosR * sinP;
+    mahony->q3 = -sinR * sinP;
+
+    // Chuẩn hóa quaternion
+    float q_norm = 1.0f / sqrtf(mahony->q0 * mahony->q0 + mahony->q1 * mahony->q1 +
+                                mahony->q2 * mahony->q2 + mahony->q3 * mahony->q3);
+    mahony->q0 *= q_norm;
+    mahony->q1 *= q_norm;
+    mahony->q2 *= q_norm;
+    mahony->q3 *= q_norm;
+
+    mahony->roll  = roll;
+    mahony->pitch = pitch;
+    mahony->yaw   = 0.0f;
+}
+
+void Attitude_ResetWithAccel(Attitude_Handle_t *hatt,
+                             const ICM42688_Handle_t *imu_frame,
+                             const ICM42688_Handle_t *imu_payload)
+{
+    if (!hatt->initialized) return;
+
+    _mahony_reset_with_accel(&hatt->mahony_frame, imu_frame->accel_x_g, imu_frame->accel_y_g, imu_frame->accel_z_g);
+    _mahony_reset_with_accel(&hatt->mahony_payload, imu_payload->accel_x_g, imu_payload->accel_y_g, imu_payload->accel_z_g);
+
+    hatt->frame_roll  = hatt->mahony_frame.roll;
+    hatt->frame_pitch = hatt->mahony_frame.pitch;
+    hatt->frame_yaw   = hatt->mahony_frame.yaw;
+
+    hatt->payload_roll  = hatt->mahony_payload.roll;
+    hatt->payload_pitch = hatt->mahony_payload.pitch;
+    hatt->payload_yaw   = hatt->mahony_payload.yaw;
+
+    // Cập nhật lại q_error ban đầu: q_error = conj(q_frame) * q_payload
+    {
+        float qf[4] = {
+            hatt->mahony_frame.q0,
+            hatt->mahony_frame.q1,
+            hatt->mahony_frame.q2,
+            hatt->mahony_frame.q3
+        };
+        float qp[4] = {
+            hatt->mahony_payload.q0,
+            hatt->mahony_payload.q1,
+            hatt->mahony_payload.q2,
+            hatt->mahony_payload.q3
+        };
+
+        _quat_mul_conj(qf, qp, hatt->q_error);
+
+        float qw = hatt->q_error[0];
+        float qx = hatt->q_error[1];
+        float qy = hatt->q_error[2];
+        float qz = hatt->q_error[3];
+
+        hatt->relative_roll = atan2f(2.0f * (qw * qx + qy * qz), 1.0f - 2.0f * (qx * qx + qy * qy));
+        float sinp = 2.0f * (qw * qy - qz * qx);
+        if (sinp >  1.0f) sinp =  1.0f;
+        if (sinp < -1.0f) sinp = -1.0f;
+        hatt->relative_pitch = asinf(sinp);
+    }
+}

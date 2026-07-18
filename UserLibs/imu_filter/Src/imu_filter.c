@@ -167,3 +167,18 @@ void Mahony_Update(MahonyFilter_t *mahony, float gx, float gy, float gz, float a
     mahony->pitch = asinf(2.0f * (mahony->q0 * mahony->q2 - mahony->q3 * mahony->q1));
     mahony->yaw   = atan2f(2.0f * (mahony->q0 * mahony->q3 + mahony->q1 * mahony->q2), 1.0f - 2.0f * (mahony->q2 * mahony->q2 + mahony->q3 * mahony->q3));
 }
+
+void Mahony_Update_ICM42688(MahonyFilter_t *mahony, const ICM42688_Handle_t *imu, float dt) {
+    // Chuyển đổi gyro từ độ/giây (dps) sang Radian/giây (Rad/s)
+    // 1 dps = pi / 180 rad/s = 0.01745329252f rad/s
+    float gx = imu->gyro_x_dps * 0.01745329252f;
+    float gy = imu->gyro_y_dps * 0.01745329252f;
+    float gz = imu->gyro_z_dps * 0.01745329252f;
+
+    // Gia tốc (accel) giữ nguyên đơn vị G
+    float ax = imu->accel_x_g;
+    float ay = imu->accel_y_g;
+    float az = imu->accel_z_g;
+
+    Mahony_Update(mahony, gx, gy, gz, ax, ay, az, dt);
+}

@@ -30,6 +30,7 @@
 #include "foc.h"
 #include "as5048a.h"
 #include "icm42688.h"
+#include "attitude.h"
 #include "pid_lib.h"
 #include "math.h"
 #include <stdio.h>
@@ -82,6 +83,8 @@ AS5048A_Handle_t roll_enc;
 
 ICM42688_Handle_t frame_imu;
 ICM42688_Handle_t payload_imu;
+
+Attitude_Handle_t att;
 
 // FOC Handles
 FOC_Handle_t foc_pitch;
@@ -225,6 +228,9 @@ int main(void)
   PID_Init(&pid_pos_roll, 0.8f, 0.0f, 0.0f, -1.5f, 1.5f);
   PID_Init(&pid_pos_yaw, 0.8f, 0.0f, 0.0f, -1.5f, 1.5f);
 
+  // Initialize Attitude Estimator (Kp = 2.0f, Ki = 0.005f)
+  Attitude_Init(&att, 2.0f, 0.005f);
+
   // Start PWM for TIM1/3/8 (and TIM1 CH4 as TRGO)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
@@ -291,6 +297,11 @@ int main(void)
   FOC_Start(&foc_pitch, pitch_enc.angle_rad);
   FOC_Start(&foc_roll, roll_enc.angle_rad);
   FOC_Start(&foc_yaw, yaw_enc.angle_rad);
+
+  // Initial IMU reading and attitude alignment
+  ICM42688_ReadSensor(&frame_imu);
+  ICM42688_ReadSensor(&payload_imu);
+  Attitude_ResetWithAccel(&att, &frame_imu, &payload_imu);
 
   // Start TIM6 Control Loop
   HAL_TIM_Base_Start_IT(&htim6);
@@ -451,23 +462,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
       HAL_SPI_TransmitReceive_DMA(&hspi3, imu_tx_buf, imu_rx_buf, 15);
     }
 
-    // 3. Attitude Estimation (Sensor Fusion via Complementary Filter)
+    // 3. Attitude Estimation (Sensor Fusion via Mahony Filter & Quaternions)
     float dt = 0.001f;
-    float alpha_filt = 0.98f;
+    Attitude_Update_ICM42688(&att, &frame_imu, &payload_imu, dt);
 
-    // Payload Attitude
-    float payload_accel_pitch = atan2f(payload_imu.accel_x_g, sqrtf(payload_imu.accel_y_g * payload_imu.accel_y_g + payload_imu.accel_z_g * payload_imu.accel_z_g)) * RAD_TO_DEG;
-    payload_pitch_deg = alpha_filt * (payload_pitch_deg + payload_imu.gyro_y_dps * dt) + (1.0f - alpha_filt) * payload_accel_pitch;
-
-    float payload_accel_roll = atan2f(payload_imu.accel_y_g, payload_imu.accel_z_g) * RAD_TO_DEG;
-    payload_roll_deg = alpha_filt * (payload_roll_deg + payload_imu.gyro_x_dps * dt) + (1.0f - alpha_filt) * payload_accel_roll;
-
-    // Frame Attitude
-    float frame_accel_pitch = atan2f(frame_imu.accel_x_g, sqrtf(frame_imu.accel_y_g * frame_imu.accel_y_g + frame_imu.accel_z_g * frame_imu.accel_z_g)) * RAD_TO_DEG;
-    frame_pitch_deg = alpha_filt * (frame_pitch_deg + frame_imu.gyro_y_dps * dt) + (1.0f - alpha_filt) * frame_accel_pitch;
-
-    float frame_accel_roll = atan2f(frame_imu.accel_y_g, frame_imu.accel_z_g) * RAD_TO_DEG;
-    frame_roll_deg = alpha_filt * (frame_roll_deg + frame_imu.gyro_x_dps * dt) + (1.0f - alpha_filt) * frame_accel_roll;
+    payload_pitch_deg = att.payload_pitch * RAD_TO_DEG;
+    payload_roll_deg  = att.payload_roll * RAD_TO_DEG;
+    frame_pitch_deg   = att.frame_pitch * RAD_TO_DEG;
+    frame_roll_deg    = att.frame_roll * RAD_TO_DEG;
 
     // 4. Cascade PID Controller Updates
     // Pitch (Closed-loop current FOC)

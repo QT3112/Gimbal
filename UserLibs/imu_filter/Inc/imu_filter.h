@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <math.h>
+#include "icm42688.h"
 
 /* =================================================================================
  * COMPLEMENTARY FILTER (Bộ lọc bù - 1 Trục)
@@ -92,5 +93,13 @@ void Mahony_Init(MahonyFilter_t *mahony, float Kp, float Ki);
  * @param dt: Thời gian lấy mẫu (giây)
  */
 void Mahony_Update(MahonyFilter_t *mahony, float gx, float gy, float gz, float ax, float ay, float az, float dt);
+
+/**
+ * @brief Cập nhật Quaternion và tính ra Roll/Pitch/Yaw trực tiếp từ cấu trúc dữ liệu ICM42688
+ * @param mahony: Con trỏ đến cấu trúc MahonyFilter_t
+ * @param imu: Con trỏ đến cấu trúc ICM42688_Handle_t chứa dữ liệu thô và đã đổi từ cảm biến
+ * @param dt: Thời gian lấy mẫu (giây)
+ */
+void Mahony_Update_ICM42688(MahonyFilter_t *mahony, const ICM42688_Handle_t *imu, float dt);
 
 #endif /* IMU_FILTER_H */

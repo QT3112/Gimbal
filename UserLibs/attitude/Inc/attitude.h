@@ -62,6 +62,7 @@ extern "C" {
 #endif
 
 #include "imu_filter.h"
+#include "icm42688.h"
 #include <stdint.h>
 
 /* ===========================================================================
@@ -261,6 +262,28 @@ float Attitude_GetElecAngle(const Attitude_Handle_t *hatt,
 float Attitude_GetElecAngleRoll(const Attitude_Handle_t *hatt,
                                 uint8_t pole_pairs,
                                 float offset);
+
+/**
+ * @brief  Cập nhật tư thế 2-IMU trực tiếp từ hai cảm biến ICM42688
+ * @param  hatt        Con trỏ đến Attitude_Handle_t
+ * @param  imu_frame   Con trỏ đến cấu trúc ICM42688_Handle_t của khung drone
+ * @param  imu_payload Con trỏ đến cấu trúc ICM42688_Handle_t của camera/payload
+ * @param  dt          Thời gian lấy mẫu (giây)
+ */
+void Attitude_Update_ICM42688(Attitude_Handle_t *hatt,
+                              const ICM42688_Handle_t *imu_frame,
+                              const ICM42688_Handle_t *imu_payload,
+                              float dt);
+
+/**
+ * @brief  Khởi tạo/Reset bộ ước lượng tư thế trực tiếp từ gia tốc trọng trường ban đầu
+ * @param  hatt        Con trỏ đến Attitude_Handle_t
+ * @param  imu_frame   Con trỏ đến cấu trúc ICM42688_Handle_t của khung drone
+ * @param  imu_payload Con trỏ đến cấu trúc ICM42688_Handle_t của camera/payload
+ */
+void Attitude_ResetWithAccel(Attitude_Handle_t *hatt,
+                             const ICM42688_Handle_t *imu_frame,
+                             const ICM42688_Handle_t *imu_payload);
 
 #ifdef __cplusplus
 }
