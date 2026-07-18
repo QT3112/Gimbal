@@ -175,41 +175,6 @@ void FOC_InvClarke(FOC_AlphaBeta_t ab, float *ua, float *ub, float *uc)
 }
 
 /* ===========================================================================
- * PID Controller
- * =========================================================================== */
-
-/**
- * @brief  Tính một bước PID với anti-windup (clamping)
- *
- * output = Kp*e + Ki*∫e*dt + Kd*de/dt
- *
- * Anti-windup: tích phân bị clamp trong [output_min, output_max].
- */
-float FOC_PID_Update(FOC_PID_t *pid, float error, float Ts)
-{
-    /* Thành phần tỉ lệ */
-    float p_term = pid->Kp * error;
-
-    /* Thành phần tích phân với anti-windup clamp */
-    pid->integral += pid->Ki * error * Ts;
-    pid->integral  = _clamp(pid->integral, pid->output_min, pid->output_max);
-
-    /* Thành phần vi phân (d(error)/dt) */
-    float d_term = (Ts > 1e-9f) ? (pid->Kd * (error - pid->prev_error) / Ts) : 0.0f;
-    pid->prev_error = error;
-
-    /* Tổng và clamp */
-    float output = p_term + pid->integral + d_term;
-    return _clamp(output, pid->output_min, pid->output_max);
-}
-
-void FOC_PID_Reset(FOC_PID_t *pid)
-{
-    pid->integral   = 0.0f;
-    pid->prev_error = 0.0f;
-}
-
-/* ===========================================================================
  * API công khai — Khởi tạo
  * =========================================================================== */
 
@@ -243,38 +208,31 @@ void FOC_Init(FOC_Handle_t *hfoc,
     hfoc->Id_ref = 0.0f;
     hfoc->Iq_ref = 0.0f;
 
-    /* Đặt PWM về 50% (trạng thái an toàn = không dòng) */
-    FOC_Stop(hfoc);
+    /* Chỉ đặt PWM về 50% khi htim hợp lệ.
+     * FOC_Stop() nên được gọi lại sau khi PWM đã được Start trong main(). */
+    if (hfoc->htim != NULL) {
+        FOC_Stop(hfoc);
+    }
 }
 
 void FOC_SetPID_D(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
                   float out_min, float out_max)
 {
-    hfoc->pid_d.Kp         = Kp;
-    hfoc->pid_d.Ki         = Ki;
-    hfoc->pid_d.Kd         = Kd;
-    hfoc->pid_d.output_min = out_min;
-    hfoc->pid_d.output_max = out_max;
-    FOC_PID_Reset(&hfoc->pid_d);
+    PID_Init(&hfoc->pid_d, Kp, Ki, Kd, out_min, out_max);
 }
 
 void FOC_SetPID_Q(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
                   float out_min, float out_max)
 {
-    hfoc->pid_q.Kp         = Kp;
-    hfoc->pid_q.Ki         = Ki;
-    hfoc->pid_q.Kd         = Kd;
-    hfoc->pid_q.output_min = out_min;
-    hfoc->pid_q.output_max = out_max;
-    FOC_PID_Reset(&hfoc->pid_q);
+    PID_Init(&hfoc->pid_q, Kp, Ki, Kd, out_min, out_max);
 }
 
 void FOC_EnableCurrentLoop(FOC_Handle_t *hfoc, float Ts_current)
 {
     hfoc->Ts_current           = Ts_current;
     hfoc->current_loop_enabled = 1;
-    FOC_PID_Reset(&hfoc->pid_d);
-    FOC_PID_Reset(&hfoc->pid_q);
+    PID_Reset(&hfoc->pid_d);
+    PID_Reset(&hfoc->pid_q);
 }
 
 void FOC_SetCurrentLimit(FOC_Handle_t *hfoc, float limit_A)
@@ -341,8 +299,8 @@ void FOC_UpdateCurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib)
     float err_d = hfoc->Id_ref - hfoc->Id_meas;  /* Id_ref luôn = 0 */
     float err_q = hfoc->Iq_ref - hfoc->Iq_meas;
 
-    hfoc->Vd_ref = FOC_PID_Update(&hfoc->pid_d, err_d, hfoc->Ts_current);
-    hfoc->Vq_ref = FOC_PID_Update(&hfoc->pid_q, err_q, hfoc->Ts_current);
+    hfoc->Vd_ref = PID_Update(&hfoc->pid_d, err_d, hfoc->Ts_current);
+    hfoc->Vq_ref = PID_Update(&hfoc->pid_q, err_q, hfoc->Ts_current);
 
     /* === Bước 4: InvPark + SVPWM → PWM === */
     _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
@@ -351,15 +309,18 @@ void FOC_UpdateCurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib)
 void FOC_Stop(FOC_Handle_t *hfoc)
 {
     hfoc->enabled = 0;
-    FOC_PID_Reset(&hfoc->pid_d);
-    FOC_PID_Reset(&hfoc->pid_q);
-    FOC_PID_Reset(&hfoc->pid_vel);
+    PID_Reset(&hfoc->pid_d);
+    PID_Reset(&hfoc->pid_q);
+    PID_Reset(&hfoc->pid_vel);
 
-    /* Reset current references */
+    /* Reset tất cả setpoint về 0 để tránh xung điện áp bất ngờ khi Start lại */
+    hfoc->Vd_ref = 0.0f;
+    hfoc->Vq_ref = 0.0f;
     hfoc->Iq_ref = 0.0f;
     hfoc->Id_ref = 0.0f;
 
     /* Đặt tất cả PWM về 50% duty = không dòng (floating) */
+    if (hfoc->htim == NULL) return;
     uint16_t mid = (uint16_t)(hfoc->pwm_period * 0.5f);
     __HAL_TIM_SET_COMPARE(hfoc->htim, hfoc->ch_a, mid);
     __HAL_TIM_SET_COMPARE(hfoc->htim, hfoc->ch_b, mid);
@@ -368,9 +329,9 @@ void FOC_Stop(FOC_Handle_t *hfoc)
 
 void FOC_Start(FOC_Handle_t *hfoc, float current_angle)
 {
-    FOC_PID_Reset(&hfoc->pid_d);
-    FOC_PID_Reset(&hfoc->pid_q);
-    FOC_PID_Reset(&hfoc->pid_vel);
+    PID_Reset(&hfoc->pid_d);
+    PID_Reset(&hfoc->pid_q);
+    PID_Reset(&hfoc->pid_vel);
     hfoc->lpf_vel.output   = 0.0f;
     hfoc->velocity_mech    = 0.0f;
     hfoc->prev_angle_mech  = current_angle;  /* Fix velocity spike */
@@ -384,7 +345,7 @@ void FOC_AlignD(FOC_Handle_t *hfoc, float Vd)
     if (!hfoc->enabled) return;
 
     /* Áp điện áp vào trục D tại góc điện = 0 để kéo rotor về vị trí chuẩn */
-    hfoc->Vd_ref    = _clamp(Vd, 0.0f, hfoc->voltage_limit);
+    hfoc->Vd_ref    = _clamp(Vd, -hfoc->voltage_limit, hfoc->voltage_limit);
     hfoc->Vq_ref    = 0.0f;
     hfoc->angle_elec = 0.0f;
 
@@ -409,7 +370,7 @@ void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq)
 {
     if (!hfoc->enabled) return;
 
-    hfoc->angle_elec += velocity_elec_rad_s * hfoc->Ts;
+    hfoc->angle_elec += velocity_elec_rad_s * hfoc->Ts_current;
     hfoc->angle_elec  = _normalize_angle(hfoc->angle_elec);
 
     hfoc->Vq_ref = _clamp(Vq, -hfoc->voltage_limit, hfoc->voltage_limit);
@@ -437,12 +398,7 @@ void FOC_SetLPF_Vel(FOC_Handle_t *hfoc, float alpha)
 void FOC_SetPID_Vel(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
                     float out_min, float out_max)
 {
-    hfoc->pid_vel.Kp         = Kp;
-    hfoc->pid_vel.Ki         = Ki;
-    hfoc->pid_vel.Kd         = Kd;
-    hfoc->pid_vel.output_min = out_min;
-    hfoc->pid_vel.output_max = out_max;
-    FOC_PID_Reset(&hfoc->pid_vel);
+    PID_Init(&hfoc->pid_vel, Kp, Ki, Kd, out_min, out_max);
 }
 
 /**
@@ -483,7 +439,7 @@ void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
 
     /* --- Bước 4: PID vòng tốc độ --- */
     float vel_error = target_vel_rad_s - hfoc->velocity_mech;
-    float pid_out   = FOC_PID_Update(&hfoc->pid_vel, vel_error, hfoc->Ts);
+    float pid_out   = PID_Update(&hfoc->pid_vel, vel_error, hfoc->Ts);
 
     if (hfoc->current_loop_enabled) {
         /* ============================================================

@@ -51,6 +51,7 @@ extern "C" {
 #include "stm32g4xx_hal.h"
 #include <stdint.h>
 #include <math.h>
+#include "pid_lib.h"
 
 /* ===========================================================================
  * Hằng số toán học
@@ -60,19 +61,6 @@ extern "C" {
 #define FOC_SQRT3       1.73205080757f
 #define FOC_SQRT3_2     0.86602540378f  /* sqrt(3)/2 */
 #define FOC_ONE_SQRT3   0.57735026919f  /* 1/sqrt(3) */
-
-/* ===========================================================================
- * Cấu trúc PID Controller
- * =========================================================================== */
-typedef struct {
-    float Kp;
-    float Ki;
-    float Kd;
-    float integral;
-    float prev_error;
-    float output_min;
-    float output_max;
-} FOC_PID_t;
 
 /* ===========================================================================
  * Cấu trúc Low-Pass Filter (LPF) — lọc nhiễu tốc độ encoder
@@ -164,9 +152,9 @@ typedef struct {
     FOC_DQ_t        V_dq;
 
     /* --- PID Controllers --- */
-    FOC_PID_t pid_d;    /*!< PID trục d (điều khiển Id → 0) — chạy trong Current Loop */
-    FOC_PID_t pid_q;    /*!< PID trục q (điều khiển Iq → Iq_ref) — chạy trong Current Loop */
-    FOC_PID_t pid_vel;  /*!< PID vòng tốc độ: vel_error → Iq_ref — chạy trong Velocity Loop */
+    PID_Handle_t pid_d;    /*!< PID trục d (điều khiển Id → 0) — chạy trong Current Loop */
+    PID_Handle_t pid_q;    /*!< PID trục q (điều khiển Iq → Iq_ref) — chạy trong Current Loop */
+    PID_Handle_t pid_vel;  /*!< PID vòng tốc độ: vel_error → Iq_ref — chạy trong Velocity Loop */
 
     /* --- Trạng thái vòng lặp --- */
     float Ts;            /*!< Chu kỳ Velocity Loop [s] */
@@ -335,20 +323,6 @@ FOC_AlphaBeta_t FOC_InvPark(FOC_DQ_t dq, float theta_e);
  *         Output là điện áp centered quanh 0 (chưa normalize về duty cycle).
  */
 void FOC_InvClarke(FOC_AlphaBeta_t ab, float *ua, float *ub, float *uc);
-
-/**
- * @brief  Tính PID một bước
- * @param  pid    Con trỏ FOC_PID_t
- * @param  error  Sai số (setpoint - feedback)
- * @param  Ts     Chu kỳ lấy mẫu [s]
- * @retval Output của PID (đã clamp trong [output_min, output_max])
- */
-float FOC_PID_Update(FOC_PID_t *pid, float error, float Ts);
-
-/**
- * @brief  Reset tích phân PID về 0 (dùng khi disable/enable)
- */
-void FOC_PID_Reset(FOC_PID_t *pid);
 
 /**
  * @brief  Căn chỉnh góc encoder-rotor (Alignment sequence)

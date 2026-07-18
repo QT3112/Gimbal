@@ -17,11 +17,14 @@ float PID_Update(PID_Handle_t *pid, float error, float dt) {
     // Integral term with anti-windup clamping
     pid->integral += pid->Ki * error * dt;
     pid->integral = _clamp(pid->integral, pid->out_min, pid->out_max);
-    
-    // Derivative term
-    float d_term = pid->Kd * (error - pid->prev_error) / dt;
+
+    // Derivative term — guard against dt == 0 to prevent NaN/Inf
+    float d_term = 0.0f;
+    if (dt > 1e-9f) {
+        d_term = pid->Kd * (error - pid->prev_error) / dt;
+    }
     pid->prev_error = error;
-    
+
     // Compute total output and clamp
     float out = pid->Kp * error + pid->integral + d_term;
     return _clamp(out, pid->out_min, pid->out_max);
