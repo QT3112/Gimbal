@@ -24,7 +24,8 @@
 /* USER CODE BEGIN PTD */
 typedef enum {
   ENC_STATE_IDLE = 0,
-  ENC_STATE_PITCH
+  ENC_STATE_PITCH_CMD,
+  ENC_STATE_PITCH_READ
 } Encoder_State_t;
 /* USER CODE END PTD */
 
@@ -53,8 +54,10 @@ volatile uint32_t log_raw_ib = 0;
 
 /* SPI DMA Buffers & States cho Encoder */
 volatile Encoder_State_t enc_state = ENC_STATE_IDLE;
-uint8_t enc_tx_buf[4] = { 0xFF, 0xFF, 0xC0, 0x00 };
-uint8_t enc_rx_buf[4];
+/* Khi dùng SPI 16-bit, buffer phải là mảng uint16_t. DMA sẽ truyền 16-bit nguyên khối.
+ * Frame 1: 0xFFFF (Đọc góc), Frame 2: 0xC000 (NOP để lấy kết quả) */
+uint16_t enc_tx_buf[2] = { 0xFFFF, 0xC000 };
+uint16_t enc_rx_buf[2];
 
 /* Cấu hình phần cứng mạch dòng */
 #define GAIN_DRV   10.0f
@@ -83,7 +86,7 @@ int main(void)
 {
 
   /* USER CODE BEGIN 1 */
-/* USER CODE END 1 */
+  /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
 
@@ -91,21 +94,18 @@ int main(void)
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-/* USER CODE END Init */
+  /* USER CODE END Init */
 
   /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-/* USER CODE END SysInit */
+  /* USER CODE END SysInit */
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_USB_Device_Init();
-  
-  /* Vô hiệu hóa bộ đệm của printf để dữ liệu đẩy thẳng ra USB CDC ngay lập tức */
-  setvbuf(stdout, NULL, _IONBF, 0);
   MX_SPI1_Init();
   MX_TIM6_Init();
   MX_TIM3_Init();
@@ -134,9 +134,11 @@ int main(void)
   FOC_Init(&foc_pitch, &htim1, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3, 
            PWM_PERIOD, MOTOR_POLE_PAIRS, VOLTAGE_LIMIT, 0.001f);
            
-  /* Set Current Loop PID (Tạm thời để thông số cơ bản) */
-  FOC_SetPID_D(&foc_pitch, 0.5f, 100.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
-  FOC_SetPID_Q(&foc_pitch, 0.5f, 100.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  /* Set Current Loop PID (Tạm thời để thông số cơ bản) 
+   * Kp = 0.5 là quá lớn đối với motor Gimbal (thường điện trở cao, tự cảm thấp), gây ra dao động (HÚ).
+   * Giảm Kp xuống 0.05 và duy trì Ki = 100 */
+  FOC_SetPID_D(&foc_pitch, 0.05f, 100.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetPID_Q(&foc_pitch, 0.05f, 100.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
   FOC_SetCurrentLimit(&foc_pitch, 0.4f);
   
   /* Bật vòng lặp dòng điện tại tần số 20kHz */
@@ -150,7 +152,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4); // Trigger ADC (TRGO)
+  HAL_TIM_PWM_Start(&htim1,TIM_CHANNEL_4); // Trigger ADC (TRGO)
   HAL_Delay(10);
 
   /* Tính toán dòng offset */
@@ -179,6 +181,16 @@ int main(void)
       pitch_offset_a = sum_a / 1000.0f;
       pitch_offset_b = sum_b / 1000.0f;
       printf("[INFO] Calibrated Offset A: %.3fV | B: %.3fV\r\n", pitch_offset_a, pitch_offset_b);
+      
+      /* KIỂM TRA AN TOÀN: Nếu DRV8302 chưa được cấp nguồn (hoặc lỗi), offset sẽ ~0V thay vì 1.65V */
+      if (pitch_offset_a < 1.0f || pitch_offset_a > 2.3f || pitch_offset_b < 1.0f || pitch_offset_b > 2.3f) {
+          printf("\r\n[FATAL ERROR] ADC Offset qua thap (0V) hoac khong hop le! \r\n");
+          printf("--> NGUYEN NHAN: Ban CHUA BAT NGUON 12V/24V cho mach DRV8302 truoc khi STM32 khoi dong!\r\n");
+          printf("--> CACH SUA: Hay bat nguon Motor truoc, sau do an nut RESET tren STM32 de Hieu chuan lai.\r\n");
+          while(1) {
+              HAL_Delay(1000); // HALT he thong de bao ve
+          }
+      }
   }
 
   /* Align và Khởi động động cơ */
@@ -201,7 +213,7 @@ int main(void)
   /* Kích hoạt Timer 6 chạy ngắt ngầm định (ví dụ 1kHz) để trigger SPI DMA */
   HAL_TIM_Base_Start_IT(&htim6);
 
-/* USER CODE END 2 */
+  /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
@@ -219,11 +231,11 @@ int main(void)
       
       /* In ra Terminal ở dạng dễ đọc trực tiếp */
       printf("[ENCODER] Pitch Angle: %.2f rad | %.2f deg\r\n", pitch_enc.angle_rad, pitch_enc.angle_deg);
-      // printf("[ADC RAW] raw_ia: %lu, raw_ib: %lu\r\n", log_raw_ia, log_raw_ib);
-      // printf("[PHASE I] Ia: %.3f, Ib: %.3f, Ic: %.3f\r\n", foc_pitch.Ia, foc_pitch.Ib, foc_pitch.Ic);
-      // printf("[CLARKE ] I_alpha: %.3f, I_beta: %.3f\r\n", I_ab.alpha, I_ab.beta);
-      // printf("[PARK   ] Id_meas: %.3f, Iq_meas: %.3f\r\n", foc_pitch.Id_meas, foc_pitch.Iq_meas);
-      // printf("----------------------------------------\r\n");
+      printf("[ADC RAW] raw_ia: %lu, raw_ib: %lu\r\n", log_raw_ia, log_raw_ib);
+      printf("[PHASE I] Ia: %.3f, Ib: %.3f, Ic: %.3f\r\n", foc_pitch.Ia, foc_pitch.Ib, foc_pitch.Ic);
+      printf("[CLARKE ] I_alpha: %.3f, I_beta: %.3f\r\n", I_ab.alpha, I_ab.beta);
+      printf("[PARK   ] Id_meas: %.3f, Iq_meas: %.3f\r\n", foc_pitch.Id_meas, foc_pitch.Iq_meas);
+      printf("----------------------------------------\r\n");
     }
   }
   /* USER CODE END 3 */
@@ -282,11 +294,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
   /* TIM6 chạy định kỳ (vd 1kHz) dùng để kích hoạt đọc SPI qua DMA */
   if (htim->Instance == TIM6) {
     if (enc_state == ENC_STATE_IDLE) {
-      enc_state = ENC_STATE_PITCH;
-      /* Kéo CS xuống Mức Thấp để bắt đầu truyền SPI */
+      enc_state = ENC_STATE_PITCH_CMD;
+      /* Bước 1: Kéo CS xuống Mức Thấp để gửi Lệnh Đọc Góc (0xFFFF) */
       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET); 
-      /* Gửi 4 byte: 2 byte đầu là Lệnh Đọc Góc (0xFFFF), 2 byte sau là NOP (0xC000) để clock dữ liệu về */
-      HAL_SPI_TransmitReceive_DMA(&hspi1, enc_tx_buf, enc_rx_buf, 4);
+      HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t*)&enc_tx_buf[0], (uint8_t*)&enc_rx_buf[0], 1);
     }
   }
 }
@@ -294,18 +305,36 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 {
   if (hspi->Instance == SPI1) {
-    if (enc_state == ENC_STATE_PITCH) {
-      /* Kéo CS lên Mức Cao kết thúc truyền SPI */
+    if (enc_state == ENC_STATE_PITCH_CMD) {
+      /* Kéo CS lên Mức Cao kết thúc Frame 1 */
       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); 
       
-      /* Dữ liệu góc trả về nằm ở 2 byte cuối (byte 2 và 3) của mảng nhận */
-      uint16_t rx_val = ((uint16_t)enc_rx_buf[2] << 8) | enc_rx_buf[3];
+      /* Chuyển sang Bước 2: Gửi NOP (0xC000) để clock dữ liệu về */
+      enc_state = ENC_STATE_PITCH_READ;
       
-      /* Kiểm tra chẵn lẻ (Parity) và cờ lỗi (Error Flag) */
-      if (AS5048A_CheckParity(rx_val) && !(rx_val & AS5048A_EF_BIT)) {
+      /* Kéo CS xuống Mức Thấp để gửi Frame 2 */
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET); 
+      HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t*)&enc_tx_buf[1], (uint8_t*)&enc_rx_buf[1], 1);
+      
+    } else if (enc_state == ENC_STATE_PITCH_READ) {
+      /* Kéo CS lên Mức Cao kết thúc Frame 2 */
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET); 
+      
+      /* Dữ liệu góc trả về nằm ở Frame 2 (enc_rx_buf[1]) của mảng nhận */
+      uint16_t rx_val = enc_rx_buf[1];
+      
+      /* Kiểm tra chẵn lẻ (Parity) và cờ lỗi (Error Flag) 
+       * LOẠI TRỪ các giá trị glitch rác (0x0000, 0xFFFF) vì chúng vô tình thoả mãn Parity! */
+      if (rx_val != 0x0000 && rx_val != 0xFFFF && AS5048A_CheckParity(rx_val) && !(rx_val & AS5048A_EF_BIT)) {
         pitch_enc.raw_angle = rx_val & AS5048A_DATA_MASK;
         pitch_enc.angle_deg = (float)pitch_enc.raw_angle * (360.0f / 16384.0f);
         pitch_enc.angle_rad = (float)pitch_enc.raw_angle * (6.28318530718f / 16384.0f);
+        
+        /* CỰC KỲ QUAN TRỌNG: Cập nhật góc này cho bộ điều khiển FOC 
+         * Thay vì dùng FOC_SetAngle, ta gọi FOC_RunVelocity để bộ FOC tự động 
+         * tính toán tốc độ quay (velocity_mech). Nhờ có velocity, ngắt ADC (20kHz) 
+         * có thể NỘI SUY (interpolate) góc mượt mà giữa các lần đọc SPI, loại bỏ hoàn toàn rung giật! */
+        FOC_RunVelocity(&foc_pitch, pitch_enc.angle_rad, 0.0f);
       }
       
       enc_state = ENC_STATE_IDLE;
@@ -349,7 +378,7 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-/* USER CODE END Error_Handler_Debug */
+  /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
 /**
@@ -362,6 +391,6 @@ void Error_Handler(void)
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-/* USER CODE END 6 */
+  /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
