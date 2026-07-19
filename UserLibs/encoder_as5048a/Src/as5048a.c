@@ -28,6 +28,7 @@
 
 #include "as5048a.h"
 #include <string.h>
+#include <stdio.h>
 
 /* ===========================================================================
  * Hàm nội bộ (static)
@@ -78,24 +79,21 @@ static AS5048A_Status_t AS5048A_SPI_Transfer(AS5048A_Handle_t *hdev,
                                               uint16_t *rx_data)
 {
     HAL_StatusTypeDef ret;
-    uint8_t tx_buf[2], rx_buf[2];
-
-    /* Chuyển từ uint16 sang byte array theo thứ tự Big-Endian (MSB first) */
-    tx_buf[0] = (uint8_t)(tx_data >> 8);
-    tx_buf[1] = (uint8_t)(tx_data & 0xFF);
 
     AS5048A_CS_Low(hdev);
 
-    ret = HAL_SPI_TransmitReceive(hdev->hspi, tx_buf, rx_buf, 2, AS5048A_SPI_TIMEOUT_MS);
+    /* Khi SPI DataSize = 16 Bits, HAL_SPI_TransmitReceive truyền 1 phần tử 16-bit.
+     * STM32 tự động clock ra MSB trước tiên (nếu cấu hình MSB First). */
+    ret = HAL_SPI_TransmitReceive(hdev->hspi, (uint8_t*)&tx_data, (uint8_t*)rx_data, 1, AS5048A_SPI_TIMEOUT_MS);
 
     AS5048A_CS_High(hdev);
 
     if (ret != HAL_OK) {
+        printf("[AS5048A] SPI HAL Error: %d\r\n", ret);
         hdev->spi_error_count++;
         return AS5048A_ERROR_SPI;
     }
 
-    *rx_data = ((uint16_t)rx_buf[0] << 8) | rx_buf[1];
     return AS5048A_OK;
 }
 

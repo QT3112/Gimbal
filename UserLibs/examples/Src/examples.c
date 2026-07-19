@@ -7,6 +7,7 @@
 
 #include "examples.h"
 #include <math.h>
+#include <stdio.h>
 
 /* ===========================================================================
  * Biến nội bộ (private) — chỉ dùng trong file này
@@ -14,7 +15,7 @@
  */
 
 /* PID vòng vị trí dùng riêng cho Example_HoldAngle */
-static FOC_PID_t s_pid_pos;
+static PID_Handle_t s_pid_pos;
 
 /* Cờ để biết Example_Init đã được gọi chưa */
 static uint8_t s_initialized = 0;
@@ -36,9 +37,9 @@ void Example_Init(FOC_Handle_t *hfoc, const ExampleConfig_t *cfg) {
   /* Giới hạn đầu ra vòng vị trí = tốc độ góc tối đa cho phép [rad/s].
    * 10 rad/s ≈ 1.6 vòng/giây — an toàn cho gimbal.
    * Tăng nếu muốn motor phản ứng tốc độ cao hơn. */
-  s_pid_pos.output_min = -10.0f;
-  s_pid_pos.output_max = 10.0f;
-  FOC_PID_Reset(&s_pid_pos);
+  s_pid_pos.out_min = -10.0f;
+  s_pid_pos.out_max = 10.0f;
+  PID_Reset(&s_pid_pos);
 
   s_initialized = 1;
 }
@@ -75,8 +76,11 @@ void Example_HoldAngle(FOC_Handle_t *hfoc, AS5048A_Handle_t *henc,
     return;
 
   /* Đọc góc hiện tại từ encoder */
-  if (AS5048A_ReadAngle(henc) != AS5048A_OK)
+  AS5048A_Status_t st = AS5048A_ReadAngle(henc);
+  if (st != AS5048A_OK) {
+    printf("[HoldAngle] Enc Err: %d\r\n", st);
     return;
+  }
 
   float current_angle = henc->angle_rad; /* Góc cơ học thực tế [0, 2π) */
 
@@ -96,7 +100,7 @@ void Example_HoldAngle(FOC_Handle_t *hfoc, AS5048A_Handle_t *henc,
     angle_error += 2.0f * (float)M_PI;
 
   /* PID vòng vị trí: Đầu ra là vận tốc góc mục tiêu [rad/s] */
-  float target_vel = FOC_PID_Update(&s_pid_pos, angle_error, hfoc->Ts);
+  float target_vel = PID_Update(&s_pid_pos, angle_error, hfoc->Ts);
 
   /* -----------------------------------------------------------------------
    * VÒNG TRONG: FOC Velocity Control → PWM
