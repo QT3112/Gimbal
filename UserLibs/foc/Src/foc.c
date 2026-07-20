@@ -332,6 +332,7 @@ void FOC_Start(FOC_Handle_t *hfoc, float current_angle)
     PID_Reset(&hfoc->pid_d);
     PID_Reset(&hfoc->pid_q);
     PID_Reset(&hfoc->pid_vel);
+    PID_Reset(&hfoc->pid_pos);
     hfoc->lpf_vel.output   = 0.0f;
     hfoc->velocity_mech    = 0.0f;
     hfoc->prev_angle_mech  = current_angle;  /* Fix velocity spike */
@@ -432,10 +433,11 @@ void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
     /* --- Bước 2: Lọc LPF --- */
     hfoc->velocity_mech = FOC_LPF_Update(&hfoc->lpf_vel, vel_raw);
 
-    /* --- Bước 3: Cập nhật góc điện từ encoder --- */
+    /* --- Bước 3: Cập nhật góc cơ học từ encoder --- */
     hfoc->angle_mech = angle_mech_rad;
-    float elec = angle_mech_rad * (float)hfoc->pole_pairs - hfoc->angle_offset;
-    hfoc->angle_elec = _normalize_angle(elec);
+    /* KHÔNG cập nhật hfoc->angle_elec ở đây để tránh Race Condition với ngắt ADC (20kHz).
+     * Góc điện (angle_elec) giờ đây đã được quản lý và nội suy mượt mà bằng thuật toán PLL
+     * trong ISR ADC (FOC_UpdateCurrentLoop). */
 
     /* --- Bước 4: PID vòng tốc độ --- */
     float vel_error = target_vel_rad_s - hfoc->velocity_mech;
@@ -457,4 +459,31 @@ void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
         hfoc->Vd_ref = 0.0f;
         _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
     }
+}
+
+/* ===========================================================================
+ * Closed-loop Position Control
+ * =========================================================================== */
+
+void FOC_SetPID_Pos(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
+                    float out_min, float out_max)
+{
+    PID_Init(&hfoc->pid_pos, Kp, Ki, Kd, out_min, out_max);
+}
+
+void FOC_RunPosition(FOC_Handle_t *hfoc, float angle_mech_rad, float target_angle_rad)
+{
+    if (!hfoc->enabled) return;
+
+    /* Tính sai số vị trí với wrap-around (chọn đường ngắn nhất) */
+    float pos_error = target_angle_rad - angle_mech_rad;
+    
+    if (pos_error >  FOC_PI) pos_error -= FOC_TWO_PI;
+    if (pos_error < -FOC_PI) pos_error += FOC_TWO_PI;
+
+    /* Tính PID vòng vị trí -> Vận tốc mục tiêu (rad/s) */
+    float target_vel = PID_Update(&hfoc->pid_pos, pos_error, hfoc->Ts);
+
+    /* Gọi vòng lặp tốc độ để thực thi vận tốc mục tiêu */
+    FOC_RunVelocity(hfoc, angle_mech_rad, target_vel);
 }

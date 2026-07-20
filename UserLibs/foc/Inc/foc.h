@@ -155,6 +155,7 @@ typedef struct {
     PID_Handle_t pid_d;    /*!< PID trục d (điều khiển Id → 0) — chạy trong Current Loop */
     PID_Handle_t pid_q;    /*!< PID trục q (điều khiển Iq → Iq_ref) — chạy trong Current Loop */
     PID_Handle_t pid_vel;  /*!< PID vòng tốc độ: vel_error → Iq_ref — chạy trong Velocity Loop */
+    PID_Handle_t pid_pos;  /*!< PID vòng vị trí: pos_error → target_vel — chạy trong Position Loop */
 
     /* --- Trạng thái vòng lặp --- */
     float Ts;            /*!< Chu kỳ Velocity Loop [s] */
@@ -384,8 +385,31 @@ void FOC_SetPID_Vel(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
  * @param  angle_mech_rad    Góc cơ học từ encoder [rad], range [0, 2π)
  * @param  target_vel_rad_s  Tốc độ cơ học mục tiêu [rad/s]
  */
-void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
-                     float target_vel_rad_s);
+void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad, float target_vel_rad_s);
+
+/* ===========================================================================
+ * API Closed-loop Position Control
+ * =========================================================================== */
+
+/**
+ * @brief  Cấu hình PID vòng vị trí (position loop)
+ *
+ * out_min/max là giới hạn tốc độ [rad/s]
+ */
+void FOC_SetPID_Pos(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd,
+                    float out_min, float out_max);
+
+/**
+ * @brief  Chạy 1 chu kỳ Position Control
+ *
+ * Tính: pos_error → PID_pos → target_vel
+ * Sau đó tự động gọi FOC_RunVelocity() để tính target_vel → Iq_ref.
+ *
+ * @param  hfoc              Con trỏ FOC_Handle_t
+ * @param  angle_mech_rad    Góc cơ học hiện tại từ encoder [rad]
+ * @param  target_angle_rad  Góc cơ học mục tiêu [rad]
+ */
+void FOC_RunPosition(FOC_Handle_t *hfoc, float angle_mech_rad, float target_angle_rad);
 
 #ifdef __cplusplus
 }

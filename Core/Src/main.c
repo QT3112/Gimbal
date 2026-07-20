@@ -42,8 +42,14 @@ typedef enum {
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+/* ----------------- CHỌN CHẾ ĐỘ HOẠT ĐỘNG ----------------- */
+#define USE_POSITION_LOOP 1  /* 1: Chạy vòng vị trí (giữ góc), 0: Chạy vòng tốc độ/dòng điện */
+
 AS5048A_Handle_t pitch_enc;
 FOC_Handle_t foc_pitch;
+
+/* Biến lưu góc mục tiêu (rad) */
+volatile float target_pitch_angle = 0.0f;
 
 float pitch_offset_a = 0.0f;
 float pitch_offset_b = 0.0f;
@@ -116,6 +122,7 @@ int main(void)
   MX_SPI3_Init();
   MX_USART1_UART_Init();
   MX_USART3_UART_Init();
+  MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
   /* --- SETUP PHẦN CỨNG PITCH MOTOR --- */
   
@@ -127,20 +134,23 @@ int main(void)
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_SET);
   HAL_Delay(10);
 
-  /* Khởi tạo Encoder */
   AS5048A_Init(&pitch_enc, &hspi1, GPIOB, GPIO_PIN_12);
 
-  /* Khởi tạo FOC */
+  /* Khởi tạo FOC (Ts vòng ngoài = 0.0005s vì TIM6 chạy ở 2kHz) */
   FOC_Init(&foc_pitch, &htim1, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3, 
-           PWM_PERIOD, MOTOR_POLE_PAIRS, VOLTAGE_LIMIT, 0.001f);
+           PWM_PERIOD, MOTOR_POLE_PAIRS, VOLTAGE_LIMIT, 0.0005f);
            
-  /* Set Current Loop PID (Tạm thời để thông số cơ bản) 
-   * Kp = 0.5 là quá lớn đối với motor Gimbal (thường điện trở cao, tự cảm thấp), gây ra dao động (HÚ).
-   * Giảm Kp xuống 0.05 và duy trì Ki = 100 */
+  /* 1. Vòng lặp Dòng điện (Current Loop) ở 20kHz */
   FOC_SetPID_D(&foc_pitch, 0.05f, 100.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
   FOC_SetPID_Q(&foc_pitch, 0.05f, 100.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
-  FOC_SetCurrentLimit(&foc_pitch, 0.4f);
-  
+  FOC_SetCurrentLimit(&foc_pitch, 0.2f); // Giới hạn dòng (Quyết định lực cứng tối đa) - 0.35A là khá mềm
+
+  /* 2. Vòng lặp Tốc độ (Velocity Loop) - Nhận target_vel và xuất ra Iq_ref */
+  FOC_SetLPF_Vel(&foc_pitch, 0.9f);      // Bộ lọc LPF (alpha = 0.9 -> lọc mạnh 90% nhiễu)
+  FOC_SetPID_Vel(&foc_pitch, 0.05f, 1.0f, 0.0f, -0.35f, 0.35f); // Kp=0.05 mềm hơn khi cản tốc độ tay bạn
+
+  FOC_SetPID_Pos(&foc_pitch, 2.0f, 0.01f, 0.0f, -3.0f, 3.0f); 
+
   /* Bật vòng lặp dòng điện tại tần số 20kHz */
   FOC_EnableCurrentLoop(&foc_pitch, 1.0f / 20000.0f);
 
@@ -204,14 +214,14 @@ int main(void)
   FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
   printf("[INFO] FOC Align Complete. Offset: %.2f rad\r\n", foc_pitch.angle_offset);
 
-  /* Bắt đầu vòng điều khiển chính FOC */
+  /* Setup góc mặc định 45 độ (0.785398 rad) để motor tự động đi về góc này */
+  target_pitch_angle = 45.0f * (3.14159265f / 180.0f);
+  printf("[INFO] Target Angle set to: %.2f rad (45 deg)\r\n", target_pitch_angle);
   FOC_Start(&foc_pitch, pitch_enc.angle_rad);
 
-  /* Bật ngắt ngầm định ADC1 (Trigger tự động ở 20kHz từ TIM1_CH4) */
-  HAL_ADCEx_InjectedStart_IT(&hadc1);
-
-  /* Kích hoạt Timer 6 chạy ngắt ngầm định (ví dụ 1kHz) để trigger SPI DMA */
-  HAL_TIM_Base_Start_IT(&htim6);
+  HAL_ADCEx_InjectedStart_IT(&hadc1);    // Trigger đọc dòng phản hồi 
+  HAL_TIM_Base_Start_IT(&htim6);         // Ngắt TIMER6 để đọc SPI - 2kHz 
+  HAL_TIM_Base_Start_IT(&htim7);         // Ngắt TIMER7 để xử lý thuật toán FOC (position, velocity) - 2kHz
 
   /* USER CODE END 2 */
 
@@ -289,18 +299,7 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-  /* TIM6 chạy định kỳ (vd 1kHz) dùng để kích hoạt đọc SPI qua DMA */
-  if (htim->Instance == TIM6) {
-    if (enc_state == ENC_STATE_IDLE) {
-      enc_state = ENC_STATE_PITCH_CMD;
-      /* Bước 1: Kéo CS xuống Mức Thấp để gửi Lệnh Đọc Góc (0xFFFF) */
-      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET); 
-      HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t*)&enc_tx_buf[0], (uint8_t*)&enc_rx_buf[0], 1);
-    }
-  }
-}
+
 
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
 {
@@ -327,18 +326,43 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
        * LOẠI TRỪ các giá trị glitch rác (0x0000, 0xFFFF) vì chúng vô tình thoả mãn Parity! */
       if (rx_val != 0x0000 && rx_val != 0xFFFF && AS5048A_CheckParity(rx_val) && !(rx_val & AS5048A_EF_BIT)) {
         pitch_enc.raw_angle = rx_val & AS5048A_DATA_MASK;
-        pitch_enc.angle_deg = (float)pitch_enc.raw_angle * (360.0f / 16384.0f);
-        pitch_enc.angle_rad = (float)pitch_enc.raw_angle * (6.28318530718f / 16384.0f);
         
-        /* CỰC KỲ QUAN TRỌNG: Cập nhật góc này cho bộ điều khiển FOC 
-         * Thay vì dùng FOC_SetAngle, ta gọi FOC_RunVelocity để bộ FOC tự động 
-         * tính toán tốc độ quay (velocity_mech). Nhờ có velocity, ngắt ADC (20kHz) 
-         * có thể NỘI SUY (interpolate) góc mượt mà giữa các lần đọc SPI, loại bỏ hoàn toàn rung giật! */
-        FOC_RunVelocity(&foc_pitch, pitch_enc.angle_rad, 0.0f);
+        /* ĐẢO CHIỀU ENCODER TRONG PHẦN MỀM: 
+         * Thay vì tráo 2 dây pha vật lý (gây sai lệch kênh đo dòng điện ADC Ia/Ib),
+         * ta chỉ cần lấy (2*PI - góc_hiện_tại). Như vậy chiều Dương của Encoder 
+         * sẽ tự động khớp 100% với chiều Dương của từ trường Motor! */
+        pitch_enc.angle_deg = 360.0f - ((float)pitch_enc.raw_angle * (360.0f / 16384.0f));
+        pitch_enc.angle_rad = 6.28318530718f - ((float)pitch_enc.raw_angle * (6.28318530718f / 16384.0f));
+        
+        /* CHỈ LƯU GÓC TẠI ĐÂY (Ngắt SPI kết thúc cực nhanh, giải phóng CPU) 
+         * Việc tính toán FOC_RunPosition sẽ do TIM7 (chạy sau đó) đảm nhận. */
       }
       
       enc_state = ENC_STATE_IDLE;
     }
+  }
+}
+
+/* Hàm ngắt Timer định kỳ (TIM6 cho đọc SPI, TIM7 cho tính PID Vị trí) */
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM6) {
+    if (enc_state == ENC_STATE_IDLE) {
+      enc_state = ENC_STATE_PITCH_CMD;
+      /* Bước 1: Kéo CS xuống Mức Thấp để gửi Lệnh Đọc Góc (0xFFFF) */
+      HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET); 
+      HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t*)&enc_tx_buf[0], (uint8_t*)&enc_rx_buf[0], 1);
+    }
+  }
+  else if (htim->Instance == TIM7) {
+      /* Ngắt TIM7 (1kHz hoặc 2kHz) chuyên dụng để tính toán PID Vị trí và Tốc độ.
+       * Ngắt này có Priority thấp hơn SPI và ADC, nên nó sẽ "thong thả" tính toán
+       * mà không làm ảnh hưởng đến thời gian thực của ADC (20kHz). */
+#if USE_POSITION_LOOP
+      FOC_RunPosition(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
+#else
+      FOC_RunVelocity(&foc_pitch, pitch_enc.angle_rad, 0.0f);
+#endif
   }
 }
 
@@ -351,21 +375,22 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef* hadc)
     
     log_raw_ia = raw_ia;
     log_raw_ib = raw_ib;
-    
-    /* Đổi ra điện áp */
     float volt_a = (float)raw_ia * 3.3f / 4096.0f;
     float volt_b = (float)raw_ib * 3.3f / 4096.0f;
-    
-    /* Tính dòng điện thực tế dựa trên độ nhạy mạch DRV8302 */
     float current_a = (volt_a - pitch_offset_a) / (GAIN_DRV * SHUNT_RES);
     float current_b = (volt_b - pitch_offset_b) / (GAIN_DRV * SHUNT_RES);
+    float true_elec = pitch_enc.angle_rad * foc_pitch.pole_pairs - foc_pitch.angle_offset;
+    true_elec = fmodf(true_elec, 6.28318530718f);
+    if (true_elec < 0.0f) true_elec += 6.28318530718f;
+  
+    float phase_err = true_elec - foc_pitch.angle_elec;
+    if (phase_err > 3.14159265f) phase_err -= 6.28318530718f;
+    if (phase_err < -3.14159265f) phase_err += 6.28318530718f;
     
-    /* Nội suy góc điện động cơ dựa vào tốc độ hiện tại (dt = 1/20000) */
-    foc_pitch.angle_elec += foc_pitch.velocity_mech * foc_pitch.pole_pairs * (1.0f / 20000.0f);
+    foc_pitch.angle_elec += phase_err * 0.1f + (foc_pitch.velocity_mech * foc_pitch.pole_pairs * (1.0f / 20000.0f));
+    
     if (foc_pitch.angle_elec >= 6.28318530718f) foc_pitch.angle_elec -= 6.28318530718f;
     else if (foc_pitch.angle_elec < 0.0f) foc_pitch.angle_elec += 6.28318530718f;
-    
-    /* Thực thi giải thuật điều khiển dòng điện True FOC */
     FOC_UpdateCurrentLoop(&foc_pitch, current_a, current_b);
   }
 }
