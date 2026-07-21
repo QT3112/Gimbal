@@ -111,6 +111,7 @@ typedef struct {
     float angle_mech;
     float angle_elec;
     float angle_offset;
+    int8_t sensor_direction; /*!< 1 = Thuận chiều motor, -1 = Ngược chiều motor */
 
     /* --- Ước lượng tốc độ từ encoder --- */
     float prev_angle_mech;   /*!< Góc cơ lần trước [rad] — dùng tính vi phân */

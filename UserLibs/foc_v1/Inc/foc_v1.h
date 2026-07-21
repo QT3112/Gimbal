@@ -1,100 +1,134 @@
-// #ifndef FOC_V1_H
-// #define FOC_V1_H
+#ifndef FOC_V1_H
+#define FOC_V1_H
 
-// #ifdef __cplusplus
-// extern "C" {
-// #endif
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-// #include "stm32g4xx_hal.h"
-// #include "pid_lib.h"
-// #include <stdint.h>
-// #include <math.h>
+#include "stm32g4xx_hal.h"
+#include "pid_lib.h"
+#include <stdint.h>
+#include <math.h>
 
-// /* ===========================================================================
-//  * Hằng số toán học
-//  * =========================================================================== */
-// #define FOC_PI          3.14159265359f
-// #define FOC_TWO_PI      6.28318530718f
-// #define FOC_SQRT3       1.73205080757f
-// #define FOC_SQRT3_2     0.86602540378f  /* sqrt(3)/2 */
-// #define FOC_ONE_SQRT3   0.57735026919f  /* 1/sqrt(3) */
-
-
-// /* ===========================================================================
-//  * Cấu trúc trạng thái tọa độ αβ (stationary frame)
-//  * =========================================================================== */
-// typedef struct {
-//     float alpha;   /*!< Thành phần trục α */
-//     float beta;    /*!< Thành phần trục β */
-// } FOC_Clarke_t;
-
-// /* ===========================================================================
-//  * Cấu trúc trạng thái tọa độ dq (rotating frame)
-//  * =========================================================================== */
-// typedef struct {
-//     float d;   /*!< Thành phần trục d (flux, cần điều khiển về 0) */
-//     float q;   /*!< Thành phần trục q (torque, điều khiển moment) */
-// } FOC_Park_t;
-
-// /* ===========================================================================
-//  * Cấu trúc Low-Pass Filter (LPF) — lọc nhiễu tốc độ encoder
-//  *
-//  * Công thức: y[n] = α * y[n-1] + (1-α) * x[n]
-//  *   α gần 1 = lọc nhiều, chậm theo (dùng khi nhiễu lớn)
-//  *   α gần 0 = lọc ít, nhanh theo (dùng khi muốn đáp ứng nhanh)
-//  *   Khuyến nghị: 0.85 – 0.95 cho bước lấy mẫu 10ms
-//  * =========================================================================== */
-// typedef struct {
-//     float alpha;   /*!< Hệ số lọc: 0 < α < 1 */
-//     float output;  /*!< Giá trị đã lọc (khởi tạo = 0) */
-// } FOC_LPF_t;
-
-// /* ===========================================================================
-//  * Cấu trúc chính của FOC Handle
-//  * =========================================================================== */
-// typedef struct {
-//     /* --- Phần cứng PWM --- */
-//     TIM_HandleTypeDef *htim;
-//     uint32_t ch_a;
-//     uint32_t ch_b;
-//     uint32_t ch_c;
-//     float    pwm_period;
-
-//     /* --- Thông số động cơ --- */
-//     uint8_t  pole_pairs;
-//     float    voltage_supply;
-//     float    voltage_limit;
-
-//     /* --- Góc điện --- */
-//     float angle_mech;
-//     float angle_elec;
-//     float angle_offset;
-
-//     /* --- Ước lượng tốc độ từ encoder --- */
-//     float prev_angle_mech;   /*!< Góc cơ lần trước [rad] — dùng tính vi phân */
-//     float velocity_mech;     /*!< Tốc độ cơ học đã lọc LPF [rad/s] */
-//     FOC_LPF_t lpf_vel;       /*!< Bộ lọc LPF cho tín hiệu tốc độ */
-
-//     /* --- Setpoint điều khiển --- */
-//     float Vd_ref;
-//     float Vq_ref;
-
-//     /* --- Trạng thái biến đổi tọa độ --- */
-//     FOC_Clarke_t V_ab;
-//     FOC_Park_t   V_dq;
-
-//     /* --- PID Controllers --- */
-//     PID_Handle_t pid_d;    /*!< PID trục d (từ thông, thường Kp=0) */
-//     PID_Handle_t pid_q;    /*!< PID trục q (moment) */
-//     PID_Handle_t pid_vel;  /*!< PID vòng tốc độ: vel_error → Vq */
-
-//     /* --- Trạng thái vòng lặp --- */
-//     float Ts;
-//     uint8_t enabled;
-// } FOC_Handle_t;
+/* ===========================================================================
+ * Hằng số toán học
+ * =========================================================================== */
+#define FOC_PI          3.14159265359f
+#define FOC_TWO_PI      6.28318530718f
+#define FOC_SQRT3       1.73205080757f
+#define FOC_SQRT3_2     0.86602540378f  /* sqrt(3)/2 */
+#define FOC_ONE_SQRT3   0.57735026919f  /* 1/sqrt(3) */
 
 
-// #ifdef __cplusplus
-// }
-// #endif
-// #endif //FOC_V1_H
+typedef struct {
+    float alpha;   /*!< Thành phần trục α */
+    float beta;    /*!< Thành phần trục β */
+} FOC_Clarke_t;
+
+typedef struct {
+    float d;   /*!< Thành phần trục d (flux, cần điều khiển về 0) */
+    float q;   /*!< Thành phần trục q (torque, điều khiển moment) */
+} FOC_Park_t;
+
+typedef struct {
+    float alpha;   /*!< Hệ số lọc: 0 < α < 1 */
+    float output;  /*!< Giá trị đã lọc (khởi tạo = 0) */
+} FOC_LPF_t;
+
+
+typedef struct {
+    /* --- Phần cứng PWM --- */
+    TIM_HandleTypeDef *htim;
+    uint32_t ch_a;
+    uint32_t ch_b;
+    uint32_t ch_c;
+    float    pwm_period;
+
+    /* --- Thông số động cơ --- */
+    uint8_t  pole_pairs;
+    float    voltage_supply;
+    float    voltage_limit;
+    float    current_limit;
+
+    /* --- Góc điện --- */
+    float angle_mech;
+    float angle_elec;
+    float angle_offset;
+
+    /* --- Ước lượng tốc độ từ encoder --- */
+    float prev_angle_mech;   /*!< Góc cơ lần trước [rad] — dùng tính vi phân */
+    float velocity_mech;     /*!< Tốc độ cơ học đã lọc LPF [rad/s] */
+    FOC_LPF_t lpf_vel;       /*!< Bộ lọc LPF cho tín hiệu tốc độ */
+
+    /* Setpoint dòng điện (đầu ra của Velocity PID) */
+    float Id_ref;            /*!< Dòng từ thông mục tiêu — luôn = 0 với SPMSM [A] */
+    float Iq_ref;            /*!< Dòng momen mục tiêu từ velocity PID [A] */
+
+    /* Dòng điện đo được (raw từ ADC, đã quy đổi sang [A]) */
+    float Ia;                /*!< Dòng pha A đo từ SO1 [A] */
+    float Ib;                /*!< Dòng pha B đo từ SO2 [A] */
+    float Ic;                /*!< Dòng pha C = -(Ia+Ib) [A] */
+
+    /* --- Trạng thái biến đổi tọa độ --- */
+    FOC_Clarke_t I_ab;
+    FOC_Park_t   I_dq;
+
+    /* --- Setpoint điều khiển --- */
+    float Vd_ref;
+    float Vq_ref;
+
+    /* --- Trạng thái biến đổi tọa độ --- */
+    FOC_Clarke_t V_ab;
+    FOC_Park_t   V_dq;
+
+    /* --- PID Controllers --- */
+    PID_Handle_t pid_d;    /*!< PID trục d (từ thông, thường Kp=0) */
+    PID_Handle_t pid_q;    /*!< PID trục q (moment) */
+    PID_Handle_t pid_pos; 
+    PID_Handle_t pid_vel;  
+
+    /* --- Trạng thái vòng lặp --- */
+    float Ts;
+    float Ts_current;  
+    uint8_t enabled;
+    uint8_t position_loop_enabled;
+    uint8_t velocity_loop_enabled;
+    uint8_t current_loop_enabled;
+} FOC_Handle_t;
+
+
+
+
+FOC_Clarke_t FOC_Clarke(float ia, float ib, float ic);
+FOC_Park_t FOC_Park(FOC_Clarke_t ab, float theta_e);
+FOC_Clarke_t FOC_InvPark(FOC_Park_t dq, float theta_e);
+void FOC_InvClarke(FOC_Clarke_t ab, float *ua, float *ub, float *uc);
+void FOC_Update(FOC_Handle_t *hfoc);
+void FOC_Stop(FOC_Handle_t *hfoc);
+void FOC_Start(FOC_Handle_t *hfoc, float current_angle);
+float FOC_LPF_Update(FOC_LPF_t *lpf, float input);
+void FOC_SetLPF_Vel(FOC_Handle_t *hfoc, float alpha);
+void FOC_AlignD(FOC_Handle_t *hfoc, float Vd);
+void FOC_CalibrateAngle(FOC_Handle_t *hfoc, float current_angle_mech);
+void FOC_SetAngle(FOC_Handle_t *hfoc, float angle_mech_rad);
+void FOC_SetVoltage(FOC_Handle_t *hfoc, float Vd, float Vq);
+void FOC_SetPID_D(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd, float out_min, float out_max);
+void FOC_SetPID_Q(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd, float out_min, float out_max);
+void FOC_SetPID_POS(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd, float out_min, float out_max);
+void FOC_SetPID_VEL(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd, float out_min, float out_max);
+void FOC_Init(FOC_Handle_t *hfoc,
+              TIM_HandleTypeDef *htim,
+              uint32_t ch_a, uint32_t ch_b, uint32_t ch_c,
+              float pwm_period,
+              uint8_t pole_pairs,
+              float voltage_lim, float current_lim,
+              float Ts, float Ts_current);
+void FOC_CurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib);
+void FOC_VelocityLoop(FOC_Handle_t *hfoc, float angle_mech_rad, float target_vel_rad_s);
+void FOC_PositionLoop(FOC_Handle_t *hfoc, float angle_mech_rad, float target_angle_rad);           
+void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq);
+
+#ifdef __cplusplus
+}
+#endif
+#endif //FOC_V1_H

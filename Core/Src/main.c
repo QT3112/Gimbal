@@ -147,10 +147,10 @@ int main(void)
 
   /* 2. Vòng lặp Tốc độ (Velocity Loop) - Nhận target_vel và xuất ra Iq_ref */
   FOC_SetLPF_Vel(&foc_pitch, 0.9f);      // Bộ lọc LPF (alpha = 0.9 -> lọc mạnh 90% nhiễu)
-  FOC_SetPID_Vel(&foc_pitch, 0.05f, 1.0f, 0.0f, -0.35f, 0.35f); // Kp=0.05 mềm hơn khi cản tốc độ tay bạn
+  FOC_SetPID_Vel(&foc_pitch, 0.05f, 1.0f, 0.0f, -0.35f, 0.35f);
 
-  FOC_SetPID_Pos(&foc_pitch, 2.0f, 0.01f, 0.0f, -3.0f, 3.0f); 
-
+  FOC_SetPID_Pos(&foc_pitch, 2.0f, 0.01f, 0.0f, -3.0f, 3.0f);
+ 
   /* Bật vòng lặp dòng điện tại tần số 20kHz */
   FOC_EnableCurrentLoop(&foc_pitch, 1.0f / 20000.0f);
 
@@ -203,14 +203,73 @@ int main(void)
       }
   }
 
-  /* Align và Khởi động động cơ */
-  printf("[INFO] Aligning Motor...\r\n");
-  FOC_AlignD(&foc_pitch, 3.0f); 
-  HAL_Delay(800);
+  /* =========================================================
+   * BƯỚC 3: ALIGN VÀ DÒ CHIỀU ENCODER (Auto-calibration)
+   * ========================================================= */
+  printf("[INFO] Aligning Motor and Detecting Direction...\r\n");
   
+  foc_pitch.enabled = 1; // Bật FOC để cấp PWM
+  
+  /* 1. Cấp nguồn Vd = 3.0V tại góc điện 0 độ để khoá Rotor vào vị trí mốc */
+  FOC_AlignD(&foc_pitch, 3.0f); 
+  HAL_Delay(800); // Đợi rotor ổn định
+  
+  /* Đọc góc Encoder ban đầu */
+  float start_angle = 0.0f;
   if (AS5048A_ReadAngle(&pitch_enc) == AS5048A_OK) {
+      start_angle = (float)pitch_enc.raw_angle * (6.28318530718f / 16384.0f);
+  }
+  
+  /* 2. Quét từ trường điện đi 1 vòng tròn (2*PI) để xem Encoder chạy theo chiều nào */
+  printf("[INFO] Sweeping electrical field...\r\n");
+  for (int i = 1; i <= 100; i++) {
+      foc_pitch.angle_elec = (float)i * (6.28318530718f / 100.0f);
+      FOC_Update(&foc_pitch); // Cập nhật PWM theo Vd và góc điện mới
+      HAL_Delay(5);           // Tốc độ quét (quét 1 vòng mất 500ms)
+  }
+  HAL_Delay(500); // Chờ rotor ổn định ở điểm cuối
+  
+  /* Đọc góc Encoder lúc sau */
+  float end_angle = 0.0f;
+  if (AS5048A_ReadAngle(&pitch_enc) == AS5048A_OK) {
+      end_angle = (float)pitch_enc.raw_angle * (6.28318530718f / 16384.0f);
+  }
+  
+  /* 3. Tính toán độ lệch góc và phán xét chiều quay */
+  float delta_angle = end_angle - start_angle;
+  if (delta_angle > 3.14159265f) delta_angle -= 6.28318530718f;
+  if (delta_angle < -3.14159265f) delta_angle += 6.28318530718f;
+  
+  /* Chẩn đoán số Pole Pairs thực tế: 
+   * 1 vòng điện = 360 / PolePairs độ cơ học 
+   * VD: delta_angle ~ 0.44 rad (25 độ) => PolePairs = 14 */
+  float delta_deg = delta_angle * (180.0f / 3.14159265f);
+  printf("[INFO] Sweep Delta: %.2f deg (%.2f rad)\r\n", delta_deg, delta_angle);
+  
+  if (delta_angle > 0.0f) {
+      foc_pitch.sensor_direction = 1;
+      printf("[INFO] Sensor Direction: FORWARD (1)\r\n");
+  } else {
+      foc_pitch.sensor_direction = -1;
+      printf("[INFO] Sensor Direction: REVERSE (-1)\r\n");
+  }
+  
+  /* 4. Khóa Rotor lại vị trí 0 độ điện lần nữa để lấy mốc (Offset) chuẩn xác */
+  FOC_AlignD(&foc_pitch, 3.0f);
+  HAL_Delay(500);
+  
+  /* Cập nhật lại góc hiện tại với chiều quay vừa phát hiện */
+  if (AS5048A_ReadAngle(&pitch_enc) == AS5048A_OK) {
+      float final_rad = (float)pitch_enc.raw_angle * (6.28318530718f / 16384.0f);
+      if (foc_pitch.sensor_direction == -1) {
+          pitch_enc.angle_rad = 6.28318530718f - final_rad;
+      } else {
+          pitch_enc.angle_rad = final_rad;
+      }
       printf("[INFO] Encoder OK! Angle: %.2f rad\r\n", pitch_enc.angle_rad);
   }
+  
+  /* Lưu offset */
   FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
   printf("[INFO] FOC Align Complete. Offset: %.2f rad\r\n", foc_pitch.angle_offset);
 
@@ -325,15 +384,35 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi)
       /* Kiểm tra chẵn lẻ (Parity) và cờ lỗi (Error Flag) 
        * LOẠI TRỪ các giá trị glitch rác (0x0000, 0xFFFF) vì chúng vô tình thoả mãn Parity! */
       if (rx_val != 0x0000 && rx_val != 0xFFFF && AS5048A_CheckParity(rx_val) && !(rx_val & AS5048A_EF_BIT)) {
-        pitch_enc.raw_angle = rx_val & AS5048A_DATA_MASK;
+        uint16_t new_raw = rx_val & AS5048A_DATA_MASK;
         
-        /* ĐẢO CHIỀU ENCODER TRONG PHẦN MỀM: 
-         * Thay vì tráo 2 dây pha vật lý (gây sai lệch kênh đo dòng điện ADC Ia/Ib),
-         * ta chỉ cần lấy (2*PI - góc_hiện_tại). Như vậy chiều Dương của Encoder 
-         * sẽ tự động khớp 100% với chiều Dương của từ trường Motor! */
-        pitch_enc.angle_deg = 360.0f - ((float)pitch_enc.raw_angle * (360.0f / 16384.0f));
-        pitch_enc.angle_rad = 6.28318530718f - ((float)pitch_enc.raw_angle * (6.28318530718f / 16384.0f));
+        /* Tính delta cơ học thô để lọc glitch */
+        int32_t delta_raw = (int32_t)new_raw - (int32_t)pitch_enc.raw_angle;
+        if (delta_raw > 8192) delta_raw -= 16384;
+        if (delta_raw < -8192) delta_raw += 16384;
         
+        /* Lọc Glitch: Nếu nhảy > 150 raw (khoảng 3.3 độ/0.5ms) thì coi là nhiễu.
+         * Dùng bộ đếm reject_count để tránh bị khoá vĩnh viễn nếu góc thực sự bị dịch chuyển. */
+        static uint8_t startup_skip = 10;
+        static uint8_t reject_count = 0;
+        
+        if (startup_skip > 0 || abs(delta_raw) < 150 || reject_count > 10) {
+            if (startup_skip > 0) startup_skip--;
+            pitch_enc.raw_angle = new_raw;
+            reject_count = 0;
+        
+            /* Tự động đảo chiều (dựa vào Auto-Calibration) */
+            if (foc_pitch.sensor_direction == -1) {
+                pitch_enc.angle_deg = 360.0f - ((float)pitch_enc.raw_angle * (360.0f / 16384.0f));
+                pitch_enc.angle_rad = 6.28318530718f - ((float)pitch_enc.raw_angle * (6.28318530718f / 16384.0f));
+            } else {
+                pitch_enc.angle_deg = ((float)pitch_enc.raw_angle * (360.0f / 16384.0f));
+                pitch_enc.angle_rad = ((float)pitch_enc.raw_angle * (6.28318530718f / 16384.0f));
+            }
+        } else {
+            reject_count++;
+        }
+
         /* CHỈ LƯU GÓC TẠI ĐÂY (Ngắt SPI kết thúc cực nhanh, giải phóng CPU) 
          * Việc tính toán FOC_RunPosition sẽ do TIM7 (chạy sau đó) đảm nhận. */
       }
@@ -352,17 +431,17 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
       /* Bước 1: Kéo CS xuống Mức Thấp để gửi Lệnh Đọc Góc (0xFFFF) */
       HAL_GPIO_WritePin(GPIOB, GPIO_PIN_12, GPIO_PIN_RESET); 
       HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t*)&enc_tx_buf[0], (uint8_t*)&enc_rx_buf[0], 1);
+#if USE_POSITION_LOOP
+      FOC_RunPosition(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
+#else
+      FOC_RunVelocity(&foc_pitch, pitch_enc.angle_rad, 0.0f);
+#endif
     }
   }
   else if (htim->Instance == TIM7) {
       /* Ngắt TIM7 (1kHz hoặc 2kHz) chuyên dụng để tính toán PID Vị trí và Tốc độ.
        * Ngắt này có Priority thấp hơn SPI và ADC, nên nó sẽ "thong thả" tính toán
        * mà không làm ảnh hưởng đến thời gian thực của ADC (20kHz). */
-#if USE_POSITION_LOOP
-      FOC_RunPosition(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
-#else
-      FOC_RunVelocity(&foc_pitch, pitch_enc.angle_rad, 0.0f);
-#endif
   }
 }
 

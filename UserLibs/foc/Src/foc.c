@@ -197,6 +197,7 @@ void FOC_Init(FOC_Handle_t *hfoc,
     hfoc->voltage_limit = voltage_lim;
     hfoc->Ts            = Ts;
     hfoc->enabled       = 0;
+    hfoc->sensor_direction = 1; /* Mặc định là thuận chiều */
 
     /* Mặc định: Voltage-Mode (tương thích ngược) */
     hfoc->current_loop_enabled = 0;
@@ -294,9 +295,12 @@ void FOC_UpdateCurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib)
      * Trục D: Id_ref = 0 (không kích từ thêm với SPMSM)
      * Trục Q: Iq_ref được đặt bởi Velocity PID
      */
-    if (!hfoc->current_loop_enabled) return;
-
-    float err_d = hfoc->Id_ref - hfoc->Id_meas;  /* Id_ref luôn = 0 */
+    if (!hfoc->current_loop_enabled) {
+        /* Voltage-Mode: Update PWM directly using Vd_ref and Vq_ref at 20kHz */
+        _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+        return;
+    }
+    float err_d = hfoc->Id_ref - hfoc->Id_meas;
     float err_q = hfoc->Iq_ref - hfoc->Iq_meas;
 
     hfoc->Vd_ref = PID_Update(&hfoc->pid_d, err_d, hfoc->Ts_current);
@@ -457,7 +461,7 @@ void FOC_RunVelocity(FOC_Handle_t *hfoc, float angle_mech_rad,
          * ============================================================ */
         hfoc->Vq_ref = pid_out;  /* đã clamp trong PID */
         hfoc->Vd_ref = 0.0f;
-        _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+        /* KHÔNG gọi _vdq_to_pwm() ở đây để ISR ADC tự xử lý ở 20kHz */
     }
 }
 
