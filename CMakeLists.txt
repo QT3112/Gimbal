@@ -50,15 +50,15 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     # --- UserLibs ---
     # UserLibs/mpu6050/Src/mpu6050.c         # Tạm tắt — chưa dùng I2C, chờ chuyển sang ICM42688 SPI
     UserLibs/encoder_as5048a/Src/as5048a.c
-    UserLibs/foc/Src/foc.c
+    # UserLibs/foc/Src/foc.c
     UserLibs/imu_filter/Src/imu_filter.c   # Tạm tắt — phụ thuộc MPU6050
     UserLibs/attitude/Src/attitude.c       # Tạm tắt — phụ thuộc imu_filter
-    UserLibs/examples/Src/examples.c
-    UserLibs/examples/Src/example_velocity_control.c
-    UserLibs/examples/Src/example_position_control.c
+    # UserLibs/examples/Src/examples.c
+    # UserLibs/examples/Src/example_velocity_control.c
+    # UserLibs/examples/Src/example_position_control.c
     UserLibs/pid_lib/Src/pid_lib.c
     UserLibs/icm42688/Src/icm42688.c
-    # UserLibs/foc_v1/Src/foc_v1.c
+    UserLibs/foc_v1/Src/foc_v1.c
 )
 
 # Add include paths
@@ -68,13 +68,13 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     # --- UserLibs ---
     # UserLibs/mpu6050/Inc                   # Tạm tắt
     UserLibs/encoder_as5048a/Inc
-    UserLibs/foc/Inc
+    # UserLibs/foc/Inc
     UserLibs/imu_filter/Inc               # Tạm tắt
     UserLibs/attitude/Inc                 # Tạm tắt
-    UserLibs/examples/Inc
+    # UserLibs/examples/Inc
     UserLibs/pid_lib/Inc
     UserLibs/icm42688/Inc
-    # UserLibs/foc_v1/Inc
+    UserLibs/foc_v1/Inc
 )
 
 # Add project symbols (macros)

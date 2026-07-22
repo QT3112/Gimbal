@@ -54,7 +54,8 @@ typedef struct {
     float angle_mech;
     float angle_elec;
     float angle_offset;
-
+    int8_t sensor_direction;
+    
     /* --- Ước lượng tốc độ từ encoder --- */
     float prev_angle_mech;   /*!< Góc cơ lần trước [rad] — dùng tính vi phân */
     float velocity_mech;     /*!< Tốc độ cơ học đã lọc LPF [rad/s] */
@@ -68,6 +69,12 @@ typedef struct {
     float Ia;                /*!< Dòng pha A đo từ SO1 [A] */
     float Ib;                /*!< Dòng pha B đo từ SO2 [A] */
     float Ic;                /*!< Dòng pha C = -(Ia+Ib) [A] */
+
+    /* --- Cấu hình & Hiệu chỉnh ADC Current Sense --- */
+    uint32_t adc_offset_a;   /*!< Zero-current raw offset ADC Pha A (thường ~2048) */
+    uint32_t adc_offset_b;   /*!< Zero-current raw offset ADC Pha B (thường ~2048) */
+    float    current_scale;  /*!< Hệ số chuyển đổi (ADC_raw - offset) -> Amperes [A/count] */
+    uint8_t  current_calibrated; /*!< Flag = 1 khi đã hoàn thành hiệu chỉnh offset */
 
     /* --- Trạng thái biến đổi tọa độ --- */
     FOC_Clarke_t I_ab;
@@ -103,6 +110,7 @@ FOC_Clarke_t FOC_Clarke(float ia, float ib, float ic);
 FOC_Park_t FOC_Park(FOC_Clarke_t ab, float theta_e);
 FOC_Clarke_t FOC_InvPark(FOC_Park_t dq, float theta_e);
 void FOC_InvClarke(FOC_Clarke_t ab, float *ua, float *ub, float *uc);
+void FOC_SVPWM(FOC_Handle_t *hfoc, float Vd, float Vq, float theta_e);
 void FOC_Update(FOC_Handle_t *hfoc);
 void FOC_Stop(FOC_Handle_t *hfoc);
 void FOC_Start(FOC_Handle_t *hfoc, float current_angle);
@@ -111,6 +119,7 @@ void FOC_SetLPF_Vel(FOC_Handle_t *hfoc, float alpha);
 void FOC_AlignD(FOC_Handle_t *hfoc, float Vd);
 void FOC_CalibrateAngle(FOC_Handle_t *hfoc, float current_angle_mech);
 void FOC_SetAngle(FOC_Handle_t *hfoc, float angle_mech_rad);
+void FOC_SetSensorDirection(FOC_Handle_t *hfoc, int8_t direction);
 void FOC_SetVoltage(FOC_Handle_t *hfoc, float Vd, float Vq);
 void FOC_SetPID_D(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd, float out_min, float out_max);
 void FOC_SetPID_Q(FOC_Handle_t *hfoc, float Kp, float Ki, float Kd, float out_min, float out_max);
@@ -123,6 +132,13 @@ void FOC_Init(FOC_Handle_t *hfoc,
               uint8_t pole_pairs,
               float voltage_lim, float current_lim,
               float Ts, float Ts_current);
+
+/* --- APIs Cấu hình & Xử lý Dòng ADC --- */
+void FOC_ConfigureCurrentSense(FOC_Handle_t *hfoc, float shunt_res, float gain_drv, float vref_adc);
+void FOC_SetCurrentOffset(FOC_Handle_t *hfoc, uint32_t offset_a, uint32_t offset_b);
+void FOC_CalibrateCurrentOffset(FOC_Handle_t *hfoc, uint32_t sum_raw_a, uint32_t sum_raw_b, uint32_t num_samples);
+void FOC_UpdateCurrentLoopADC(FOC_Handle_t *hfoc, uint32_t raw_adc_a, uint32_t raw_adc_b);
+
 void FOC_CurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib);
 void FOC_VelocityLoop(FOC_Handle_t *hfoc, float angle_mech_rad, float target_vel_rad_s);
 void FOC_PositionLoop(FOC_Handle_t *hfoc, float angle_mech_rad, float target_angle_rad);           

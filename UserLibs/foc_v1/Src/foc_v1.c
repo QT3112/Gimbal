@@ -36,21 +36,59 @@ static void _apply_pwm(FOC_Handle_t *hfoc, float ua, float ub, float uc)
 }
 
 
-static void _vdq_to_pwm(FOC_Handle_t *hfoc, float Vd, float Vq, float theta_e)
+void FOC_SVPWM(FOC_Handle_t *hfoc, float Vd, float Vq, float theta_e)
 {
+    /* 1. Giới hạn biên độ Vector điện áp Vdq <= voltage_limit */
+    float v_mag_sq = Vd * Vd + Vq * Vq;
+    float v_lim_sq = hfoc->voltage_limit * hfoc->voltage_limit;
+    if (v_mag_sq > v_lim_sq && v_mag_sq > 1e-9f) {
+        float scale = sqrtf(v_lim_sq / v_mag_sq);
+        Vd *= scale;
+        Vq *= scale;
+    }
+
+    hfoc->Vd_ref = Vd;
+    hfoc->Vq_ref = Vq;
+    hfoc->V_dq.d = Vd;
+    hfoc->V_dq.q = Vq;
+
+    /* 2. Biến đổi Park ngược (dq -> alpha/beta) */
     FOC_Park_t dq_ref = { Vd, Vq };
     hfoc->V_ab = FOC_InvPark(dq_ref, theta_e);
 
+    /* 3. Biến đổi Clarke ngược (alpha/beta -> ua, ub, uc) */
     float ua_c, ub_c, uc_c;
     FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
 
-    /* Normalize điện áp centered về duty cycle [0, 1] */
+    /* 4. Space Vector PWM (Midpoint Centered Injection)
+     * V_mid = (V_min + V_max) / 2
+     * Căn giữa dạng sóng điện áp trong chu kỳ PWM, tăng hiệu suất bus DC thêm 15.5% */
+    float v_min = ua_c;
+    if (ub_c < v_min) v_min = ub_c;
+    if (uc_c < v_min) v_min = uc_c;
+
+    float v_max = ua_c;
+    if (ub_c > v_max) v_max = ub_c;
+    if (uc_c > v_max) v_max = uc_c;
+
+    float v_mid = 0.5f * (v_min + v_max);
+
+    ua_c -= v_mid;
+    ub_c -= v_mid;
+    uc_c -= v_mid;
+
+    /* 5. Quy đổi điện áp pha về Duty Cycle [0.0, 1.0] */
     float inv_vmax = 1.0f / hfoc->voltage_limit;
-    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
-    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
-    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
+    float ua = 0.5f + ua_c * inv_vmax;
+    float ub = 0.5f + ub_c * inv_vmax;
+    float uc = 0.5f + uc_c * inv_vmax;
 
     _apply_pwm(hfoc, ua, ub, uc);
+}
+
+static inline void _vdq_to_pwm(FOC_Handle_t *hfoc, float Vd, float Vq, float theta_e)
+{
+    FOC_SVPWM(hfoc, Vd, Vq, theta_e);
 }
 
 
@@ -171,10 +209,10 @@ void FOC_AlignD(FOC_Handle_t *hfoc, float Vd)
 
 void FOC_CalibrateAngle(FOC_Handle_t *hfoc, float current_angle_mech)
 {
-    /* Khi rotor đang được giữ ở điện áp Vd và Iq=0,
-     * góc điện thực tế nên là 0.
-     * Offset = (góc cơ hiện tại * pole_pairs) mod 2π */
-    hfoc->angle_offset = _normalize_angle(current_angle_mech * (float)hfoc->pole_pairs);
+    /* Khi rotor đang được giữ ở điện áp Vd (Vq=0) tại góc điện = 0 (AlignD):
+     * Offset = (sensor_direction * góc cơ hiện tại * pole_pairs) mod 2π */
+    float elec_aligned = (float)hfoc->sensor_direction * current_angle_mech * (float)hfoc->pole_pairs;
+    hfoc->angle_offset = _normalize_angle(elec_aligned);
 }
 
 
@@ -182,9 +220,14 @@ void FOC_SetAngle(FOC_Handle_t *hfoc, float angle_mech_rad)
 {
     hfoc->angle_mech = _normalize_angle(angle_mech_rad);
 
-    /* Tính góc điện và trừ offset hiệu chỉnh */
-    float elec = hfoc->angle_mech * (float)hfoc->pole_pairs - hfoc->angle_offset;
+    /* Tính góc điện dựa trên sensor_direction và trừ offset hiệu chỉnh */
+    float elec = (float)hfoc->sensor_direction * hfoc->angle_mech * (float)hfoc->pole_pairs - hfoc->angle_offset;
     hfoc->angle_elec = _normalize_angle(elec);
+}
+
+void FOC_SetSensorDirection(FOC_Handle_t *hfoc, int8_t direction)
+{
+    hfoc->sensor_direction = (direction >= 0) ? 1 : -1;
 }
 
 void FOC_SetVoltage(FOC_Handle_t *hfoc, float Vd, float Vq)
@@ -249,6 +292,12 @@ void FOC_Init(FOC_Handle_t *hfoc,
     hfoc->current_limit        = (current_lim > 0.0f) ? current_lim : 0.0f;
     hfoc->Ts_current           = Ts_current;    /* Sẽ được ghi đè bởi FOC_EnableCurrentLoop() */
 
+    /* Mặc định offset zero-current cho ADC 12-bit (2048) */
+    hfoc->adc_offset_a       = 2048;
+    hfoc->adc_offset_b       = 2048;
+    hfoc->current_scale      = 1.0f;
+    hfoc->current_calibrated = 0;
+
     hfoc->Vd_ref = 0.0f;
     hfoc->Vq_ref = 0.0f;
     hfoc->Id_ref = 0.0f;
@@ -259,6 +308,46 @@ void FOC_Init(FOC_Handle_t *hfoc,
     if (hfoc->htim != NULL) {
         FOC_Stop(hfoc);
     }
+}
+
+
+void FOC_ConfigureCurrentSense(FOC_Handle_t *hfoc, float shunt_res, float gain_drv, float vref_adc)
+{
+    if (shunt_res <= 0.0f || gain_drv <= 0.0f) return;
+    if (vref_adc <= 0.0f) vref_adc = 3.3f;
+
+    /* Current [A] = (ADC_raw - ADC_offset) * Vref / (4095.0 * gain_drv * shunt_res) */
+    hfoc->current_scale = vref_adc / (4095.0f * gain_drv * shunt_res);
+}
+
+void FOC_SetCurrentOffset(FOC_Handle_t *hfoc, uint32_t offset_a, uint32_t offset_b)
+{
+    hfoc->adc_offset_a = offset_a;
+    hfoc->adc_offset_b = offset_b;
+    hfoc->current_calibrated = 1;
+}
+
+void FOC_CalibrateCurrentOffset(FOC_Handle_t *hfoc, uint32_t sum_raw_a, uint32_t sum_raw_b, uint32_t num_samples)
+{
+    if (num_samples == 0) return;
+    hfoc->adc_offset_a = sum_raw_a / num_samples;
+    hfoc->adc_offset_b = sum_raw_b / num_samples;
+    hfoc->current_calibrated = 1;
+}
+
+void FOC_UpdateCurrentLoopADC(FOC_Handle_t *hfoc, uint32_t raw_adc_a, uint32_t raw_adc_b)
+{
+    if ((!hfoc->enabled) || (!hfoc->current_loop_enabled)) return;
+
+    /* Trừ zero-current offset và quy đổi sang Amperes */
+    float ia = ((float)raw_adc_a - (float)hfoc->adc_offset_a) * hfoc->current_scale;
+    float ib = ((float)raw_adc_b - (float)hfoc->adc_offset_b) * hfoc->current_scale;
+
+    /* Extrapolation: Nội suy góc điện ở tần số 20kHz giữa 2 chu kỳ lấy mẫu encoder (1kHz) */
+    float d_elec = (float)hfoc->sensor_direction * hfoc->velocity_mech * (float)hfoc->pole_pairs * hfoc->Ts_current;
+    hfoc->angle_elec = _normalize_angle(hfoc->angle_elec + d_elec);
+
+    FOC_CurrentLoop(hfoc, ia, ib);
 }
 
 
@@ -276,26 +365,30 @@ void FOC_CurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib)
 
     /* === Bước 2: Park thuận → tọa độ dq (dùng góc điện hiện tại) === */
     hfoc->I_dq = FOC_Park(hfoc->I_ab, hfoc->angle_elec);
-    
-    float err_d = hfoc->Id_ref - hfoc->Idq.d;
-    float err_q = hfoc->Iq_ref - hfoc->Idq.q;
 
+    float err_d = hfoc->Id_ref - hfoc->I_dq.d;
+    float err_q = hfoc->Iq_ref - hfoc->I_dq.q;
+    
+    /* === Bước 3: Đặt ưu tiên điện áp trục D (từ thông Id -> 0) === */
+    hfoc->pid_d.out_min = -hfoc->voltage_limit;
+    hfoc->pid_d.out_max =  hfoc->voltage_limit;
     hfoc->Vd_ref = PID_Update(&hfoc->pid_d, err_d, hfoc->Ts_current);
+
+    /* === Bước 4: Tính giới hạn điện áp tối đa còn lại cho trục Q (momen Iq) ===
+     * Vq_max = sqrt(V_limit^2 - Vd^2) */
+    float v_d_sq = hfoc->Vd_ref * hfoc->Vd_ref;
+    float v_lim_sq = hfoc->voltage_limit * hfoc->voltage_limit;
+    float v_q_max = 0.0f;
+    if (v_lim_sq > v_d_sq) {
+        v_q_max = sqrtf(v_lim_sq - v_d_sq);
+    }
+
+    /* === Bước 5: Cập nhật giới hạn động cho PID trục Q === */
+    hfoc->pid_q.out_min = -v_q_max;
+    hfoc->pid_q.out_max =  v_q_max;
     hfoc->Vq_ref = PID_Update(&hfoc->pid_q, err_q, hfoc->Ts_current);
 
-    hfoc->Vdq.d = hfoc->Vd_ref;
-    hfoc->Vdq.q = hfoc->Vq_ref;
-
-    hfoc->V_ab = FOC_InvPark(hfoc->Vdq, hfoc->angle_elec);
-    float ua_c, ub_c, uc_c;
-    FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
-
-    float inv_vmax = 1.0f / hfoc->voltage_limit;
-    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
-    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
-    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
-
-    _apply_pwm(hfoc, ua, ub, uc);
+    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }
 
 
@@ -318,28 +411,8 @@ void FOC_VelocityLoop(FOC_Handle_t *hfoc, float angle_mech_rad,
     /* --- Bước 2: Lọc LPF --- */
     hfoc->velocity_mech = FOC_LPF_Update(&hfoc->lpf_vel, vel_raw);
 
-    /* --- Bước 3: Cập nhật góc cơ học từ encoder --- */
-    hfoc->angle_mech = angle_mech_rad;
-    if (hfoc->current_loop_enabled) {
-        hfoc->angle_mech = angle_mech_rad;
-    } else {
-        hfoc->angle_mech = angle_mech_rad;
-        float true_elec = angle_mech_rad * hfoc->pole_pairs - hfoc->angle_offset;
-        true_elec = fmodf(true_elec, FOC_TWO_PI);
-        if (true_elec < 0.0f) true_elec += FOC_TWO_PI;
-    
-        float phase_err = true_elec - hfoc->angle_elec;
-        if (phase_err > FOC_PI) phase_err -= FOC_TWO_PI;
-        if (phase_err < -FOC_PI) phase_err += FOC_TWO_PI;
-        
-        hfoc->angle_elec += phase_err * 0.1f + (hfoc->velocity_mech * hfoc->pole_pairs * (1.0f / 2000.0f));
-        
-        if (hfoc->angle_elec >= FOC_TWO_PI) hfoc->angle_elec -= FOC_TWO_PI;
-        else if (hfoc->angle_elec < 0.0f) hfoc->angle_elec += FOC_TWO_PI;
-    }
-    /* KHÔNG cập nhật hfoc->angle_elec ở đây để tránh Race Condition với ngắt ADC (20kHz).
-     * Góc điện (angle_elec) giờ đây đã được quản lý và nội suy mượt mà bằng thuật toán PLL
-     * trong ISR ADC (FOC_UpdateCurrentLoop). */
+    /* --- Bước 3: Đồng bộ góc cơ học & góc điện mới từ encoder --- */
+    FOC_SetAngle(hfoc, angle_mech_rad);
 
     /* --- Bước 4: PID vòng tốc độ --- */
     float vel_error = target_vel_rad_s - hfoc->velocity_mech;
@@ -351,19 +424,7 @@ void FOC_VelocityLoop(FOC_Handle_t *hfoc, float angle_mech_rad,
     } else {
         hfoc->Vq_ref = pid_out;  /* đã clamp trong PID */
         hfoc->Vd_ref = 0.0f;
-        hfoc->Vdq.d = hfoc->Vd_ref;
-        hfoc->Vdq.q = hfoc->Vq_ref;
-
-        hfoc->V_ab = FOC_InvPark(hfoc->Vdq, hfoc->angle_elec);
-        float ua_c, ub_c, uc_c;
-        FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
-
-        float inv_vmax = 1.0f / hfoc->voltage_limit;
-        float ua = 0.5f + ua_c * inv_vmax * 0.5f;
-        float ub = 0.5f + ub_c * inv_vmax * 0.5f;
-        float uc = 0.5f + uc_c * inv_vmax * 0.5f;
-
-        _apply_pwm(hfoc, ua, ub, uc);
+        _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
     }
 }
 
@@ -383,7 +444,7 @@ void FOC_PositionLoop(FOC_Handle_t *hfoc, float angle_mech_rad, float target_ang
     float target_vel = PID_Update(&hfoc->pid_pos, pos_error, hfoc->Ts);
 
     /* Gọi vòng lặp tốc độ để thực thi vận tốc mục tiêu */
-    FOC_RunVelocity(hfoc, angle_mech_rad, target_vel);
+    FOC_VelocityLoop(hfoc, angle_mech_rad, target_vel);
 }
 
 
@@ -399,17 +460,5 @@ void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq)
     hfoc->Vq_ref = _clamp(Vq, -hfoc->voltage_limit, hfoc->voltage_limit);
     hfoc->Vd_ref = 0.0f;
 
-    hfoc->Vdq.d = hfoc->Vd_ref;
-    hfoc->Vdq.q = hfoc->Vq_ref;
-
-    hfoc->V_ab = FOC_InvPark(hfoc->Vdq, hfoc->angle_elec);
-    float ua_c, ub_c, uc_c;
-    FOC_InvClarke(hfoc->V_ab, &ua_c, &ub_c, &uc_c);
-
-    float inv_vmax = 1.0f / hfoc->voltage_limit;
-    float ua = 0.5f + ua_c * inv_vmax * 0.5f;
-    float ub = 0.5f + ub_c * inv_vmax * 0.5f;
-    float uc = 0.5f + uc_c * inv_vmax * 0.5f;
-
-    _apply_pwm(hfoc, ua, ub, uc);
+    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }

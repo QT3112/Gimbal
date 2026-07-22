@@ -14,9 +14,8 @@ void PID_Init(PID_Handle_t *pid, float Kp, float Ki, float Kd, float min, float 
 }
 
 float PID_Update(PID_Handle_t *pid, float error, float dt) {
-    // Integral term with anti-windup clamping
-    pid->integral += pid->Ki * error * dt;
-    pid->integral = _clamp(pid->integral, pid->out_min, pid->out_max);
+    // Proportional term
+    float p_term = pid->Kp * error;
 
     // Derivative term — guard against dt == 0 to prevent NaN/Inf
     float d_term = 0.0f;
@@ -25,9 +24,22 @@ float PID_Update(PID_Handle_t *pid, float error, float dt) {
     }
     pid->prev_error = error;
 
-    // Compute total output and clamp
-    float out = pid->Kp * error + pid->integral + d_term;
-    return _clamp(out, pid->out_min, pid->out_max);
+    // Calculate candidate unclamped output with potential new integral
+    float new_integral = pid->integral + pid->Ki * error * dt;
+    float out_unclamped = p_term + new_integral + d_term;
+    float out = _clamp(out_unclamped, pid->out_min, pid->out_max);
+
+    // Conditional Integration Anti-Windup:
+    // Only accumulate integral if output is NOT saturated, OR if the error is pushing out back into linear region.
+    if (out == out_unclamped) {
+        pid->integral = _clamp(new_integral, pid->out_min, pid->out_max);
+    } else {
+        if ((out >= pid->out_max && error < 0.0f) || (out <= pid->out_min && error > 0.0f)) {
+            pid->integral = _clamp(new_integral, pid->out_min, pid->out_max);
+        }
+    }
+
+    return out;
 }
 
 void PID_Reset(PID_Handle_t *pid) {
