@@ -86,7 +86,7 @@ typedef struct {
     float Vd_ref;
     float Vq_ref;
 
-    /* --- Trạng thái biến đổi tọa độ --- */
+    /* --- Setpoint điện áp đầu ra --- */
     FOC_Clarke_t V_ab;
     FOC_Park_t   V_dq;
 
@@ -132,6 +132,7 @@ void FOC_Init(FOC_Handle_t *hfoc,
               uint32_t ch_a, uint32_t ch_b, uint32_t ch_c,
               float pwm_period,
               uint8_t pole_pairs,
+              float voltage_supply,
               float voltage_lim, float current_lim,
               float Ts, float Ts_current);
 

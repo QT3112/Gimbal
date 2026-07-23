@@ -42,8 +42,9 @@
 AS5048A_Handle_t pitch_enc;
 FOC_Handle_t foc_pitch;
 
-/* Biến lưu góc mục tiêu (rad) */
+/* Biến lưu góc và vận tốc mục tiêu (rad & rad/s) */
 volatile float target_pitch_angle = 0.0f;
+volatile float target_velocity_rad_s = 0.0f;
 float test_angle_elec = 0.0f;
 
 float pitch_offset_a = 0.0f;
@@ -66,9 +67,7 @@ volatile uint32_t cal_count = 0;
 /* Cấu hình phần cứng mạch dòng */
 #define GAIN_DRV 10.0f
 #define SHUNT_RES 0.005f
-#define VOLTAGE_LIMIT                                                                        \
-  0.6f /* Giới hạn 2.5V cho motor Gimbal không tải để quay êm, không bị giật \
- nọt */
+#define VOLTAGE_LIMIT 1.5f /* Nâng giới hạn điện áp 1.5V để Vq không bị bão hòa va đập (clamp) gây rung motor */
 #define PWM_PERIOD 4249.0f
 #define MOTOR_POLE_PAIRS 14
 
@@ -134,36 +133,61 @@ int main(void) {
   HAL_Delay(100); // Chờ lấy mẫu vài frame góc ban đầu từ AS5048A
 
   FOC_Init(&foc_pitch, &htim1, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
-           PWM_PERIOD, MOTOR_POLE_PAIRS, VOLTAGE_LIMIT, 1.0f, 0.0005f,
-           0.00005f);
+           PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, /* voltage_supply: Bus DC 12V */
+           VOLTAGE_LIMIT, 1.0f, 0.0005f, 0.00005f);
 
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1); /* PA8 -> Phase A */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2); /* PA9 -> Phase B */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3); /* PA10 -> Phase C */
 
-  /* Position PID: Kp = 1.0f, giới hạn tốc độ mục tiêu [-3.0, 3.0] rad/s */
+  /* 2. Cấu hình Tham số PID & LPF Tối ưu (Tránh rung lắc & Chuẩn tốc độ) */
+  /* Position PID */
   FOC_SetPID_POS(&foc_pitch, 2.0f, 0.001f, 0.0f, -3.0f, 3.0f);
-  /* Velocity PID: Kp_vel = 0.05f, Ki_vel = 0.001f cho động cơ Gimbal */
-  FOC_SetPID_VEL(&foc_pitch, 0.1f, 0.01f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
-  /* LPF Vel: alpha = 0.8f */
-  FOC_SetLPF_Vel(&foc_pitch, 0.8f);
+  /* Velocity PID: Kp_vel = 0.15f, Ki_vel = 0.5f cho đáp ứng mượt */
+  FOC_SetPID_VEL(&foc_pitch, 0.15f, 0.5f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  /* LPF Vel: alpha = 0.93f để lọc sạch gai nhiễu vi phân encoder */
+  FOC_SetLPF_Vel(&foc_pitch, 0.93f);
 
+  /* 3. Bật FOC và thực hiện Alignment D-axis để đồng bộ góc encoder */
   foc_pitch.enabled = 1;
+  FOC_AlignD(&foc_pitch, 0.5f); /* Áp 0.5V vào trục D để giữ rotor */
+  HAL_Delay(1000); /* Chờ 1 giây cho rotor định vị ổn định */
+
+  /* Lưu offset góc điện tương ứng với vị trí cơ hiện tại của encoder */
+  FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
+
+  /* 4. Kích hoạt Vòng điều khiển Vận tốc kín (Closed-Loop Velocity) */
+  foc_pitch.velocity_loop_enabled = 1;
   foc_pitch.position_loop_enabled = 0;
-  foc_pitch.velocity_loop_enabled = 0;
   foc_pitch.current_loop_enabled = 0;
 
   HAL_TIM_Base_Start_IT(&htim7);
 
+  uint32_t last_step_time = HAL_GetTick();
+  uint8_t step_state = 0;
+
   while (1) {
-    printf("Enc: %.2f deg (%.3f rad) | Vq: %.2fV | TestAngle: %.2f rad\r\n",
-           pitch_enc.angle_deg, pitch_enc.angle_rad, foc_pitch.Vq_ref,
-           test_angle_elec);
+    /* Kịch bản test step response vận tốc tự động mỗi 3 giây */
+    uint32_t now = HAL_GetTick();
+    if (now - last_step_time >= 3000) {
+      last_step_time = now;
+      step_state = (step_state + 1) % 3;
+      if (step_state == 0) {
+        target_velocity_rad_s = 3.0f; /* Quay thuận 3.0 rad/s (~28.6 RPM) */
+      } else if (step_state == 1) {
+        target_velocity_rad_s = -3.0f; /* Quay ngược -3.0 rad/s */
+      } else {
+        target_velocity_rad_s = 0.0f; /* Dừng 0 rad/s */
+      }
+    }
+
+    /* Print Telemetry (10Hz) để giám sát đáp ứng tốc độ */
+    printf("TargetVel: %.2f | VelFilt: %.2f | VelRaw: %.2f | Vq: %.2fV | Enc: "
+           "%.2f deg\r\n",
+           target_velocity_rad_s, foc_pitch.velocity_mech,
+           foc_pitch.velocity_mech_raw, foc_pitch.Vq_ref, pitch_enc.angle_deg);
     HAL_Delay(100); // 10Hz print rate
   }
-
-  /* Sau khi thoát vòng lặp test 45 độ, tiếp tục vào vòng lặp vô hạn duy trì vị
-   * trí */
 }
 
 /**
@@ -275,8 +299,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
                                   (uint8_t *)&enc_rx_dummy, 1);
     }
   } else if (htim->Instance == TIM7) {
-    /* Chạy Open-Loop ở tốc độ 10.0 rad/s (điện) và điện áp Vq = 0.6V */
-    FOC_RunOpenLoop(&foc_pitch, 30.0f, 0.6f);
+    /* Chạy Vòng kín Vận tốc (Velocity Control Loop) */
+    FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, target_velocity_rad_s);
   }
 }
 

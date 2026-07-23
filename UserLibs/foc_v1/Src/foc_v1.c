@@ -77,8 +77,12 @@ void FOC_SVPWM(FOC_Handle_t *hfoc, float Vd, float Vq, float theta_e)
     ub_c -= v_mid;
     uc_c -= v_mid;
 
-    /* 5. Quy đổi điện áp pha về Duty Cycle [0.0, 1.0] */
-    float inv_vmax = 1.0f / hfoc->voltage_limit;
+    /* 5. Quy đổi điện áp pha về Duty Cycle [0.0, 1.0]
+     * Chuẩn: ánh xạ [-Vbus/2, +Vbus/2] → [0, 1]
+     * → chia cho voltage_supply (bus DC thực tế), không phải voltage_limit */
+    float half_vbus = hfoc->voltage_supply * 0.5f;
+    if (half_vbus < 1e-3f) half_vbus = 1e-3f;  /* Guard: tránh chia cho 0 */
+    float inv_vmax = 1.0f / half_vbus;
     float ua = 0.5f + ua_c * inv_vmax;
     float ub = 0.5f + ub_c * inv_vmax;
     float uc = 0.5f + uc_c * inv_vmax;
@@ -86,10 +90,6 @@ void FOC_SVPWM(FOC_Handle_t *hfoc, float Vd, float Vq, float theta_e)
     _apply_pwm(hfoc, ua, ub, uc);
 }
 
-static inline void _vdq_to_pwm(FOC_Handle_t *hfoc, float Vd, float Vq, float theta_e)
-{
-    FOC_SVPWM(hfoc, Vd, Vq, theta_e);
-}
 
 
 FOC_Clarke_t FOC_Clarke(float ia, float ib, float ic)
@@ -135,7 +135,7 @@ void FOC_InvClarke(FOC_Clarke_t ab, float *ua, float *ub, float *uc)
 void FOC_Update(FOC_Handle_t *hfoc)
 {
     if (!hfoc->enabled) return;
-    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+    FOC_SVPWM(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }
 
 
@@ -211,7 +211,7 @@ void FOC_AlignD(FOC_Handle_t *hfoc, float Vd)
     hfoc->Vq_ref    = 0.0f;
     hfoc->angle_elec = 0.0f;
 
-    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+    FOC_SVPWM(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }
 
 
@@ -277,6 +277,7 @@ void FOC_Init(FOC_Handle_t *hfoc,
               uint32_t ch_a, uint32_t ch_b, uint32_t ch_c,
               float pwm_period,
               uint8_t pole_pairs,
+              float voltage_supply,
               float voltage_lim, float current_lim,
               float Ts, float Ts_current)
 {
@@ -288,7 +289,8 @@ void FOC_Init(FOC_Handle_t *hfoc,
     hfoc->ch_c          = ch_c;
     hfoc->pwm_period    = pwm_period;
     hfoc->pole_pairs    = pole_pairs;
-    hfoc->voltage_limit = voltage_lim;
+    hfoc->voltage_supply = (voltage_supply > 0.0f) ? voltage_supply : 12.0f; /* BUG #3 FIX */
+    hfoc->voltage_limit  = voltage_lim;
     hfoc->Ts            = Ts;
     hfoc->enabled       = 0;
     hfoc->position_loop_enabled = 0;
@@ -397,7 +399,7 @@ void FOC_CurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib)
     hfoc->pid_q.out_max =  v_q_max;
     hfoc->Vq_ref = PID_Update(&hfoc->pid_q, err_q, hfoc->Ts_current);
 
-    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+    FOC_SVPWM(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }
 
 
@@ -405,7 +407,8 @@ void FOC_CurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib)
 void FOC_VelocityLoop(FOC_Handle_t *hfoc, float angle_mech_rad,
                      float target_vel_rad_s)
 {
-    if (!hfoc->enabled) return;
+    /* BUG #5 FIX: Kiểm tra cả velocity_loop_enabled, không chỉ enabled */
+    if (!hfoc->enabled || !hfoc->velocity_loop_enabled) return;
 
     /* --- Bước 1: Tính tốc độ cơ học thô (vi phân góc) --- */
     float d_angle = angle_mech_rad - hfoc->prev_angle_mech;
@@ -437,7 +440,7 @@ void FOC_VelocityLoop(FOC_Handle_t *hfoc, float angle_mech_rad,
     } else {
         hfoc->Vq_ref = pid_out;  /* đã clamp trong PID */
         hfoc->Vd_ref = 0.0f;
-        _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+        FOC_SVPWM(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
     }
 }
 
@@ -474,5 +477,5 @@ void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq)
     hfoc->Vq_ref = _clamp(Vq, -hfoc->voltage_limit, hfoc->voltage_limit);
     hfoc->Vd_ref = 0.0f;
 
-    _vdq_to_pwm(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+    FOC_SVPWM(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }
