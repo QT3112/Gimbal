@@ -171,13 +171,15 @@ void FOC_Start(FOC_Handle_t *hfoc, float current_angle)
     hfoc->enabled = 1;
     hfoc->position_loop_enabled = 1;
     hfoc->velocity_loop_enabled = 1;
-    hfoc->current_loop_enabled  = 1;
+    hfoc->current_loop_enabled  = 0;
 
-    hfoc->lpf_vel.output   = 0.0f;
-    hfoc->velocity_mech    = 0.0f;
-    hfoc->prev_angle_mech  = current_angle;  /* Fix velocity spike */
-    hfoc->Iq_ref           = 0.0f;
-    hfoc->Id_ref           = 0.0f;
+    hfoc->lpf_vel.output      = 0.0f;
+    hfoc->velocity_mech       = 0.0f;
+    hfoc->velocity_mech_raw   = 0.0f;
+    hfoc->prev_velocity_mech  = 0.0f;
+    hfoc->prev_angle_mech     = current_angle;  /* Fix velocity spike */
+    hfoc->Iq_ref              = 0.0f;
+    hfoc->Id_ref              = 0.0f;
 }
 
 
@@ -197,6 +199,12 @@ void FOC_SetLPF_Vel(FOC_Handle_t *hfoc, float alpha)
 void FOC_AlignD(FOC_Handle_t *hfoc, float Vd)
 {
     if (!hfoc->enabled) return;
+
+    /* Fix LỖI 3: Tạm tắt vòng điều khiển vị trí/tốc độ để FOC_PositionLoop
+     * (chạy trong TIM7) không override điện áp Align này trong quá trình calibration */
+    hfoc->position_loop_enabled = 0;
+    hfoc->velocity_loop_enabled = 0;
+    hfoc->current_loop_enabled  = 0;
 
     /* Áp điện áp vào trục D tại góc điện = 0 để kéo rotor về vị trí chuẩn */
     hfoc->Vd_ref    = _clamp(Vd, -hfoc->voltage_limit, hfoc->voltage_limit);
@@ -227,7 +235,8 @@ void FOC_SetAngle(FOC_Handle_t *hfoc, float angle_mech_rad)
 
 void FOC_SetSensorDirection(FOC_Handle_t *hfoc, int8_t direction)
 {
-    hfoc->sensor_direction = (direction >= 0) ? 1 : -1;
+    /* Fix LỖI 4: direction == 0 là không hợp lệ, chỉ nhận > 0 là thuận, còn lại là nghịch */
+    hfoc->sensor_direction = (direction > 0) ? 1 : -1;
 }
 
 void FOC_SetVoltage(FOC_Handle_t *hfoc, float Vd, float Vq)
@@ -408,6 +417,10 @@ void FOC_VelocityLoop(FOC_Handle_t *hfoc, float angle_mech_rad,
     float vel_raw = d_angle / hfoc->Ts;  /* [rad/s] cơ học */
     hfoc->prev_angle_mech = angle_mech_rad;
 
+    /* Lưu trữ vận tốc cũ và vận tốc thô (raw) để debug / so sánh */
+    hfoc->prev_velocity_mech = hfoc->velocity_mech;
+    hfoc->velocity_mech_raw  = vel_raw;
+
     /* --- Bước 2: Lọc LPF --- */
     hfoc->velocity_mech = FOC_LPF_Update(&hfoc->lpf_vel, vel_raw);
 
@@ -432,11 +445,12 @@ void FOC_VelocityLoop(FOC_Handle_t *hfoc, float angle_mech_rad,
 
 void FOC_PositionLoop(FOC_Handle_t *hfoc, float angle_mech_rad, float target_angle_rad)
 {
-    if (!hfoc->enabled) return;
+    /* Fix LỖI 5: Kiểm tra cả enabled lẫn position_loop_enabled flag */
+    if (!hfoc->enabled || !hfoc->position_loop_enabled) return;
 
     /* Tính sai số vị trí với wrap-around (chọn đường ngắn nhất) */
     float pos_error = target_angle_rad - angle_mech_rad;
-    
+
     if (pos_error >  FOC_PI) pos_error -= FOC_TWO_PI;
     if (pos_error < -FOC_PI) pos_error += FOC_TWO_PI;
 
@@ -454,7 +468,7 @@ void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq)
 {
     if (!hfoc->enabled) return;
 
-    hfoc->angle_elec += velocity_elec_rad_s * hfoc->Ts_current;
+    hfoc->angle_elec += velocity_elec_rad_s * hfoc->Ts;
     hfoc->angle_elec  = _normalize_angle(hfoc->angle_elec);
 
     hfoc->Vq_ref = _clamp(Vq, -hfoc->voltage_limit, hfoc->voltage_limit);

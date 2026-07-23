@@ -58,7 +58,9 @@ typedef struct {
     
     /* --- Ước lượng tốc độ từ encoder --- */
     float prev_angle_mech;   /*!< Góc cơ lần trước [rad] — dùng tính vi phân */
-    float velocity_mech;     /*!< Tốc độ cơ học đã lọc LPF [rad/s] */
+    float velocity_mech_raw; /*!< Tốc độ cơ học thô (chưa qua bộ lọc) [rad/s] */
+    float prev_velocity_mech;/*!< Tốc độ cơ học vòng lặp trước [rad/s] */
+    float velocity_mech;     /*!< Tốc độ cơ học hiện tại đã lọc LPF [rad/s] */
     FOC_LPF_t lpf_vel;       /*!< Bộ lọc LPF cho tín hiệu tốc độ */
 
     /* Setpoint dòng điện (đầu ra của Velocity PID) */
