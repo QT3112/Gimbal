@@ -146,14 +146,15 @@ int main(void) {
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2); /* PA9 -> Phase B */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3); /* PA10 -> Phase C */
 
-  /* 2. Cấu hình Tham số PID & LPF Tối ưu */
-  /* Position PID: Kp = 4.0f, Ki = 0.05f, giới hạn tốc độ mục tiêu [-3.0, 3.0]
+  /* 2. Cấu hình Tham số PID & LPF Tối ưu (Siêu mượt & Triệt tiêu sai số góc) */
+  /* Position PID: Kp = 6.0f, Ki = 0.4f để triệt tiêu sai số góc ma sát tĩnh 2.5
+   * deg */
+  FOC_SetPID_POS(&foc_pitch, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
+  /* Velocity PID: Kp_vel = 0.12f, Ki_vel = 0.4f cho đáp ứng siêu mượt */
+  FOC_SetPID_VEL(&foc_pitch, 0.12f, 0.4f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  /* LPF Vel: alpha = 0.96f triệt tiêu hoàn toàn nhiễu bước nhảy lượng hóa 0.77
    * rad/s */
-  FOC_SetPID_POS(&foc_pitch, 4.0f, 0.05f, 0.0f, -3.0f, 3.0f);
-  /* Velocity PID: Kp_vel = 0.15f, Ki_vel = 0.5f cho đáp ứng mượt */
-  FOC_SetPID_VEL(&foc_pitch, 0.15f, 0.5f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
-  /* LPF Vel: alpha = 0.93f để lọc sạch gai nhiễu vi phân encoder */
-  FOC_SetLPF_Vel(&foc_pitch, 0.93f);
+  FOC_SetLPF_Vel(&foc_pitch, 0.96f);
 
   /* 3. Bật FOC và thực hiện Alignment D-axis để đồng bộ góc encoder */
   foc_pitch.enabled = 1;
@@ -223,8 +224,11 @@ int main(void) {
     }
 
     float target_pos_deg = target_pitch_angle * (180.0f / 3.14159265f);
-    float err_pos_deg =
-        (target_pitch_angle - pitch_enc.angle_rad) * (180.0f / 3.14159265f);
+    float err_pos_deg = target_pos_deg - pitch_enc.angle_deg;
+    while (err_pos_deg > 180.0f)
+      err_pos_deg -= 360.0f;
+    while (err_pos_deg < -180.0f)
+      err_pos_deg += 360.0f;
 
     /* Print Telemetry (10Hz) để giám sát đáp ứng vị trí */
     printf("TargetPos: %.1f deg | Enc: %.1f deg | Err: %.1f deg | Vq: %.2fV | "
