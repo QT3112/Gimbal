@@ -59,6 +59,12 @@ volatile uint32_t log_raw_ia = 0;
 volatile uint32_t log_raw_ib = 0;
 volatile uint16_t log_enc_raw = 0; /* Debug: raw SPI data từ AS5048A */
 
+/* Biến runtime điều khiển từ GUI (volatile vì được ghi từ ISR CDC) */
+volatile uint8_t g_mode = TEST_MODE; /* Chế độ hiện tại: 1=VEL, 2=POS */
+volatile uint8_t g_foc_stop_req = 0;  /* Flag dừng khẩn cấp từ GUI */
+volatile uint8_t g_foc_start_req = 0; /* Flag bật lại FOC từ GUI */
+volatile uint8_t g_align_req = 0;     /* Flag re-alignment từ GUI */
+
 /* ===========================================================
  * Biến hiệu chỉnh offset zero-current ADC (chạy trong ISR)
  * Lấy mẫu khi motor đang dừng (Duty=50%, không có dòng).
@@ -87,6 +93,130 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/**
+ * @brief  ParseCommand — Xử lý lệnh '#CMD,val1,val2,...' nhận từ GUI qua USB
+ * CDC
+ *
+ * Được gọi từ CDC_Receive_FS() trong USB ISR context.
+ * Cần nhanh, không block. Ghi giá trị trực tiếp hoặc set volatile flag.
+ *
+ * Lệnh hỗ trợ:
+ *   #MODE,VEL|POS        — Đổi chế độ điều khiển
+ *   #TPOS,<deg>          — Đặt góc mục tiêu (chế độ Position)
+ *   #TVEL,<rad_s>        — Đặt vận tốc mục tiêu (chế độ Velocity)
+ *   #PID_POS,Kp,Ki,Kd   — Cập nhật PID vòng vị trí
+ *   #PID_VEL,Kp,Ki,Kd   — Cập nhật PID vòng vận tốc
+ *   #LPF,alpha           — Cập nhật LPF vận tốc
+ *   #VLIM,volts          — Cập nhật giới hạn điện áp Vq
+ *   #STOP                — Dừng động cơ (disable FOC)
+ *   #START               — Bật lại FOC
+ *   #ALIGN               — Yêu cầu re-alignment trục D
+ */
+void ParseCommand(const char *line) {
+  /* Sao chép sang buffer local để dùng strtok an toàn */
+  static char buf[128];
+  strncpy(buf, line, sizeof(buf) - 1);
+  buf[sizeof(buf) - 1] = '\0';
+
+  /* Tách CMD (trước dấu ',') */
+  char *cmd = strtok(buf, ",");
+  if (!cmd)
+    return;
+
+  /* -------------------------------------------------------- */
+  if (strcmp(cmd, "#MODE") == 0) {
+    char *val = strtok(NULL, ",");
+    if (!val)
+      return;
+    if (strncmp(val, "VEL", 3) == 0) {
+      g_mode = TEST_MODE_VELOCITY;
+      foc_pitch.velocity_loop_enabled = 1;
+      foc_pitch.position_loop_enabled = 0;
+    } else if (strncmp(val, "POS", 3) == 0) {
+      g_mode = TEST_MODE_POSITION;
+      foc_pitch.velocity_loop_enabled = 1;
+      foc_pitch.position_loop_enabled = 1;
+      target_pitch_angle = pitch_enc.angle_rad; /* giữ vị trí hiện tại */
+    }
+
+    /* -------------------------------------------------------- */
+  } else if (strcmp(cmd, "#TPOS") == 0) {
+    char *val = strtok(NULL, ",");
+    if (!val)
+      return;
+    float deg = strtof(val, NULL);
+    target_pitch_angle = deg * (3.14159265f / 180.0f);
+
+    /* -------------------------------------------------------- */
+  } else if (strcmp(cmd, "#TVEL") == 0) {
+    char *val = strtok(NULL, ",");
+    if (!val)
+      return;
+    target_velocity_rad_s = strtof(val, NULL);
+
+    /* -------------------------------------------------------- */
+  } else if (strcmp(cmd, "#PID_POS") == 0) {
+    char *s_kp = strtok(NULL, ",");
+    char *s_ki = strtok(NULL, ",");
+    char *s_kd = strtok(NULL, ",");
+    if (!s_kp || !s_ki || !s_kd)
+      return;
+    float kp = strtof(s_kp, NULL);
+    float ki = strtof(s_ki, NULL);
+    float kd = strtof(s_kd, NULL);
+    FOC_SetPID_POS(&foc_pitch, kp, ki, kd, foc_pitch.pid_pos.out_min,
+                   foc_pitch.pid_pos.out_max);
+
+    /* -------------------------------------------------------- */
+  } else if (strcmp(cmd, "#PID_VEL") == 0) {
+    char *s_kp = strtok(NULL, ",");
+    char *s_ki = strtok(NULL, ",");
+    char *s_kd = strtok(NULL, ",");
+    if (!s_kp || !s_ki || !s_kd)
+      return;
+    float kp = strtof(s_kp, NULL);
+    float ki = strtof(s_ki, NULL);
+    float kd = strtof(s_kd, NULL);
+    FOC_SetPID_VEL(&foc_pitch, kp, ki, kd, foc_pitch.pid_vel.out_min,
+                   foc_pitch.pid_vel.out_max);
+
+    /* -------------------------------------------------------- */
+  } else if (strcmp(cmd, "#LPF") == 0) {
+    char *val = strtok(NULL, ",");
+    if (!val)
+      return;
+    float alpha = strtof(val, NULL);
+    if (alpha > 0.0f && alpha < 1.0f) {
+      FOC_SetLPF_Vel(&foc_pitch, alpha);
+    }
+
+    /* -------------------------------------------------------- */
+  } else if (strcmp(cmd, "#VLIM") == 0) {
+    char *val = strtok(NULL, ",");
+    if (!val)
+      return;
+    float vlim = strtof(val, NULL);
+    if (vlim > 0.0f && vlim <= 12.0f) {
+      foc_pitch.voltage_limit = vlim;
+      /* Cập nhật lại output clamp của Velocity PID */
+      FOC_SetPID_VEL(&foc_pitch, foc_pitch.pid_vel.Kp, foc_pitch.pid_vel.Ki,
+                     foc_pitch.pid_vel.Kd, -vlim, vlim);
+    }
+
+    /* -------------------------------------------------------- */
+  } else if (strcmp(cmd, "#STOP") == 0) {
+    g_foc_stop_req = 1;
+
+    /* -------------------------------------------------------- */
+  } else if (strcmp(cmd, "#START") == 0) {
+    g_foc_start_req = 1;
+
+    /* -------------------------------------------------------- */
+  } else if (strcmp(cmd, "#ALIGN") == 0) {
+    g_align_req = 1;
+  }
+}
 
 /* USER CODE END 0 */
 
@@ -180,64 +310,54 @@ int main(void) {
 
   HAL_TIM_Base_Start_IT(&htim7);
 
-  uint32_t last_step_time = HAL_GetTick();
-  uint8_t step_state = 0;
+  /* Khởi tạo giá trị mặc định: GUI sẽ điều khiển từ đây */
+  uint32_t last_print_time = HAL_GetTick();
 
   while (1) {
     uint32_t now = HAL_GetTick();
 
-#if (TEST_MODE == TEST_MODE_VELOCITY)
-    /* Kịch bản test step response vận tốc tự động mỗi 3 giây */
-    if (now - last_step_time >= 3000) {
-      last_step_time = now;
-      step_state = (step_state + 1) % 3;
-      if (step_state == 0) {
-        target_velocity_rad_s = 3.0f; /* Quay thuận 3.0 rad/s (~28.6 RPM) */
-      } else if (step_state == 1) {
-        target_velocity_rad_s = -3.0f; /* Quay ngược -3.0 rad/s */
+    /* --- Xử lý các yêu cầu từ GUI (volatile flags từ ParseCommand) --- */
+    if (g_foc_stop_req) {
+      g_foc_stop_req = 0;
+      foc_pitch.enabled = 0;
+      FOC_Stop(&foc_pitch);
+    }
+    if (g_foc_start_req) {
+      g_foc_start_req = 0;
+      foc_pitch.enabled = 1;
+    }
+    if (g_align_req) {
+      g_align_req = 0;
+      foc_pitch.enabled = 0;
+      FOC_AlignD(&foc_pitch, 0.5f);
+      HAL_Delay(1000);
+      FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
+      target_pitch_angle = pitch_enc.angle_rad;
+      foc_pitch.enabled = 1;
+    }
+
+    /* --- Gửi Telemetry lên GUI qua USB CDC (10Hz) --- */
+    if (now - last_print_time >= 100) {
+      last_print_time = now;
+
+      if (g_mode == TEST_MODE_VELOCITY) {
+        /* Format: $VEL,target_vel,vel_filt,vel_raw,vq,enc_deg */
+        printf("$VEL,%.2f,%.2f,%.2f,%.2f,%.2f\r\n", target_velocity_rad_s,
+               foc_pitch.velocity_mech, foc_pitch.velocity_mech_raw,
+               foc_pitch.Vq_ref, pitch_enc.angle_deg);
       } else {
-        target_velocity_rad_s = 0.0f; /* Dừng 0 rad/s */
+        /* Format: $POS,target_pos,enc_deg,err_deg,vq,vel_filt */
+        float target_pos_deg = target_pitch_angle * (180.0f / 3.14159265f);
+        float err_pos_deg = target_pos_deg - pitch_enc.angle_deg;
+        while (err_pos_deg > 180.0f)
+          err_pos_deg -= 360.0f;
+        while (err_pos_deg < -180.0f)
+          err_pos_deg += 360.0f;
+        printf("$POS,%.1f,%.1f,%.1f,%.2f,%.2f\r\n", target_pos_deg,
+               pitch_enc.angle_deg, err_pos_deg, foc_pitch.Vq_ref,
+               foc_pitch.velocity_mech);
       }
     }
-
-    /* Print Telemetry (10Hz) để giám sát đáp ứng tốc độ */
-    printf("TargetVel: %.2f | VelFilt: %.2f | VelRaw: %.2f | Vq: %.2fV | Enc: "
-           "%.2f deg\r\n",
-           target_velocity_rad_s, foc_pitch.velocity_mech,
-           foc_pitch.velocity_mech_raw, foc_pitch.Vq_ref, pitch_enc.angle_deg);
-
-#elif (TEST_MODE == TEST_MODE_POSITION)
-    /* Kịch bản test step response vị trí tự động mỗi 4 giây: 0 rad -> +90 deg
-     * -> +180 deg -> -90 deg */
-    if (now - last_step_time >= 4000) {
-      last_step_time = now;
-      step_state = (step_state + 1) % 4;
-      if (step_state == 0) {
-        target_pitch_angle = 0.0f; /* 0 deg */
-      } else if (step_state == 1) {
-        target_pitch_angle = 1.5707963f; /* +90 deg (+pi/2 rad) */
-      } else if (step_state == 2) {
-        target_pitch_angle = 3.14159265f; /* +180 deg (+pi rad) */
-      } else if (step_state == 3) {
-        target_pitch_angle = -1.5707963f; /* -90 deg (-pi/2 rad) */
-      }
-    }
-
-    float target_pos_deg = target_pitch_angle * (180.0f / 3.14159265f);
-    float err_pos_deg = target_pos_deg - pitch_enc.angle_deg;
-    while (err_pos_deg > 180.0f)
-      err_pos_deg -= 360.0f;
-    while (err_pos_deg < -180.0f)
-      err_pos_deg += 360.0f;
-
-    /* Print Telemetry (10Hz) để giám sát đáp ứng vị trí */
-    printf("TargetPos: %.1f deg | Enc: %.1f deg | Err: %.1f deg | Vq: %.2fV | "
-           "VelFilt: %.2f\r\n",
-           target_pos_deg, pitch_enc.angle_deg, err_pos_deg, foc_pitch.Vq_ref,
-           foc_pitch.velocity_mech);
-#endif
-
-    HAL_Delay(100); // 10Hz print rate
   }
 }
 
@@ -350,12 +470,12 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
                                   (uint8_t *)&enc_rx_dummy, 1);
     }
   } else if (htim->Instance == TIM7) {
-    /* Chạy Vòng lặp kín tương ứng với TEST_MODE */
-#if (TEST_MODE == TEST_MODE_VELOCITY)
-    FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, target_velocity_rad_s);
-#elif (TEST_MODE == TEST_MODE_POSITION)
-    FOC_PositionLoop(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
-#endif
+    /* Chạy Vòng lặp kín theo chế độ hiện tại (có thể đổi runtime từ GUI) */
+    if (g_mode == TEST_MODE_VELOCITY) {
+      FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, target_velocity_rad_s);
+    } else {
+      FOC_PositionLoop(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
+    }
   }
 }
 

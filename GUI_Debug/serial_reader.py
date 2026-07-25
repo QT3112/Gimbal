@@ -1,12 +1,11 @@
 """
-serial_reader.py — Thread đọc cổng Serial USB CDC và parse CSV tagged
+serial_reader.py — Thread đọc/ghi USB CDC bi-directional
 
-Chạy trong QThread riêng để không block UI.
-Phát signal PyQt mỗi khi có frame dữ liệu mới ($IMU + $ATT + $PID + $FOC).
+STM32 -> PC: dòng $VEL,... hoặc $POS,...
+PC -> STM32: lệnh #CMD,... qua send()
 """
 
 import time
-import threading
 from PyQt6.QtCore import QThread, pyqtSignal
 
 try:
@@ -18,7 +17,6 @@ except ImportError:
 
 
 def list_serial_ports() -> list[str]:
-    """Trả về danh sách tên cổng serial khả dụng."""
     if not SERIAL_AVAILABLE:
         return []
     return [p.device for p in serial.tools.list_ports.comports()]
@@ -26,26 +24,19 @@ def list_serial_ports() -> list[str]:
 
 class SerialReaderThread(QThread):
     """
-    QThread đọc serial và push dữ liệu vào GimbalDataStore.
-
-    Signals:
-        new_frame  — phát mỗi khi nhận đủ 1 bộ 4 dòng ($IMU,$ATT,$PID,$FOC)
-        error_msg  — phát khi có lỗi kết nối
-        connected  — phát khi kết nối thành công
-        disconnected — phát khi mất kết nối
+    QThread đọc serial line-by-line và push vào FOCDataStore.
+    Cũng cung cấp send() để gửi lệnh #CMD xuống MCU.
     """
 
     new_frame    = pyqtSignal()
     error_msg    = pyqtSignal(str)
-    connected    = pyqtSignal(str)       # arg: port name
+    connected    = pyqtSignal(str)
     disconnected = pyqtSignal()
-    sys_msg      = pyqtSignal(str)       # arg: system status message
-
-    EXPECTED_TAGS = {'$IMU', '$ATT', '$PID', '$FOC'}
+    raw_line     = pyqtSignal(str)    # mỗi dòng raw nhận được -> Console
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
-        self.store = store
+        self.store     = store
         self._port     = ''
         self._baudrate = 115200
         self._running  = False
@@ -59,9 +50,7 @@ class SerialReaderThread(QThread):
         self._running = False
         self.wait(2000)
 
-    # ------------------------------------------------------------------
     def run(self):
-        """Vòng lặp chính của thread."""
         if not SERIAL_AVAILABLE:
             self.error_msg.emit("pyserial chưa được cài đặt!")
             return
@@ -77,9 +66,9 @@ class SerialReaderThread(QThread):
             return
 
         self._running = True
+        self.store.reset_time()
         self.connected.emit(self._port)
 
-        received_tags = set()
         try:
             while self._running:
                 try:
@@ -91,24 +80,15 @@ class SerialReaderThread(QThread):
                     self.error_msg.emit(f"Lỗi đọc serial: {e}")
                     break
 
-                if not line.startswith('$'):
-                    continue
-
-                tag, _, body = line.partition(',')
-                if tag == '$SYS':
-                    self.sys_msg.emit(body)
-                    continue
-
-                if tag not in self.EXPECTED_TAGS:
+                if not line:
                     continue
 
                 ts = time.monotonic()
-                self.store.push_line(line, ts)
-                received_tags.add(tag)
+                self.raw_line.emit(line)
 
-                # Phát signal khi nhận đủ 4 loại dòng trong 1 batch
-                if received_tags >= self.EXPECTED_TAGS:
-                    received_tags.clear()
+                # Chỉ parse $ telemetry vào store
+                if line.startswith('$'):
+                    self.store.push_line(line, ts)
                     self.new_frame.emit()
 
         finally:
@@ -117,22 +97,24 @@ class SerialReaderThread(QThread):
             self.disconnected.emit()
 
     def send(self, text: str):
-        """Gửi lệnh ngược lại MCU (dùng cho Live Tuning sau này)."""
+        """Gửi lệnh #CMD xuống MCU."""
         if self._ser and self._ser.is_open:
-            self._ser.write(text.encode())
+            if not text.endswith('\n'):
+                text += '\n'
+            try:
+                self._ser.write(text.encode('utf-8'))
+            except (serial.SerialException, OSError):
+                pass
 
 
 class DemoThread(QThread):
-    """
-    Thread sinh dữ liệu giả lập để test GUI không cần phần cứng.
-    API giống SerialReaderThread.
-    """
+    """Thread sinh dữ liệu giả lập để test GUI không cần phần cứng."""
 
     new_frame    = pyqtSignal()
     error_msg    = pyqtSignal(str)
     connected    = pyqtSignal(str)
     disconnected = pyqtSignal()
-    sys_msg      = pyqtSignal(str)
+    raw_line     = pyqtSignal(str)
 
     def __init__(self, store, parent=None):
         super().__init__(parent)
@@ -148,11 +130,20 @@ class DemoThread(QThread):
 
     def run(self):
         self._running = True
+        self.store.reset_time()
         self.connected.emit('DEMO')
         t = 0.0
         while self._running:
             self.store.push_demo(t)
+            # Phát raw line cho Console
+            if self.store.raw_lines:
+                _, last_line = self.store.raw_lines[-1]
+                self.raw_line.emit(last_line)
             self.new_frame.emit()
-            t += 0.02
-            self.msleep(20)   # 50Hz
+            t += 0.1
+            self.msleep(100)   # 10Hz
         self.disconnected.emit()
+
+    def send(self, text: str):
+        """Demo mode: hiển thị lệnh như echo."""
+        pass

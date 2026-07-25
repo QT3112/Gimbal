@@ -1,47 +1,39 @@
 #!/usr/bin/env python3
 """
-main.py — Entry point: Gimbal Debug Monitor
-
-Yêu cầu:
-    pip install pyqt6 pyqtgraph pyserial numpy
+main.py — Entry point: FOC Debug Monitor v2.0
 
 Chạy:
-    python main.py
-    python main.py --demo    (chạy chế độ giả lập không cần phần cứng)
+    python main.py              (kết nối phần cứng)
+    python main.py --demo       (demo mode không cần MCU)
 """
 
 import sys
 import os
 
-# Thêm thư mục gốc vào path để import các module ngang hàng
 sys.path.insert(0, os.path.dirname(__file__))
 
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PyQt6.QtGui import QFont, QFontDatabase
 
 from ui.main_window import MainWindow
 
 
 def main():
-    # Bật High-DPI scaling
     QApplication.setHighDpiScaleFactorRoundingPolicy(
-        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough
-    )
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
 
     app = QApplication(sys.argv)
-    app.setApplicationName("Gimbal Debug Monitor")
-    app.setApplicationVersion("1.0.0")
-    app.setOrganizationName("STM32G431 Gimbal Project")
+    app.setApplicationName("FOC Debug Monitor")
+    app.setApplicationVersion("2.0.0")
+    app.setOrganizationName("STM32G431 Gimbal")
 
-    # Font mặc định
-    default_font = QFont("Inter", 10)
-    app.setFont(default_font)
+    # Font
+    app.setFont(QFont("Inter", 10))
 
     window = MainWindow()
     window.show()
 
-    # Nếu truyền --demo, tự động bật Demo mode
     if '--demo' in sys.argv:
         window._toggle_demo()
 

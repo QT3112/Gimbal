@@ -1,12 +1,16 @@
 """
-main_window.py — Cửa sổ chính của Gimbal Debug Monitor
+main_window.py — Cửa sổ chính FOC Debug Monitor v2.0
 
 Layout:
-  ┌─ Toolbar: Port selector, Connect, Demo, Record ─────────────┐
-  │  Status bar: latency, frame rate, bytes received            │
-  ├─ Tab widget ─────────────────────────────────────────────────┤
-  │  [IMU Raw] [Attitude] [PID Pitch] [PID Roll] [FOC]          │
-  └──────────────────────────────────────────────────────────────┘
+  ┌── Toolbar: Port, Connect, Demo, Record ───────────────────────────┐
+  │   Status bar: connected / FPS / TX / RX                          │
+  ├── Tab: [FOC Telemetry] [Control] [PID Tuning] [Console]          │
+  │   ── separator ──                                                 │
+  │   [IMU Raw] [Attitude] [PID Pitch] [PID Roll] [FOC State]        │
+  └───────────────────────────────────────────────────────────────────┘
+
+Tab FOC (mới): Telemetry, Control, PID Tuning, Console
+Tab Legacy (cũ): IMU, Attitude, PID Pitch, PID Roll, FOC State
 """
 
 import time
@@ -14,475 +18,397 @@ import csv
 import os
 from datetime import datetime
 
+import pyqtgraph as pg
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QTabWidget, QComboBox, QPushButton, QLabel,
-    QStatusBar, QFrame, QFileDialog, QMessageBox,
-    QSizePolicy, QSpinBox
+    QFrame, QFileDialog, QMessageBox, QSpinBox, QSizePolicy
 )
 from PyQt6.QtCore import Qt, QTimer
-from PyQt6.QtGui import QFont, QIcon, QPalette, QColor
+from PyQt6.QtGui import QFont, QPalette, QColor
 
-import pyqtgraph as pg
-
-from data_store import GimbalDataStore
+from data_store import FOCDataStore
 from serial_reader import SerialReaderThread, DemoThread, list_serial_ports
-from ui.panel_imu       import IMUPanel
-from ui.panel_attitude  import AttitudePanel
-from ui.panel_pid_pitch import PIDPitchPanel
-from ui.panel_pid_roll  import PIDRollPanel
-from ui.panel_foc       import FOCPanel
+from command_sender import CommandSender
+
+# ── FOC panels
+from ui.panel_telemetry  import TelemetryPanel
+from ui.panel_control    import ControlPanel
+from ui.panel_pid_tuning import PIDTuningPanel
+from ui.panel_console    import ConsolePanel
 
 
-# Áp dụng theme tối toàn cục
-pg.setConfigOption('background', '#1A1A2E')
+# ───────────────────────── Theme ─────────────────────────────────────────────
+pg.setConfigOption('background', '#12122A')
 pg.setConfigOption('foreground', '#CCCCCC')
 
-DARK_STYLESHEET = """
+DARK_SS = """
 QMainWindow, QWidget {
-    background-color: #0F0F1E;
+    background-color: #0D0D1F;
     color: #E0E0E0;
     font-family: 'Inter', 'Segoe UI', sans-serif;
     font-size: 10pt;
 }
 QTabWidget::pane {
-    border: 1px solid #2A2A4A;
-    background: #0F0F1E;
+    border: 1px solid #1E1E3E;
+    background: #0D0D1F;
 }
 QTabBar::tab {
-    background: #1A1A2E;
-    color: #AAAAAA;
-    padding: 8px 16px;
-    border: 1px solid #2A2A4A;
+    background: #141430;
+    color: #888888;
+    padding: 7px 16px;
+    border: 1px solid #1E1E3E;
     border-bottom: none;
     border-radius: 4px 4px 0 0;
-    min-width: 100px;
+    min-width: 90px;
 }
-QTabBar::tab:selected {
-    background: #2A2A4A;
-    color: #FFFFFF;
-    border-color: #4ECDC4;
-}
-QTabBar::tab:hover {
-    background: #252540;
-    color: #DDDDDD;
-}
+QTabBar::tab:selected { background: #1E1E3E; color: #FFFFFF; border-color: #4ECDC4; }
+QTabBar::tab:hover    { background: #181840; color: #CCCCCC; }
 QPushButton {
-    background: #2A2A4A;
-    color: #E0E0E0;
-    border: 1px solid #3A3A5A;
-    border-radius: 5px;
-    padding: 5px 14px;
-    font-weight: bold;
+    background: #1E1E3E; color: #E0E0E0;
+    border: 1px solid #2E2E5E; border-radius: 5px;
+    padding: 5px 14px; font-weight: bold;
 }
-QPushButton:hover  { background: #3A3A6A; border-color: #4ECDC4; }
-QPushButton:pressed{ background: #4A4A7A; }
-QPushButton:disabled { color: #555555; border-color: #2A2A4A; }
-QPushButton#btn_connect_on {
-    background: #1B4332;
-    border-color: #4ECDC4;
-    color: #4ECDC4;
-}
-QPushButton#btn_record_on {
-    background: #5C1010;
-    border-color: #FF6B6B;
-    color: #FF6B6B;
-}
+QPushButton:hover  { background: #2A2A5A; border-color: #4ECDC4; }
+QPushButton:pressed{ background: #3A3A6A; }
+QPushButton:disabled { color: #444466; border-color: #1E1E3E; }
+QPushButton#btn_on  { background: #0E3028; border-color: #4ECDC4; color: #4ECDC4; }
+QPushButton#btn_rec { background: #3A0808; border-color: #FF6B6B; color: #FF6B6B; }
 QComboBox {
-    background: #1A1A2E;
-    border: 1px solid #3A3A5A;
-    border-radius: 4px;
-    padding: 4px 8px;
-    color: #E0E0E0;
-    min-width: 100px;
+    background: #141430; border: 1px solid #2E2E5E; border-radius: 4px;
+    padding: 4px 8px; color: #E0E0E0; min-width: 110px;
 }
-QComboBox::drop-down { border: none; }
 QComboBox:hover { border-color: #4ECDC4; }
-QLabel#status_ok   { color: #4ECDC4; }
-QLabel#status_err  { color: #FF6B6B; }
-QLabel#status_idle { color: #888888; }
+QComboBox::drop-down { border: none; }
 QSpinBox {
-    background: #1A1A2E;
-    border: 1px solid #3A3A5A;
-    border-radius: 4px;
-    color: #E0E0E0;
-    padding: 2px 6px;
+    background: #141430; border: 1px solid #2E2E5E; border-radius: 4px;
+    color: #E0E0E0; padding: 2px 6px;
 }
+QGroupBox {
+    border: 1px solid #2A2A4A; border-radius: 6px; margin-top: 8px; padding-top: 6px;
+}
+QGroupBox::title { subcontrol-origin: margin; left: 10px; color: #4ECDC4; }
 """
 
 
+# ───────────────────────── Main Window ───────────────────────────────────────
 class MainWindow(QMainWindow):
-    """Cửa sổ chính của Gimbal Debug Monitor."""
-
-    UPDATE_INTERVAL_MS = 40   # ~25fps UI refresh
+    UPDATE_MS = 50   # 20fps
 
     def __init__(self):
         super().__init__()
-        self.store  = GimbalDataStore(size=2000)
-        self.reader = None
-        self._recording = False
+        self.store   = FOCDataStore(size=3000)
+        self.sender  = CommandSender()
+        self.reader  = None
+        self._recording  = False
         self._csv_writer = None
         self._csv_file   = None
-        self._frame_count = 0
-        self._last_fps_time = time.monotonic()
-        self._fps = 0.0
+        self._frame_cnt  = 0
+        self._last_fps_t = time.monotonic()
+        self._fps        = 0.0
+        self._tx_cnt     = 0
 
         self._build_ui()
-        self._apply_theme()
-        self._setup_timer()
+        self.setStyleSheet(DARK_SS)
+        self._timer = QTimer(self)
+        self._timer.setInterval(self.UPDATE_MS)
+        self._timer.timeout.connect(self._on_timer)
+        self._timer.start()
 
-    # ---------------------------------------------------------------
+    # ──────────────────────────────────────────────────────── build UI
     def _build_ui(self):
-        self.setWindowTitle("🎯 Gimbal Debug Monitor — STM32G431 + 2×MPU6050")
-        self.resize(1400, 900)
-        self.setMinimumSize(900, 600)
+        self.setWindowTitle("⚡  FOC Debug Monitor  —  STM32G431 Gimbal  [v2.0]")
+        self.resize(1440, 920)
+        self.setMinimumSize(1000, 700)
 
-        # Central widget
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
         root.setContentsMargins(6, 6, 6, 4)
         root.setSpacing(4)
 
-        # ---- Toolbar ----
         root.addWidget(self._build_toolbar())
+        root.addWidget(self._build_status_bar())
 
-        # ---- Status row ----
-        root.addWidget(self._build_status_row())
+        # ── FOC Tabs
+        self._foc_tabs = QTabWidget()
+        self._foc_tabs.setDocumentMode(True)
 
-        # ---- Tab widget ----
-        self.tabs = QTabWidget()
-        self.tabs.setDocumentMode(True)
+        self.panel_telem   = TelemetryPanel(self.store)
+        self.panel_ctrl    = ControlPanel(self.sender)
+        self.panel_pid     = PIDTuningPanel(self.store, self.sender)
+        self.panel_console = ConsolePanel(self.store, self.sender)
 
-        self.panel_imu   = IMUPanel(self.store)
-        self.panel_att   = AttitudePanel(self.store)
-        self.panel_pid_p = PIDPitchPanel(self.store)
-        self.panel_pid_r = PIDRollPanel(self.store)
-        self.panel_foc   = FOCPanel(self.store)
+        self._foc_tabs.addTab(self.panel_telem,   "📊  Telemetry")
+        self._foc_tabs.addTab(self.panel_ctrl,    "🎛  Control")
+        self._foc_tabs.addTab(self.panel_pid,     "🔧  PID Tuning")
+        self._foc_tabs.addTab(self.panel_console, "📋  Console")
 
-        self.tabs.addTab(self.panel_imu,   "📡  IMU Raw")
-        self.tabs.addTab(self.panel_att,   "🧭  Attitude")
-        self.tabs.addTab(self.panel_pid_p, "🎯  PID Pitch")
-        self.tabs.addTab(self.panel_pid_r, "🔄  PID Roll")
-        self.tabs.addTab(self.panel_foc,   "⚡  FOC")
-
-        root.addWidget(self.tabs)
+        root.addWidget(self._foc_tabs, 1)
 
     def _build_toolbar(self) -> QFrame:
         bar = QFrame()
-        bar.setStyleSheet("background:#12122A; border-radius:8px;")
-        bar.setFixedHeight(54)
-        layout = QHBoxLayout(bar)
-        layout.setContentsMargins(10, 6, 10, 6)
-        layout.setSpacing(10)
+        bar.setStyleSheet("background: #0A0A20; border-radius: 8px;")
+        bar.setFixedHeight(58)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 6, 12, 6)
+        lay.setSpacing(10)
 
-        # Logo / Title
-        logo = QLabel("⚙️  <b>Gimbal Debug</b>")
-        logo.setFont(QFont("Inter", 11, QFont.Weight.Bold))
-        logo.setStyleSheet("color:#4ECDC4;")
-        layout.addWidget(logo)
+        # Logo
+        logo = QLabel("⚡  <b>FOC Debug</b>")
+        logo.setFont(QFont("Inter", 12, QFont.Weight.Bold))
+        logo.setStyleSheet("color: #4ECDC4;")
+        lay.addWidget(logo)
+        lay.addSpacing(16)
 
-        layout.addSpacing(20)
-
-        # Port selector
-        port_lbl = QLabel("Port:")
-        port_lbl.setStyleSheet("color:#AAAAAA;")
+        # Port
+        lay.addWidget(_plain("Port:"))
         self.combo_port = QComboBox()
-        self.combo_port.setMinimumWidth(140)
-        self.combo_port.setToolTip("Chọn cổng serial USB CDC")
-        layout.addWidget(port_lbl)
-        layout.addWidget(self.combo_port)
+        self.combo_port.setMinimumWidth(150)
+        lay.addWidget(self.combo_port)
 
-        # Refresh port list
-        btn_refresh = QPushButton("🔄")
-        btn_refresh.setFixedWidth(36)
-        btn_refresh.setToolTip("Làm mới danh sách cổng")
-        btn_refresh.clicked.connect(self._refresh_ports)
-        layout.addWidget(btn_refresh)
+        btn_ref = QPushButton("🔄")
+        btn_ref.setFixedWidth(34)
+        btn_ref.setToolTip("Refresh port list")
+        btn_ref.clicked.connect(self._refresh_ports)
+        lay.addWidget(btn_ref)
 
-        # Baudrate
-        baud_lbl = QLabel("Baud:")
-        baud_lbl.setStyleSheet("color:#AAAAAA;")
+        # Baud
+        lay.addWidget(_plain("Baud:"))
         self.combo_baud = QComboBox()
         self.combo_baud.addItems(["115200", "230400", "460800", "921600"])
-        self.combo_baud.setCurrentText("115200")
         self.combo_baud.setFixedWidth(90)
-        layout.addWidget(baud_lbl)
-        layout.addWidget(self.combo_baud)
+        lay.addWidget(self.combo_baud)
 
-        layout.addSpacing(10)
+        lay.addSpacing(8)
 
-        # Connect button
+        # Connect
         self.btn_connect = QPushButton("🔗  Connect")
-        self.btn_connect.setFixedWidth(120)
-        self.btn_connect.setToolTip("Kết nối với STM32 qua USB CDC")
+        self.btn_connect.setFixedWidth(130)
         self.btn_connect.clicked.connect(self._toggle_connect)
-        layout.addWidget(self.btn_connect)
+        lay.addWidget(self.btn_connect)
 
-        # Demo button
+        # Demo
         self.btn_demo = QPushButton("🎮  Demo")
-        self.btn_demo.setFixedWidth(90)
-        self.btn_demo.setToolTip("Chạy với dữ liệu giả lập (không cần phần cứng)")
+        self.btn_demo.setFixedWidth(100)
         self.btn_demo.clicked.connect(self._toggle_demo)
-        layout.addWidget(self.btn_demo)
+        lay.addWidget(self.btn_demo)
 
-        layout.addStretch()
+        lay.addStretch()
 
-        # Buffer size
-        buf_lbl = QLabel("Buffer:")
-        buf_lbl.setStyleSheet("color:#AAAAAA;")
+        # Buffer
+        lay.addWidget(_plain("Buffer:"))
         self.spin_buf = QSpinBox()
         self.spin_buf.setRange(100, 5000)
-        self.spin_buf.setValue(1000)
+        self.spin_buf.setValue(2000)
         self.spin_buf.setSuffix(" pts")
         self.spin_buf.setFixedWidth(100)
-        self.spin_buf.setToolTip("Số điểm dữ liệu hiển thị (100–5000)")
-        layout.addWidget(buf_lbl)
-        layout.addWidget(self.spin_buf)
+        lay.addWidget(self.spin_buf)
 
-        layout.addSpacing(10)
+        lay.addSpacing(8)
 
-        # Record button
-        self.btn_record = QPushButton("⏺  Record")
-        self.btn_record.setFixedWidth(110)
-        self.btn_record.setToolTip("Ghi dữ liệu ra file CSV")
-        self.btn_record.clicked.connect(self._toggle_record)
-        layout.addWidget(self.btn_record)
+        # Record
+        self.btn_rec = QPushButton("⏺  Record")
+        self.btn_rec.setFixedWidth(110)
+        self.btn_rec.clicked.connect(self._toggle_record)
+        lay.addWidget(self.btn_rec)
 
         self._refresh_ports()
         return bar
 
-    def _build_status_row(self) -> QFrame:
-        row = QFrame()
-        row.setStyleSheet("background:#0A0A1A; border-radius:4px;")
-        row.setFixedHeight(28)
-        layout = QHBoxLayout(row)
-        layout.setContentsMargins(12, 2, 12, 2)
+    def _build_status_bar(self) -> QFrame:
+        bar = QFrame()
+        bar.setStyleSheet("background: #080818; border-radius: 4px;")
+        bar.setFixedHeight(26)
+        lay = QHBoxLayout(bar)
+        lay.setContentsMargins(12, 2, 12, 2)
+        lay.setSpacing(0)
 
-        self.lbl_status = QLabel("● Chưa kết nối")
-        self.lbl_status.setObjectName("status_idle")
-        self.lbl_gimbal = QLabel("Gimbal: ---")
-        self.lbl_fps    = QLabel("FPS: ---")
-        self.lbl_bytes  = QLabel("Bytes: 0")
-        self.lbl_record = QLabel("")
+        self.lbl_status = _status("● Chưa kết nối", '#666688')
+        self.lbl_fps    = _status("FPS: ---",        '#666688')
+        self.lbl_rx     = _status("RX: ---",         '#666688')
+        self.lbl_tx     = _status("TX: 0 cmd",       '#666688')
+        self.lbl_rec    = _status("",                 '#FF6B6B')
 
-        for lbl in (self.lbl_status, self.lbl_gimbal, self.lbl_fps, self.lbl_bytes, self.lbl_record):
-            lbl.setFont(QFont("Monospace", 8))
-            lbl.setStyleSheet("color:#888888;")
-            layout.addWidget(lbl)
-            if lbl != self.lbl_record:
-                sep = QLabel("│")
-                sep.setStyleSheet("color:#333344;")
-                layout.addWidget(sep)
+        for lbl in (self.lbl_status, self.lbl_fps, self.lbl_rx, self.lbl_tx):
+            lay.addWidget(lbl)
+            sep = QLabel("  │  ")
+            sep.setStyleSheet("color: #222244;")
+            sep.setFont(QFont("Monospace", 8))
+            lay.addWidget(sep)
+        lay.addWidget(self.lbl_rec)
+        lay.addStretch()
+        return bar
 
-        layout.addStretch()
-        return row
-
-    # ---------------------------------------------------------------
-    def _apply_theme(self):
-        self.setStyleSheet(DARK_STYLESHEET)
-
-    def _setup_timer(self):
-        self._timer = QTimer(self)
-        self._timer.setInterval(self.UPDATE_INTERVAL_MS)
-        self._timer.timeout.connect(self._on_timer)
-        self._timer.start()
-
-    # ---------------------------------------------------------------
+    # ──────────────────────────────────────────────────────── ports
     def _refresh_ports(self):
         ports = list_serial_ports()
-        current = self.combo_port.currentText()
+        cur = self.combo_port.currentText()
         self.combo_port.clear()
-        if ports:
-            self.combo_port.addItems(ports)
-            if current in ports:
-                self.combo_port.setCurrentText(current)
-        else:
-            self.combo_port.addItem("(không tìm thấy)")
+        self.combo_port.addItems(ports if ports else ["(none)"])
+        if cur in ports:
+            self.combo_port.setCurrentText(cur)
 
+    # ──────────────────────────────────────────────────────── connect/demo
     def _stop_reader(self):
         if self.reader:
             self.reader.stop()
+            self.sender.set_reader(None)
             self.reader = None
 
     def _toggle_connect(self):
         if self.reader and self.reader.isRunning():
             self._stop_reader()
-            self.btn_connect.setText("🔗  Connect")
-            self.btn_connect.setObjectName("")
-            self.btn_connect.setStyleSheet("")
+            self._set_btn_state(self.btn_connect, "🔗  Connect", False)
             self.btn_demo.setEnabled(True)
-            self._set_status("Đã ngắt kết nối", "idle")
+            self._set_status("Đã ngắt kết nối", '#666688')
         else:
             port = self.combo_port.currentText()
             baud = int(self.combo_baud.currentText())
             if not port or '(' in port:
-                QMessageBox.warning(self, "Lỗi", "Vui lòng chọn cổng serial hợp lệ.")
+                QMessageBox.warning(self, "Lỗi", "Chọn cổng serial hợp lệ.")
                 return
             self.reader = SerialReaderThread(self.store)
             self.reader.configure(port, baud)
-            self.reader.connected.connect(self._on_connected)
-            self.reader.disconnected.connect(self._on_disconnected)
-            self.reader.error_msg.connect(self._on_error)
-            self.reader.new_frame.connect(self._on_new_frame)
-            self.reader.sys_msg.connect(self._on_sys_msg)
+            self._wire_reader(self.reader)
             self.reader.start()
             self.btn_demo.setEnabled(False)
 
     def _toggle_demo(self):
         if self.reader and self.reader.isRunning():
             self._stop_reader()
-            self.btn_demo.setText("🎮  Demo")
-            self.btn_demo.setObjectName("")
-            self.btn_demo.setStyleSheet("")
+            self._set_btn_state(self.btn_demo, "🎮  Demo", False)
             self.btn_connect.setEnabled(True)
-            self._set_status("Demo dừng", "idle")
+            self._set_status("Demo dừng", '#666688')
         else:
             self.reader = DemoThread(self.store)
-            self.reader.connected.connect(self._on_connected)
-            self.reader.disconnected.connect(self._on_disconnected)
-            self.reader.error_msg.connect(self._on_error)
-            self.reader.new_frame.connect(self._on_new_frame)
-            self.reader.sys_msg.connect(self._on_sys_msg)
+            self._wire_reader(self.reader)
             self.reader.start()
             self.btn_connect.setEnabled(False)
-            self.btn_demo.setText("⏹  Stop Demo")
-            self.btn_demo.setObjectName("btn_connect_on")
-            self.btn_demo.setStyleSheet("""
-                QPushButton#btn_connect_on {
-                    background: #1B3A2E; border-color: #4ECDC4; color: #4ECDC4;
-                }
-            """)
+            self._set_btn_state(self.btn_demo, "⏹  Stop Demo", True)
 
+    def _wire_reader(self, reader):
+        self.sender.set_reader(reader)
+        reader.connected.connect(self._on_connected)
+        reader.disconnected.connect(self._on_disconnected)
+        reader.error_msg.connect(self._on_error)
+        reader.new_frame.connect(self._on_new_frame)
+        reader.raw_line.connect(self.panel_console.store.raw_lines.append
+                                if False else self._on_raw_line)
+
+    def _on_raw_line(self, line: str):
+        pass  # raw_line đã lưu trong store.raw_lines, Console tự refresh
+
+    # ──────────────────────────────────────────────────────── record
     def _toggle_record(self):
         if not self._recording:
             path, _ = QFileDialog.getSaveFileName(
-                self, "Lưu file CSV",
-                f"gimbal_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "CSV Files (*.csv)"
-            )
+                self, "Lưu CSV",
+                f"foc_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "CSV (*.csv)")
             if not path:
                 return
             self._csv_file   = open(path, 'w', newline='')
             self._csv_writer = csv.writer(self._csv_file)
-            # Header
             self._csv_writer.writerow([
-                'time_s',
-                'imu_f_ax','imu_f_ay','imu_f_az','imu_f_gx','imu_f_gy','imu_f_gz',
-                'imu_p_ax','imu_p_ay','imu_p_az','imu_p_gx','imu_p_gy','imu_p_gz',
-                'frame_pitch','frame_roll','frame_yaw',
-                'pay_pitch','pay_roll','pay_yaw',
-                'rel_pitch','rel_roll',
-                'p_err','t_vel_p','ff_pitch','cam_pr','vel_err_p','vq_pitch',
-                'r_err','t_vel_r','ff_roll','cam_rr','vel_err_r','vq_roll',
-                'elec_p','elec_r','off_p','off_r'
+                'time_s', 'mode',
+                'vel_target', 'vel_filt', 'vel_raw', 'vq_vel', 'enc_vel',
+                'pos_target', 'enc_pos', 'pos_err', 'vq_pos', 'vel_filt_pos'
             ])
             self._recording = True
-            self.btn_record.setText("⏹  Stop Rec")
-            self.btn_record.setObjectName("btn_record_on")
-            self.btn_record.setStyleSheet("""
-                QPushButton#btn_record_on {
-                    background: #4A0A0A; border-color: #FF6B6B; color: #FF6B6B;
-                }
-            """)
-            self.lbl_record.setText(f"⏺ REC → {os.path.basename(path)}")
-            self.lbl_record.setStyleSheet("color:#FF6B6B;")
+            self._set_btn_state(self.btn_rec, "⏹  Stop Rec", True, rec=True)
+            self.lbl_rec.setText(f"⏺ REC → {os.path.basename(path)}")
         else:
             self._recording = False
             if self._csv_file:
                 self._csv_file.close()
-                self._csv_file = None
-            self._csv_writer = None
-            self.btn_record.setText("⏺  Record")
-            self.btn_record.setObjectName("")
-            self.btn_record.setStyleSheet("")
-            self.lbl_record.setText("")
+                self._csv_file   = None
+                self._csv_writer = None
+            self._set_btn_state(self.btn_rec, "⏺  Record", False)
+            self.lbl_rec.setText("")
 
-    # ---------------------------------------------------------------
+    # ──────────────────────────────────────────────────────── callbacks
     def _on_connected(self, port: str):
-        self._set_status(f"● Đã kết nối: {port}", "ok")
-        self.btn_connect.setText("⏹  Disconnect")
-        self.btn_connect.setObjectName("btn_connect_on")
-        self.btn_connect.setStyleSheet("""
-            QPushButton#btn_connect_on {
-                background: #1B4332; border-color: #4ECDC4; color: #4ECDC4;
-            }
-        """)
+        self._set_status(f"● Đã kết nối: {port}", '#4ECDC4')
+        self._set_btn_state(self.btn_connect, "⏹  Disconnect", True)
 
     def _on_disconnected(self):
-        self._set_status("● Đã ngắt kết nối", "idle")
-        self.btn_connect.setText("🔗  Connect")
-        self.btn_connect.setObjectName("")
-        self.btn_connect.setStyleSheet("")
+        self._set_status("● Đã ngắt kết nối", '#666688')
+        self._set_btn_state(self.btn_connect, "🔗  Connect", False)
         self.btn_demo.setEnabled(True)
         self.btn_connect.setEnabled(True)
 
     def _on_error(self, msg: str):
-        self._set_status(f"✗ {msg}", "err")
-
-    def _on_sys_msg(self, msg: str):
-        self.lbl_gimbal.setText(f"Gimbal: {msg}")
-        if "Loi" in msg or "ERROR" in msg:
-            self.lbl_gimbal.setStyleSheet("color:#FF6B6B; font-weight:bold;")
-        elif "RUNNING" in msg or "thanh cong" in msg:
-            self.lbl_gimbal.setStyleSheet("color:#4ECDC4;")
-        else:
-            self.lbl_gimbal.setStyleSheet("color:#E0E0E0;")
+        self._set_status(f"✗ {msg}", '#FF6B6B')
 
     def _on_new_frame(self):
-        self._frame_count += 1
-        # Ghi CSV nếu đang record
+        self._frame_cnt += 1
+        # CSV record
         if self._recording and self._csv_writer:
-            t  = self.store.get_time()
-            if len(t) == 0:
+            t = self.store.get_time()
+            if not len(t):
                 return
-            ts = t[-1]
-
-            def _last(q): return self.store.get(q)[-1] if len(q) else 0.0
-            s = self.store
+            ts = float(t[-1])
+            s  = self.store
+            def _l(q): return float(s.get(q)[-1]) if len(q) else 0.0
             self._csv_writer.writerow([
-                f"{ts:.4f}",
-                _last(s.imu_f_ax), _last(s.imu_f_ay), _last(s.imu_f_az),
-                _last(s.imu_f_gx), _last(s.imu_f_gy), _last(s.imu_f_gz),
-                _last(s.imu_p_ax), _last(s.imu_p_ay), _last(s.imu_p_az),
-                _last(s.imu_p_gx), _last(s.imu_p_gy), _last(s.imu_p_gz),
-                _last(s.frame_pitch), _last(s.frame_roll), _last(s.frame_yaw),
-                _last(s.pay_pitch),   _last(s.pay_roll),   _last(s.pay_yaw),
-                _last(s.rel_pitch),   _last(s.rel_roll),
-                _last(s.p_err), _last(s.t_vel_p), _last(s.ff_pitch),
-                _last(s.cam_pr), _last(s.vel_err_p), _last(s.vq_pitch),
-                _last(s.r_err), _last(s.t_vel_r), _last(s.ff_roll),
-                _last(s.cam_rr), _last(s.vel_err_r), _last(s.vq_roll),
-                _last(s.elec_p), _last(s.elec_r), _last(s.off_p), _last(s.off_r),
+                f"{ts:.4f}", s.get_mode(),
+                _l(s.vel_target), _l(s.vel_filt), _l(s.vel_raw),
+                _l(s.vq_vel), _l(s.enc_vel),
+                _l(s.pos_target), _l(s.enc_pos), _l(s.pos_err),
+                _l(s.vq_pos), _l(s.vel_filt_pos),
             ])
 
+    # ──────────────────────────────────────────────────────── timer
     def _on_timer(self):
-        """Cập nhật tất cả panel theo UI timer."""
-        current_tab = self.tabs.currentIndex()
-        panels = [
-            self.panel_imu, self.panel_att,
-            self.panel_pid_p, self.panel_pid_r, self.panel_foc
-        ]
-        # Chỉ refresh tab hiện tại để tiết kiệm CPU
-        panels[current_tab].refresh()
+        # Refresh FOC panels
+        foc_idx = self._foc_tabs.currentIndex()
+        panels  = [self.panel_telem, self.panel_ctrl,
+                   self.panel_pid, self.panel_console]
+        if 0 <= foc_idx < len(panels):
+            try:
+                panels[foc_idx].refresh()
+            except Exception:
+                pass
 
         # FPS counter
         now = time.monotonic()
-        dt = now - self._last_fps_time
+        dt  = now - self._last_fps_t
         if dt >= 1.0:
-            self._fps = self._frame_count / dt
-            self._frame_count = 0
-            self._last_fps_time = now
+            self._fps = self._frame_cnt / dt
+            self._frame_cnt  = 0
+            self._last_fps_t = now
             self.lbl_fps.setText(f"FPS: {self._fps:.1f}")
 
-    def _set_status(self, msg: str, level: str = "idle"):
-        colors = {'ok': '#4ECDC4', 'err': '#FF6B6B', 'idle': '#888888'}
+    # ──────────────────────────────────────────────────────── helpers
+    def _set_status(self, msg: str, color: str = '#666688'):
         self.lbl_status.setText(msg)
-        self.lbl_status.setStyleSheet(f"color: {colors.get(level, '#888888')};")
+        self.lbl_status.setStyleSheet(f"color: {color}; font-family: Monospace; font-size: 8pt;")
 
-    # ---------------------------------------------------------------
+    def _set_btn_state(self, btn: QPushButton, text: str, on: bool, rec: bool = False):
+        btn.setText(text)
+        if rec:
+            btn.setObjectName("btn_rec")
+        else:
+            btn.setObjectName("btn_on" if on else "")
+        btn.setStyleSheet("")  # force re-apply stylesheet
+
     def closeEvent(self, event):
         self._stop_reader()
         if self._csv_file:
             self._csv_file.close()
         super().closeEvent(event)
+
+
+# ─────────── small helpers ─────────────────────────────────────────────────
+def _plain(text: str) -> QLabel:
+    l = QLabel(text)
+    l.setStyleSheet("color: #888888; font-size: 9pt;")
+    return l
+
+
+def _status(text: str, color: str) -> QLabel:
+    l = QLabel(text)
+    l.setFont(QFont("Monospace", 8))
+    l.setStyleSheet(f"color: {color};")
+    return l
