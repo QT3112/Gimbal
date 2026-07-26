@@ -97,12 +97,16 @@ void Error_Handler(void);
 #define DRV2_INH_B_GPIO_Port GPIOA
 #define DRV2_INH_A_Pin GPIO_PIN_15
 #define DRV2_INH_A_GPIO_Port GPIOA
+#define IMU_SPI3_SCK_Pin GPIO_PIN_10
+#define IMU_SPI3_SCK_GPIO_Port GPIOC
 #define IMU_SPI3_MISO_Pin GPIO_PIN_11
 #define IMU_SPI3_MISO_GPIO_Port GPIOC
 #define ENC_SPI1_SCK_Pin GPIO_PIN_3
 #define ENC_SPI1_SCK_GPIO_Port GPIOB
 #define DRV3_INH_A_Pin GPIO_PIN_4
 #define DRV3_INH_A_GPIO_Port GPIOB
+#define IMU_SPI3_MOSI_Pin GPIO_PIN_5
+#define IMU_SPI3_MOSI_GPIO_Port GPIOB
 #define DRV2_INH_C_Pin GPIO_PIN_9
 #define DRV2_INH_C_GPIO_Port GPIOB
 

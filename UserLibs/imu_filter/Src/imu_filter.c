@@ -182,3 +182,54 @@ void Mahony_Update_ICM42688(MahonyFilter_t *mahony, const ICM42688_Handle_t *imu
 
     Mahony_Update(mahony, gx, gy, gz, ax, ay, az, dt);
 }
+
+/* =================================================================================
+ * QUATERNION MATH & 3D ORIENTATION (Chống Gimbal Lock)
+ * ================================================================================= */
+
+void Quaternion_Multiply(const Quaternion_t *q1, const Quaternion_t *q2, Quaternion_t *result) {
+    result->q0 = q1->q0 * q2->q0 - q1->q1 * q2->q1 - q1->q2 * q2->q2 - q1->q3 * q2->q3;
+    result->q1 = q1->q0 * q2->q1 + q1->q1 * q2->q0 + q1->q2 * q2->q3 - q1->q3 * q2->q2;
+    result->q2 = q1->q0 * q2->q2 - q1->q1 * q2->q3 + q1->q2 * q2->q0 + q1->q3 * q2->q1;
+    result->q3 = q1->q0 * q2->q3 + q1->q1 * q2->q2 - q1->q2 * q2->q1 + q1->q3 * q2->q0;
+}
+
+void Quaternion_Conjugate(const Quaternion_t *q, Quaternion_t *result) {
+    result->q0 =  q->q0;
+    result->q1 = -q->q1;
+    result->q2 = -q->q2;
+    result->q3 = -q->q3;
+}
+
+void Quaternion_ToEuler(const Quaternion_t *q, float *roll, float *pitch, float *yaw) {
+    if (roll)  *roll  = atan2f(2.0f * (q->q0 * q->q1 + q->q2 * q->q3), 1.0f - 2.0f * (q->q1 * q->q1 + q->q2 * q->q2));
+    if (pitch) *pitch = asinf(2.0f * (q->q0 * q->q2 - q->q3 * q->q1));
+    if (yaw)   *yaw   = atan2f(2.0f * (q->q0 * q->q3 + q->q1 * q->q2), 1.0f - 2.0f * (q->q2 * q->q2 + q->q3 * q->q3));
+}
+
+void Quaternion_FromEuler(float roll, float pitch, float yaw, Quaternion_t *q) {
+    float cr = cosf(roll * 0.5f);
+    float sr = sinf(roll * 0.5f);
+    float cp = cosf(pitch * 0.5f);
+    float sp = sinf(pitch * 0.5f);
+    float cy = cosf(yaw * 0.5f);
+    float sy = sinf(yaw * 0.5f);
+
+    q->q0 = cr * cp * cy + sr * sp * sy;
+    q->q1 = sr * cp * cy - cr * sp * sy;
+    q->q2 = cr * sp * cy + sr * cp * sy;
+    q->q3 = cr * cp * sy - sr * sp * cy;
+}
+
+void Quaternion_ComputeError(const Quaternion_t *q_target, const Quaternion_t *q_meas, float e_rot[3]) {
+    Quaternion_t q_meas_conj, q_err;
+    Quaternion_Conjugate(q_meas, &q_meas_conj);
+    Quaternion_Multiply(q_target, &q_meas_conj, &q_err);
+
+    /* Giữ dấu quay theo hướng ngắn nhất (shortest path rotation) */
+    float sign = (q_err.q0 >= 0.0f) ? 2.0f : -2.0f;
+    e_rot[0] = sign * q_err.q1;
+    e_rot[1] = sign * q_err.q2;
+    e_rot[2] = sign * q_err.q3;
+}
+

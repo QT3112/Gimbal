@@ -102,4 +102,44 @@ void Mahony_Update(MahonyFilter_t *mahony, float gx, float gy, float gz, float a
  */
 void Mahony_Update_ICM42688(MahonyFilter_t *mahony, const ICM42688_Handle_t *imu, float dt);
 
+/* =================================================================================
+ * QUATERNION MATH & 3D ORIENTATION (Chống Gimbal Lock)
+ * ================================================================================= */
+typedef struct {
+    float q0; /* Scalar (w) */
+    float q1; /* Vector X */
+    float q2; /* Vector Y */
+    float q3; /* Vector Z */
+} Quaternion_t;
+
+/**
+ * @brief Nhân hai Quaternion: result = q1 * q2
+ */
+void Quaternion_Multiply(const Quaternion_t *q1, const Quaternion_t *q2, Quaternion_t *result);
+
+/**
+ * @brief Nghịch đảo / Liên hợp Quaternion: result = q* (cho Quaternion đơn vị)
+ */
+void Quaternion_Conjugate(const Quaternion_t *q, Quaternion_t *result);
+
+/**
+ * @brief Chuyển đổi Quaternion sang góc Euler (Roll, Pitch, Yaw tính theo Radian)
+ */
+void Quaternion_ToEuler(const Quaternion_t *q, float *roll, float *pitch, float *yaw);
+
+/**
+ * @brief Tạo Quaternion từ góc Euler (Roll, Pitch, Yaw tính theo Radian)
+ */
+void Quaternion_FromEuler(float roll, float pitch, float yaw, Quaternion_t *q);
+
+/**
+ * @brief Tính toán Vector sai số góc quay 3D (3D Rotation Error Vector) giữa Target & Measured
+ *        dùng cho vòng lặp điều khiển FOC PID không dính Gimbal Lock.
+ * @param q_target Quaternion mục tiêu
+ * @param q_meas Quaternion đo được hiện tại từ AHRS
+ * @param e_rot Mang 3 phần tử [e_x, e_y, e_z] nhận vector sai số góc (Radian)
+ */
+void Quaternion_ComputeError(const Quaternion_t *q_target, const Quaternion_t *q_meas, float e_rot[3]);
+
 #endif /* IMU_FILTER_H */
+

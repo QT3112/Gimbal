@@ -199,13 +199,27 @@ typedef enum {
 } ICM42688_Status_t;
 
 /* ===========================================================================
- * Cấu hình cảm biến — truyền vào ICM42688_Init()
+ * Lựa chọn bộ lọc UI Low-Pass Filter (GYRO_ACCEL_CONFIG0 0x52)
+ * =========================================================================== */
+#define ICM42688_UI_FILT_BW_ODR_DIV_2   0x00U  /*!< Băng thông lớn nhất (ODR / 2) */
+#define ICM42688_UI_FILT_BW_ODR_DIV_4   0x01U  /*!< ODR / 4 (ví dụ 250Hz tại 1kHz ODR) */
+#define ICM42688_UI_FILT_BW_ODR_DIV_5   0x02U  /*!< ODR / 5 (200Hz) */
+#define ICM42688_UI_FILT_BW_ODR_DIV_8   0x03U  /*!< ODR / 8 (125Hz) */
+#define ICM42688_UI_FILT_BW_ODR_DIV_10  0x04U  /*!< ODR / 10 (100Hz) */
+#define ICM42688_UI_FILT_BW_ODR_DIV_16  0x05U  /*!< ODR / 16 (62.5Hz) */
+#define ICM42688_UI_FILT_BW_ODR_DIV_20  0x06U  /*!< ODR / 20 (50Hz — khuyến nghị cho Gimbal) */
+#define ICM42688_UI_FILT_BW_ODR_DIV_40  0x07U  /*!< ODR / 40 (25Hz) */
+
+/* ===========================================================================
+ * Cấu hình truyền vào ICM42688_Init()
  * =========================================================================== */
 typedef struct {
     uint8_t gyro_fsr;    /*!< ICM42688_GYRO_FSR_xxx */
     uint8_t gyro_odr;    /*!< ICM42688_GYRO_ODR_xxx */
     uint8_t accel_fsr;   /*!< ICM42688_ACCEL_FSR_xxx */
     uint8_t accel_odr;   /*!< ICM42688_ACCEL_ODR_xxx */
+    uint8_t gyro_lpf;    /*!< ICM42688_UI_FILT_BW_xxx */
+    uint8_t accel_lpf;   /*!< ICM42688_UI_FILT_BW_xxx */
 } ICM42688_Config_t;
 
 /* ===========================================================================
@@ -221,6 +235,12 @@ typedef struct {
     float gyro_sensitivity;      /*!< LSB/dps — được tính từ FSR khi Init */
     float accel_sensitivity;     /*!< LSB/g   — được tính từ FSR khi Init */
 
+    /* --- Hiệu chuẩn Gyro Bias --- */
+    float gyro_bias_x;           /*!< Bias tĩnh trục X [dps] */
+    float gyro_bias_y;           /*!< Bias tĩnh trục Y [dps] */
+    float gyro_bias_z;           /*!< Bias tĩnh trục Z [dps] */
+    uint8_t gyro_calibrated;     /*!< Flag đã calib bias */
+
     /* --- Dữ liệu thô (two's complement) --- */
     int16_t raw_gyro_x;
     int16_t raw_gyro_y;
@@ -231,9 +251,9 @@ typedef struct {
     int16_t raw_temp;
 
     /* --- Dữ liệu đã quy đổi --- */
-    float gyro_x_dps;    /*!< Vận tốc góc trục X [dps] */
-    float gyro_y_dps;    /*!< Vận tốc góc trục Y [dps] */
-    float gyro_z_dps;    /*!< Vận tốc góc trục Z [dps] */
+    float gyro_x_dps;    /*!< Vận tốc góc trục X [dps] (đã trừ bias) */
+    float gyro_y_dps;    /*!< Vận tốc góc trục Y [dps] (đã trừ bias) */
+    float gyro_z_dps;    /*!< Vận tốc góc trục Z [dps] (đã trừ bias) */
     float accel_x_g;     /*!< Gia tốc trục X [g] */
     float accel_y_g;     /*!< Gia tốc trục Y [g] */
     float accel_z_g;     /*!< Gia tốc trục Z [g] */
@@ -253,19 +273,36 @@ typedef struct {
  * Quy trình:
  *   1. Soft reset
  *   2. Xác minh WHO_AM_I = 0x47
- *   3. Cấu hình Gyro/Accel theo config, bật Low-Noise mode
+ *   3. Cấu hình Gyro/Accel theo config, bật Low-Noise mode & UI LPF
  *
  * @param  hdev     Con trỏ handle của thư viện
  * @param  hspi     Con trỏ SPI handle (SPI Mode 3: CPOL=1, CPHA=1, 8-bit)
  * @param  cs_port  GPIO Port chân CS
  * @param  cs_pin   GPIO Pin chân CS
- * @param  config   Con trỏ cấu hình (NULL để dùng mặc định: ±2000dps, ±16g, 1kHz)
+ * @param  config   Con trỏ cấu hình (NULL để dùng mặc định: ±2000dps, ±16g, 1kHz, LPF 50Hz)
  * @retval ICM42688_Status_t
  */
 ICM42688_Status_t ICM42688_Init(ICM42688_Handle_t *hdev,
                                 SPI_HandleTypeDef *hspi,
                                 GPIO_TypeDef *cs_port, uint16_t cs_pin,
                                 const ICM42688_Config_t *config);
+
+/**
+ * @brief  Tự động hiệu chuẩn Gyro Zero-Rate Offset (khi cảm biến đứng tĩnh)
+ * @param  hdev     Con trỏ ICM42688_Handle_t
+ * @param  samples  Số mẫu lấy thu thập (khuyến nghị: 500 mẫu)
+ * @retval ICM42688_Status_t
+ */
+ICM42688_Status_t ICM42688_CalibrateGyroBias(ICM42688_Handle_t *hdev, uint16_t samples);
+
+/**
+ * @brief  Cấu hình bộ lọc Low-Pass Filter (UI LPF) phần cứng
+ * @param  hdev          Con trỏ ICM42688_Handle_t
+ * @param  gyro_lpf_bw   ICM42688_UI_FILT_BW_xxx
+ * @param  accel_lpf_bw  ICM42688_UI_FILT_BW_xxx
+ * @retval ICM42688_Status_t
+ */
+ICM42688_Status_t ICM42688_SetFilter(ICM42688_Handle_t *hdev, uint8_t gyro_lpf_bw, uint8_t accel_lpf_bw);
 
 /**
  * @brief  Đọc toàn bộ dữ liệu cảm biến (Accel + Gyro + Temp) trong 1 lần Burst Read
@@ -360,3 +397,4 @@ ICM42688_Status_t ICM42688_SelectBank(ICM42688_Handle_t *hdev, uint8_t bank);
 #endif
 
 #endif /* ICM42688_H */
+

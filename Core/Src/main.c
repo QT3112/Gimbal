@@ -7,7 +7,6 @@
 #include "dma.h"
 #include "gpio.h"
 #include "spi.h"
-#include "stm32g4xx_hal_gpio.h"
 #include "tim.h"
 #include "usart.h"
 #include "usb_device.h"
@@ -16,6 +15,8 @@
 /* USER CODE BEGIN Includes */
 #include "as5048a.h"
 #include "foc_v1.h"
+#include "icm42688.h"
+#include "imu_filter.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,8 @@
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -34,10 +37,10 @@
 #define TEST_MODE_VELOCITY 1
 #define TEST_MODE_POSITION 2
 #define TEST_MODE_CURRENT 3
+#define TEST_MODE_ICM42688 4
 
-/* Chọn chế độ thử nghiệm: TEST_MODE_VELOCITY hoặc TEST_MODE_POSITION */
-#define TEST_MODE TEST_MODE_POSITION
-#define COMM_MODE COMM_MODE_APP_GUI
+#define TEST_MODE TEST_MODE_ICM42688
+#define COMM_MODE COMM_MODE_TERMINAL_LOG
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -51,6 +54,13 @@
 
 AS5048A_Handle_t pitch_enc;
 FOC_Handle_t foc_pitch;
+
+ICM42688_Handle_t imu_payload;
+MahonyFilter_t mahony_imu;
+uint8_t icm_init_ok = 0;
+
+Quaternion_t q_target_3d = {1.0f, 0.0f, 0.0f, 0.0f};
+float e_rot[3] = {0.0f, 0.0f, 0.0f};
 
 /* Biến lưu góc và vận tốc mục tiêu (rad & rad/s) */
 volatile float target_pitch_angle = 0.0f;
@@ -145,6 +155,8 @@ void ParseCommand(const char *line) {
       foc_pitch.velocity_loop_enabled = 1;
       foc_pitch.position_loop_enabled = 1;
       target_pitch_angle = pitch_enc.angle_rad; /* giữ vị trí hiện tại */
+    } else if (strncmp(val, "ICM", 3) == 0) {
+      g_mode = TEST_MODE_ICM42688;
     }
 
     /* -------------------------------------------------------- */
@@ -295,38 +307,72 @@ int main(void) {
   foc_pitch.pid_q.integral = 0.30f; /* Áp điện áp cố định Vq = +0.30V */
   FOC_ConfigureCurrentSense(&foc_pitch, SHUNT_RES, GAIN_DRV, 3.3f);
 
+#if (TEST_MODE == TEST_MODE_POSITION)
   foc_pitch.enabled = 1;
   FOC_AlignD(&foc_pitch, 0.5f);
   HAL_Delay(1000);
   FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
-
-#if (TEST_MODE == TEST_MODE_POSITION)
   foc_pitch.position_loop_enabled = 1;
   foc_pitch.velocity_loop_enabled = 1;
   foc_pitch.current_loop_enabled = 0;
   target_pitch_angle = pitch_enc.angle_rad;
   HAL_TIM_Base_Start_IT(&htim7);
 #elif (TEST_MODE == TEST_MODE_VELOCITY)
+  foc_pitch.enabled = 1;
+  FOC_AlignD(&foc_pitch, 0.5f);
+  HAL_Delay(1000);
+  FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
   foc_pitch.position_loop_enabled = 1;
   foc_pitch.velocity_loop_enabled = 1;
   foc_pitch.current_loop_enabled = 0;
   HAL_TIM_Base_Start_IT(&htim7);
 #elif (TEST_MODE == TEST_MODE_CURRENT)
+  foc_pitch.enabled = 1;
+  FOC_AlignD(&foc_pitch, 0.5f);
+  HAL_Delay(1000);
+  FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
   foc_pitch.position_loop_enabled = 0;
   foc_pitch.velocity_loop_enabled = 0;
   foc_pitch.current_loop_enabled = 1;
   HAL_ADCEx_InjectedStart_IT(&hadc1);
   // HAL_TIM_Base_Start_IT(&htim7);
+#elif (TEST_MODE == TEST_MODE_ICM42688)
+  /* Dừng FOC motor control khi test cảm biến ICM42688 */
+  foc_pitch.enabled = 0;
+  FOC_Stop(&foc_pitch);
+
+  /* Khởi tạo cảm biến ICM-42688-P qua SPI3 DMA (CS: PB15 - IMU_PAYLOAD_CS) */
+  ICM42688_Status_t icm_status = ICM42688_Init(
+      &imu_payload, &hspi3, IMU_PAYLOAD_CS_GPIO_Port, IMU_PAYLOAD_CS_Pin, NULL);
+  if (icm_status == ICM42688_OK) {
+    icm_init_ok = 1;
+    printf("[ICM42688] Khoi tao thanh cong & bat UI LPF 50Hz! (WHO_AM_I = "
+           "0x47)\r\n");
+    printf("[ICM42688] Dang hieu chuan Gyro Bias (giu im cam bien 1s)...\r\n");
+    ICM42688_CalibrateGyroBias(&imu_payload, 500);
+    printf("[ICM42688] Bias hoan tat: X=%.2f, Y=%.2f, Z=%.2f dps\r\n",
+           imu_payload.gyro_bias_x, imu_payload.gyro_bias_y,
+           imu_payload.gyro_bias_z);
+
+    /* Khởi tạo bộ lọc Mahony AHRS */
+    Mahony_Init(&mahony_imu, 1.0f, 0.005f);
+  } else {
+    icm_init_ok = 0;
+    printf("[ICM42688] Loi khoi tao! Status code: %d\r\n", icm_status);
+  }
 #endif
 
+#if (TEST_MODE == TEST_MODE_POSITION || TEST_MODE == TEST_MODE_VELOCITY)
   uint32_t last_step_time = HAL_GetTick();
   uint8_t step_state = 0;
+#endif
 
   /* Khởi tạo giá trị mặc định: GUI sẽ điều khiển từ đây */
   uint32_t last_print_time = HAL_GetTick();
 
   /* USER CODE END 2 */
 
+  /* Infinite loop */
   /* USER CODE BEGIN WHILE */
 
   while (1) {
@@ -367,6 +413,15 @@ int main(void) {
         printf("$VEL,%.2f,%.2f,%.2f,%.2f,%.2f\r\n", target_velocity_rad_s,
                foc_pitch.velocity_mech, foc_pitch.velocity_mech_raw,
                foc_pitch.Vq_ref, pitch_enc.angle_deg);
+      } else if (g_mode == TEST_MODE_ICM42688) {
+        if (icm_init_ok) {
+          ICM42688_ReadSensor(&imu_payload);
+          printf("$IMU,%.3f,%.3f,%.3f,%.2f,%.2f,%.2f,%.1f\r\n",
+                 imu_payload.accel_x_g, imu_payload.accel_y_g,
+                 imu_payload.accel_z_g, imu_payload.gyro_x_dps,
+                 imu_payload.gyro_y_dps, imu_payload.gyro_z_dps,
+                 imu_payload.temp_c);
+        }
       } else {
         /* Format: $POS,target_pos,enc_deg,err_deg,vq,vel_filt */
         float target_pos_deg = target_pitch_angle * (180.0f / 3.14159265f);
@@ -442,6 +497,24 @@ int main(void) {
            "| OffA: %lu | OffB: %lu | rawA: %lu | rawB: %lu \r\n",
            foc_pitch.I_dq.q, foc_pitch.I_dq.d, foc_pitch.adc_offset_a,
            foc_pitch.adc_offset_b, log_raw_ia, log_raw_ib);
+
+#elif (TEST_MODE == TEST_MODE_ICM42688)
+    if (now - last_print_time >= 100) {
+      last_print_time = now;
+      if (icm_init_ok) {
+        float roll_deg = mahony_imu.roll * 57.2957795f;
+        float pitch_deg = mahony_imu.pitch * 57.2957795f;
+        float yaw_deg = mahony_imu.yaw * 57.2957795f;
+
+        printf("[SPI3 DMA 3D Quat] Err_Rad: X=%6.3f Y=%6.3f Z=%6.3f | "
+               "Quat[w=%.2f,x=%.2f,y=%.2f,z=%.2f] | AHRS[deg]: R=%5.1f P=%5.1f "
+               "Y=%5.1f\r\n",
+               e_rot[0], e_rot[1], e_rot[2], mahony_imu.q0, mahony_imu.q1,
+               mahony_imu.q2, mahony_imu.q3, roll_deg, pitch_deg, yaw_deg);
+      } else {
+        printf("[ICM42688] Cam bien chua duoc khoi tao thanh cong!\r\n");
+      }
+    }
 #endif
 #endif
   }
@@ -509,6 +582,14 @@ static uint16_t enc_rx_angle;            /* Frame 1: chứa angle data */
 volatile uint8_t enc_busy = 0;
 static uint8_t enc_phase = 0; /* 0 = gửi lệnh, 1 = lấy data */
 
+/* ============================================================
+ * SPI DMA Buffers cho ICM42688 (15-byte Burst Read Pipeline)
+ * ============================================================ */
+static uint8_t icm_tx_buf[15] = {
+    0x1D | 0x80, 0}; /* 0x1D | 0x80: Read command bắt đầu từ TEMP_DATA1 */
+static uint8_t icm_rx_buf[15];
+volatile uint8_t icm_dma_busy = 0;
+
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
   if (hspi->Instance == SPI1) {
     HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
@@ -540,6 +621,53 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
             (float)pitch_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
       }
     }
+  } else if (hspi->Instance == SPI3) {
+    /* SPI3 DMA Burst Read ICM42688 xong (15 bytes) */
+    HAL_GPIO_WritePin(IMU_PAYLOAD_CS_GPIO_Port, IMU_PAYLOAD_CS_Pin,
+                      GPIO_PIN_SET);
+    icm_dma_busy = 0;
+
+    /* Parse 14-byte data từ icm_rx_buf (byte 0 là dummy/cmd) */
+    imu_payload.raw_temp = (int16_t)((icm_rx_buf[1] << 8) | icm_rx_buf[2]);
+    imu_payload.raw_accel_x = (int16_t)((icm_rx_buf[3] << 8) | icm_rx_buf[4]);
+    imu_payload.raw_accel_y = (int16_t)((icm_rx_buf[5] << 8) | icm_rx_buf[6]);
+    imu_payload.raw_accel_z = (int16_t)((icm_rx_buf[7] << 8) | icm_rx_buf[8]);
+    imu_payload.raw_gyro_x = (int16_t)((icm_rx_buf[9] << 8) | icm_rx_buf[10]);
+    imu_payload.raw_gyro_y = (int16_t)((icm_rx_buf[11] << 8) | icm_rx_buf[12]);
+    imu_payload.raw_gyro_z = (int16_t)((icm_rx_buf[13] << 8) | icm_rx_buf[14]);
+
+    float gs = imu_payload.gyro_sensitivity;
+    float as = imu_payload.accel_sensitivity;
+
+    float gx = (float)imu_payload.raw_gyro_x / gs;
+    float gy = (float)imu_payload.raw_gyro_y / gs;
+    float gz = (float)imu_payload.raw_gyro_z / gs;
+
+    if (imu_payload.gyro_calibrated) {
+      gx -= imu_payload.gyro_bias_x;
+      gy -= imu_payload.gyro_bias_y;
+      gz -= imu_payload.gyro_bias_z;
+    }
+
+    imu_payload.gyro_x_dps = gx;
+    imu_payload.gyro_y_dps = gy;
+    imu_payload.gyro_z_dps = gz;
+
+    imu_payload.accel_x_g = (float)imu_payload.raw_accel_x / as;
+    imu_payload.accel_y_g = (float)imu_payload.raw_accel_y / as;
+    imu_payload.accel_z_g = (float)imu_payload.raw_accel_z / as;
+    imu_payload.temp_c =
+        (float)imu_payload.raw_temp / ICM42688_TEMP_SENS + ICM42688_TEMP_OFFSET;
+
+    /* Cập nhật Mahony 3D AHRS ngay tại ngắt DMA 1kHz (dt = 0.001s) */
+    Mahony_Update(&mahony_imu, imu_payload.gyro_x_dps * 0.0174532925f,
+                  imu_payload.gyro_y_dps * 0.0174532925f,
+                  imu_payload.gyro_z_dps * 0.0174532925f, imu_payload.accel_x_g,
+                  imu_payload.accel_y_g, imu_payload.accel_z_g, 0.001f);
+
+    Quaternion_t q_meas_3d = {mahony_imu.q0, mahony_imu.q1, mahony_imu.q2,
+                              mahony_imu.q3};
+    Quaternion_ComputeError(&q_target_3d, &q_meas_3d, e_rot);
   }
 }
 
@@ -547,7 +675,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
  * Loop) */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM6) {
-    /* TIM6: Khởi động Phase 0 của 2-frame AS5048A pipeline */
+    /* TIM6: Khởi động Phase 0 của 2-frame AS5048A pipeline (SPI1) */
     if (!enc_busy) {
       enc_busy = 1;
       enc_phase = 0;
@@ -556,8 +684,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
       HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t *)&enc_tx_read_cmd,
                                   (uint8_t *)&enc_rx_dummy, 1);
     }
+    /* TIM6: Kích hoạt SPI3 DMA đọc Burst 15-byte cho ICM42688 (SPI3) */
+    if (!icm_dma_busy && icm_init_ok) {
+      icm_dma_busy = 1;
+      HAL_GPIO_WritePin(IMU_PAYLOAD_CS_GPIO_Port, IMU_PAYLOAD_CS_Pin,
+                        GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive_DMA(&hspi3, icm_tx_buf, icm_rx_buf, 15);
+    }
   } else if (htim->Instance == TIM7) {
-    /* Chạy Vòng lặp kín theo chế độ hiện tại (có thể đổi runtime từ GUI) */
+    /* Chạy Vòng lặp kín theo chế độ hiện tại (không bị nghẽn I/O) */
     if (g_mode == TEST_MODE_VELOCITY) {
       FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, target_velocity_rad_s);
     } else {
