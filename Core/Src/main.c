@@ -27,11 +27,17 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+
+#define COMM_MODE_TERMINAL_LOG 1
+#define COMM_MODE_APP_GUI 2
+
 #define TEST_MODE_VELOCITY 1
 #define TEST_MODE_POSITION 2
+#define TEST_MODE_CURRENT 3
 
 /* Chọn chế độ thử nghiệm: TEST_MODE_VELOCITY hoặc TEST_MODE_POSITION */
 #define TEST_MODE TEST_MODE_POSITION
+#define COMM_MODE COMM_MODE_APP_GUI
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -114,6 +120,7 @@ void SystemClock_Config(void);
  *   #ALIGN               — Yêu cầu re-alignment trục D
  */
 void ParseCommand(const char *line) {
+#if (COMM_MODE == COMM_MODE_APP_GUI)
   /* Sao chép sang buffer local để dùng strtok an toàn */
   static char buf[128];
   strncpy(buf, line, sizeof(buf) - 1);
@@ -216,6 +223,7 @@ void ParseCommand(const char *line) {
   } else if (strcmp(cmd, "#ALIGN") == 0) {
     g_align_req = 1;
   }
+#endif
 }
 
 /* USER CODE END 0 */
@@ -276,46 +284,60 @@ int main(void) {
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2); /* PA9 -> Phase B */
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3); /* PA10 -> Phase C */
 
-  /* 2. Cấu hình Tham số PID & LPF Tối ưu (Siêu mượt & Triệt tiêu sai số góc) */
-  /* Position PID: Kp = 6.0f, Ki = 0.4f để triệt tiêu sai số góc ma sát tĩnh 2.5
-   * deg */
   FOC_SetPID_POS(&foc_pitch, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
-  /* Velocity PID: Kp_vel = 0.12f, Ki_vel = 0.4f cho đáp ứng siêu mượt */
   FOC_SetPID_VEL(&foc_pitch, 0.12f, 0.4f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
-  /* LPF Vel: alpha = 0.96f triệt tiêu hoàn toàn nhiễu bước nhảy lượng hóa 0.77
-   * rad/s */
   FOC_SetLPF_Vel(&foc_pitch, 0.96f);
 
-  /* 3. Bật FOC và thực hiện Alignment D-axis để đồng bộ góc encoder */
-  foc_pitch.enabled = 1;
-  FOC_AlignD(&foc_pitch, 0.5f); /* Áp 0.5V vào trục D để giữ rotor */
-  HAL_Delay(1000); /* Chờ 1 giây cho rotor định vị ổn định */
+  /* Cấu hình Vòng lặp Hở (Open Loop Voltage = 0.30V) để test chiều dòng */
+  FOC_SetPID_D(&foc_pitch, 0.0f, 0.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetPID_Q(&foc_pitch, 0.0f, 0.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  foc_pitch.pid_d.integral = 0.0f;
+  foc_pitch.pid_q.integral = 0.30f; /* Áp điện áp cố định Vq = +0.30V */
+  FOC_ConfigureCurrentSense(&foc_pitch, SHUNT_RES, GAIN_DRV, 3.3f);
 
-  /* Lưu offset góc điện tương ứng với vị trí cơ hiện tại của encoder */
+  foc_pitch.enabled = 1;
+  FOC_AlignD(&foc_pitch, 0.5f);
+  HAL_Delay(1000);
   FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
 
-  /* 4. Kích hoạt Chế độ Vòng lặp tương ứng với TEST_MODE */
-#if (TEST_MODE == TEST_MODE_VELOCITY)
-  foc_pitch.velocity_loop_enabled = 1;
-  foc_pitch.position_loop_enabled = 0;
-  foc_pitch.current_loop_enabled = 0;
-#elif (TEST_MODE == TEST_MODE_POSITION)
-  /* Chạy Cascade Position-Velocity: Bật cả 2 flag */
-  foc_pitch.velocity_loop_enabled = 1;
+#if (TEST_MODE == TEST_MODE_POSITION)
   foc_pitch.position_loop_enabled = 1;
+  foc_pitch.velocity_loop_enabled = 1;
   foc_pitch.current_loop_enabled = 0;
-  target_pitch_angle =
-      pitch_enc.angle_rad; /* Khởi tạo vị trí đích tại mốc hiện tại */
+  target_pitch_angle = pitch_enc.angle_rad;
+  HAL_TIM_Base_Start_IT(&htim7);
+#elif (TEST_MODE == TEST_MODE_VELOCITY)
+  foc_pitch.position_loop_enabled = 1;
+  foc_pitch.velocity_loop_enabled = 1;
+  foc_pitch.current_loop_enabled = 0;
+  HAL_TIM_Base_Start_IT(&htim7);
+#elif (TEST_MODE == TEST_MODE_CURRENT)
+  foc_pitch.position_loop_enabled = 0;
+  foc_pitch.velocity_loop_enabled = 0;
+  foc_pitch.current_loop_enabled = 1;
+  HAL_ADCEx_InjectedStart_IT(&hadc1);
+  // HAL_TIM_Base_Start_IT(&htim7);
 #endif
 
-  HAL_TIM_Base_Start_IT(&htim7);
+  uint32_t last_step_time = HAL_GetTick();
+  uint8_t step_state = 0;
 
   /* Khởi tạo giá trị mặc định: GUI sẽ điều khiển từ đây */
   uint32_t last_print_time = HAL_GetTick();
 
+  /* USER CODE END 2 */
+
+  /* USER CODE BEGIN WHILE */
+
   while (1) {
+
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+
     uint32_t now = HAL_GetTick();
 
+#if (COMM_MODE == COMM_MODE_APP_GUI)
     /* --- Xử lý các yêu cầu từ GUI (volatile flags từ ParseCommand) --- */
     if (g_foc_stop_req) {
       g_foc_stop_req = 0;
@@ -358,7 +380,72 @@ int main(void) {
                foc_pitch.velocity_mech);
       }
     }
+#elif (COMM_MODE == COMM_MODE_TERMINAL_LOG)
+#if (TEST_MODE == TEST_MODE_POSITION)
+    /* Kịch bản test step response vị trí tự động mỗi 4 giây: 0 rad ->
+    +90 deg
+     * -> +180 deg -> -90 deg */
+    if (now - last_step_time >= 4000) {
+      last_step_time = now;
+      step_state = (step_state + 1) % 4;
+      if (step_state == 0) {
+        target_pitch_angle = 0.0f; /* 0 deg */
+      } else if (step_state == 1) {
+        target_pitch_angle = 1.5707963f; /* +90 deg (+pi/2 rad) */
+      } else if (step_state == 2) {
+        target_pitch_angle = 3.14159265f; /* +180 deg (+pi rad) */
+      } else if (step_state == 3) {
+        target_pitch_angle = -1.5707963f; /* -90 deg (-pi/2 rad) */
+      }
+    }
+
+    float target_pos_deg = target_pitch_angle * (180.0f / 3.14159265f);
+    float err_pos_deg = target_pos_deg - pitch_enc.angle_deg;
+    while (err_pos_deg > 180.0f)
+      err_pos_deg -= 360.0f;
+    while (err_pos_deg < -180.0f)
+      err_pos_deg += 360.0f;
+
+    /* Print Telemetry (10Hz) để giám sát đáp ứng vị trí */
+    printf("TargetPos: %.1f deg | Enc: %.1f deg | Err: %.1f deg | Vq: %.2fV | "
+           "VelFilt: %.2f\r\n",
+           target_pos_deg, pitch_enc.angle_deg, err_pos_deg, foc_pitch.Vq_ref,
+           foc_pitch.velocity_mech);
+
+#elif (TEST_MODE == TEST_MODE_VELOCITY)
+    /* Kịch bản test step response vận tốc tự động mỗi 3 giây */
+    if (now - last_step_time >= 3000) {
+      last_step_time = now;
+      step_state = (step_state + 1) % 3;
+      if (step_state == 0) {
+        target_velocity_rad_s = 3.0f; /* Quay thuận 3.0 rad/s (~28.6 RPM)
+                                       */
+      } else if (step_state == 1) {
+        target_velocity_rad_s = -3.0f; /* Quay ngược -3.0 rad/s */
+      } else {
+        target_velocity_rad_s = 0.0f; /* Dừng 0 rad/s */
+      }
+    }
+
+    /* Print Telemetry (10Hz) để giám sát đáp ứng tốc độ */
+    printf("TargetVel: %.2f | VelFilt: %.2f | VelRaw: %.2f | Vq: %.2fV | Enc: "
+           "%.2f deg\r\n",
+           target_velocity_rad_s, foc_pitch.velocity_mech,
+           foc_pitch.velocity_mech_raw, foc_pitch.Vq_ref, pitch_enc.angle_deg);
+#elif (TEST_MODE == TEST_MODE_CURRENT)
+    /* === VÒNG LẶP HỞ (OPEN LOOP) TEST CHIỀU DÒNG ĐIỆN === */
+    /* Áp điện áp cố định Vq = +0.30V (bỏ qua PID để tránh rít/rung bão hòa) */
+    foc_pitch.pid_d.integral = 0.0f;
+    foc_pitch.pid_q.integral = 0.30f;
+
+    printf("OPEN_LOOP | Vq_applied: +0.30V | Iq_meas: %.3f A | Id_meas: %.3f A "
+           "| OffA: %lu | OffB: %lu | rawA: %lu | rawB: %lu \r\n",
+           foc_pitch.I_dq.q, foc_pitch.I_dq.d, foc_pitch.adc_offset_a,
+           foc_pitch.adc_offset_b, log_raw_ia, log_raw_ib);
+#endif
+#endif
   }
+  /* USER CODE END 3 */
 }
 
 /**
