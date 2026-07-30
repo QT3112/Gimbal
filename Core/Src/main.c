@@ -40,8 +40,8 @@
 #define TEST_MODE_ICM42688 4
 #define TEST_MODE_DEMO_1AXIS 5
 
-#define TEST_MODE TEST_MODE_POSITION
-#define COMM_MODE COMM_MODE_APP_GUI
+#define TEST_MODE TEST_MODE_DEMO_1AXIS
+#define COMM_MODE COMM_MODE_TERMINAL_LOG
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -74,7 +74,18 @@ float test_angle_elec = 0.0f;
 volatile float imu_roll_rad = 0.0f; /* Góc Roll từ Mahony AHRS [rad] */
 volatile float imu_roll_vel_rad_s =
     0.0f; /* Vận tốc góc Roll từ Gyro X [rad/s] */
-float gimbal_target_roll_rad = 0.0f; /* Setpoint: giữ 0 rad = nằm ngang */
+float gimbal_target_roll_rad =
+    0.0f; /* Setpoint LOCK: góc được chốt khi vào mode */
+
+/* ===========================================================
+ * PID riêng biệt cho LOCK_MODE (TEST_MODE_DEMO_1AXIS)
+ * Hoàn toàn độc lập với PID của các Encoder-based modes.
+ * Được swap vào foc_pitch khi vào mode, khôi phục khi thoát.
+ * =========================================================== */
+PID_Handle_t pid_lock_pos;   /* Outer loop: IMU Roll angle → target_vel */
+PID_Handle_t pid_lock_vel;   /* Inner loop: Gyro X [rad/s] → Vq */
+PID_Handle_t pid_backup_pos; /* Lưu PID Position của Encoder mode */
+PID_Handle_t pid_backup_vel; /* Lưu PID Velocity của Encoder mode */
 
 float pitch_offset_a = 0.0f;
 float pitch_offset_b = 0.0f;
@@ -118,6 +129,65 @@ void SystemClock_Config(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+/* ============================================================
+ * DEMO1AXIS_Enter() — Vào LOCK_MODE (IMU-based stabilization)
+ *
+ * Thực hiện:
+ *   1. Backup PID Position/Velocity của Encoder mode
+ *   2. Khởi tạo PID LOCK riêng với tham số phù hợp plant IMU
+ *      (Kp_pos nhỏ hơn do trễ pha Mahony, Kp_vel lớn hơn vì Gyro mịn)
+ *   3. Swap PID mới vào foc_pitch (đã reset integral = 0)
+ *   4. Chốt gimbal_target_roll_rad = imu_roll_rad tại thời điểm gọi
+ *      (giữ đúng góc hiện tại, không bị giật về 0°)
+ *
+ * Gọi sau khi: IMU đã khởi tạo và có dữ liệu ổn định
+ * ============================================================ */
+#if (TEST_MODE == TEST_MODE_DEMO_1AXIS)
+static void DEMO1AXIS_Enter(void) {
+  /* Bước 1: Backup PID Encoder mode */
+  pid_backup_pos = foc_pitch.pid_pos;
+  pid_backup_vel = foc_pitch.pid_vel;
+
+  /* Bước 2: Khởi tạo PID LOCK riêng cho IMU plant
+   *   pid_pos: Kp=3.0 (nhỏ hơn 6.0 của Encoder vì Mahony có trễ pha)
+   *            Ki=0.05 (thấp để tránh windup với plant chậm)
+   *            out: ±2.0 rad/s (giới hạn vận tốc lệnh nhỏ hơn → mượt hơn)
+   *   pid_vel: Kp=0.30 (lớn hơn 0.12 vì Gyro đã mịn → dập nhiễu nhanh)
+   *            Ki=0.08 (thấp để tránh windup khi giữ góc tĩnh) */
+  PID_Init(&pid_lock_pos, 1.5f, 0.02f, 0.0f, -1.5f, 1.5f);
+  PID_Init(&pid_lock_vel, 0.1f, 0.02f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+
+  /* Bước 3: Swap PID vào FOC handle (PID_Init đã reset integral = 0) */
+  foc_pitch.pid_pos = pid_lock_pos;
+  foc_pitch.pid_vel = pid_lock_vel;
+
+  /* Bước 4: Chốt góc mục tiêu = góc IMU thực tế tại thời điểm vào mode
+   * (không cứng về 0° để tránh giật khi gimbal đang nghiêng lúc bật nguồn) */
+  gimbal_target_roll_rad = 0;
+}
+
+/* ============================================================
+ * DEMO1AXIS_Exit() — Thoát LOCK_MODE
+ *
+ * Khôi phục PID Encoder mode với double-reset để đảm bảo:
+ *   - Integral của LOCK không ảnh hưởng mode kế tiếp
+ *   - Integral stale trong backup không gây spike khi restore
+ * ============================================================ */
+static void DEMO1AXIS_Exit(void) {
+  /* Reset PID LOCK hiện tại trước khi ghi đè */
+  PID_Reset(&foc_pitch.pid_pos);
+  PID_Reset(&foc_pitch.pid_vel);
+
+  /* Khôi phục PID Encoder mode */
+  foc_pitch.pid_pos = pid_backup_pos;
+  foc_pitch.pid_vel = pid_backup_vel;
+
+  /* Reset lại PID vừa restore để xóa integral cũ trước khi vào LOCK */
+  PID_Reset(&foc_pitch.pid_pos);
+  PID_Reset(&foc_pitch.pid_vel);
+}
+#endif /* TEST_MODE == TEST_MODE_DEMO_1AXIS */
 
 /**
  * @brief  ParseCommand — Xử lý lệnh '#CMD,val1,val2,...' nhận từ GUI qua USB
@@ -372,9 +442,11 @@ int main(void) {
 
 #elif (TEST_MODE == TEST_MODE_DEMO_1AXIS)
   /* ================================================================
-   * DEMO_1AXIS: Gimbal 1 trục — Giữ Pitch nằm ngang
-   * Luồng: ICM42688 (SPI3 DMA) → Mahony AHRS → imu_pitch_rad
-   *        TIM7 (2kHz) → FOC_PositionLoop bù pitch
+   * DEMO_1AXIS: Gimbal 1 trục — LOCK_MODE (giữ góc Roll IMU cố định)
+   * Luồng: ICM42688 (SPI3 DMA) → Mahony AHRS → imu_roll_rad
+   *        Gyro X (hardware LPF 50Hz) → imu_roll_vel_rad_s
+   *        TIM7 (2kHz) → FOC_PositionLoop_IMU → SVPWM
+   * PID: Dùng PID riêng (pid_lock_pos/vel), độc lập với Encoder modes
    * ================================================================ */
 
   /* 1. Khởi tạo IMU ICM42688 qua SPI3 DMA */
@@ -384,32 +456,38 @@ int main(void) {
     icm_init_ok = 1;
     printf("[DEMO_1AXIS] ICM42688 OK! Dang hieu chuan Gyro Bias (giu im "
            "1s)...\r\n");
+    /* CalibrateGyroBias mất ~500ms → TIM6 DMA sẽ cập nhật imu_roll_rad
+     * trong thời gian này, đảm bảo imu_roll_rad có giá trị thực khi
+     * DEMO1AXIS_Enter() */
     ICM42688_CalibrateGyroBias(&imu_payload, 500);
     printf("[DEMO_1AXIS] Bias hoan tat: X=%.2f Y=%.2f Z=%.2f dps\r\n",
            imu_payload.gyro_bias_x, imu_payload.gyro_bias_y,
            imu_payload.gyro_bias_z);
-    /* 2. Khởi tạo Mahony AHRS — dùng để lấy Pitch chính xác */
+    /* 2. Khởi tạo Mahony AHRS để ước lượng Roll chính xác */
     Mahony_Init(&mahony_imu, 1.0f, 0.005f);
   } else {
     icm_init_ok = 0;
     printf("[DEMO_1AXIS] LOI khoi tao ICM42688! Code: %d\r\n", icm_status);
   }
 
-  /* 3. Khởi tạo FOC motor — chế độ Position Loop */
+  /* 3. Khởi tạo FOC motor — Position Loop (Encoder làm SVPWM, IMU làm feedback)
+   */
   foc_pitch.enabled = 1;
   FOC_AlignD(&foc_pitch, 0.5f); /* Căn chỉnh trục D */
   HAL_Delay(1000);
-  FOC_CalibrateAngle(&foc_pitch,
-                     pitch_enc.angle_rad); /* Đặt góc 0 tại vị trí hiện tại */
+  FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
   foc_pitch.position_loop_enabled = 1;
   foc_pitch.velocity_loop_enabled = 1;
   foc_pitch.current_loop_enabled = 0;
 
-  /* Setpoint mặc định: giữ payload nằm ngang (IMU roll = 0) */
-  gimbal_target_roll_rad = 0.0f;
-  target_pitch_angle = pitch_enc.angle_rad; /* Khởi động tại vị trí hiện tại */
+  /* 4. Swap PID sang LOCK_MODE và chốt góc mục tiêu = góc IMU hiện tại
+   *    (gọi sau khi IMU đã chạy ~500ms → imu_roll_rad có giá trị thực)
+   *    Đây là điểm cốt lõi: PID Encoder mode KHÔNG bị ảnh hưởng */
+  DEMO1AXIS_Enter();
+  printf("[DEMO_1AXIS] LOCK_MODE kich hoat. Target Roll: %.2f deg\r\n",
+         gimbal_target_roll_rad * 57.2957795f);
 
-  /* 4. Bật control loop 2kHz (TIM7) */
+  /* 5. Bật control loop 2kHz (TIM7) */
   HAL_TIM_Base_Start_IT(&htim7);
 #endif
 
@@ -739,8 +817,8 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
      * imu_roll_rad     : Góc Roll đầu ra từ Mahony AHRS [rad]
      * imu_roll_vel_rad_s: Vận tốc góc Gyro_X [rad/s] — dùng cho inner velocity
      * loop */
-    imu_roll_rad = - mahony_imu.roll;
-    imu_roll_vel_rad_s = - imu_payload.gyro_x_dps * 0.0174532925f;
+    imu_roll_rad = -mahony_imu.roll;
+    imu_roll_vel_rad_s = -imu_payload.gyro_x_dps * 0.0174532925f;
   }
 }
 
