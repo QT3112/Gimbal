@@ -38,9 +38,10 @@
 #define TEST_MODE_POSITION 2
 #define TEST_MODE_CURRENT 3
 #define TEST_MODE_ICM42688 4
+#define TEST_MODE_DEMO_1AXIS 5
 
-#define TEST_MODE TEST_MODE_ICM42688
-#define COMM_MODE COMM_MODE_TERMINAL_LOG
+#define TEST_MODE TEST_MODE_POSITION
+#define COMM_MODE COMM_MODE_APP_GUI
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -66,6 +67,14 @@ float e_rot[3] = {0.0f, 0.0f, 0.0f};
 volatile float target_pitch_angle = 0.0f;
 volatile float target_velocity_rad_s = 0.0f;
 float test_angle_elec = 0.0f;
+
+/* ===========================================================
+ * Biến dành riêng cho TEST_MODE_DEMO_1AXIS (Gimbal 1 trục — Roll)
+ * =========================================================== */
+volatile float imu_roll_rad = 0.0f; /* Góc Roll từ Mahony AHRS [rad] */
+volatile float imu_roll_vel_rad_s =
+    0.0f; /* Vận tốc góc Roll từ Gyro X [rad/s] */
+float gimbal_target_roll_rad = 0.0f; /* Setpoint: giữ 0 rad = nằm ngang */
 
 float pitch_offset_a = 0.0f;
 float pitch_offset_b = 0.0f;
@@ -342,8 +351,8 @@ int main(void) {
   FOC_Stop(&foc_pitch);
 
   /* Khởi tạo cảm biến ICM-42688-P qua SPI3 DMA (CS: PB15 - IMU_PAYLOAD_CS) */
-  ICM42688_Status_t icm_status = ICM42688_Init(
-      &imu_payload, &hspi3, IMU_PAYLOAD_CS_GPIO_Port, IMU_PAYLOAD_CS_Pin, NULL);
+  ICM42688_Status_t icm_status =
+      ICM42688_Init(&imu_payload, &hspi3, GPIOC, GPIO_PIN_6, NULL);
   if (icm_status == ICM42688_OK) {
     icm_init_ok = 1;
     printf("[ICM42688] Khoi tao thanh cong & bat UI LPF 50Hz! (WHO_AM_I = "
@@ -360,6 +369,48 @@ int main(void) {
     icm_init_ok = 0;
     printf("[ICM42688] Loi khoi tao! Status code: %d\r\n", icm_status);
   }
+
+#elif (TEST_MODE == TEST_MODE_DEMO_1AXIS)
+  /* ================================================================
+   * DEMO_1AXIS: Gimbal 1 trục — Giữ Pitch nằm ngang
+   * Luồng: ICM42688 (SPI3 DMA) → Mahony AHRS → imu_pitch_rad
+   *        TIM7 (2kHz) → FOC_PositionLoop bù pitch
+   * ================================================================ */
+
+  /* 1. Khởi tạo IMU ICM42688 qua SPI3 DMA */
+  ICM42688_Status_t icm_status =
+      ICM42688_Init(&imu_payload, &hspi3, GPIOC, GPIO_PIN_6, NULL);
+  if (icm_status == ICM42688_OK) {
+    icm_init_ok = 1;
+    printf("[DEMO_1AXIS] ICM42688 OK! Dang hieu chuan Gyro Bias (giu im "
+           "1s)...\r\n");
+    ICM42688_CalibrateGyroBias(&imu_payload, 500);
+    printf("[DEMO_1AXIS] Bias hoan tat: X=%.2f Y=%.2f Z=%.2f dps\r\n",
+           imu_payload.gyro_bias_x, imu_payload.gyro_bias_y,
+           imu_payload.gyro_bias_z);
+    /* 2. Khởi tạo Mahony AHRS — dùng để lấy Pitch chính xác */
+    Mahony_Init(&mahony_imu, 1.0f, 0.005f);
+  } else {
+    icm_init_ok = 0;
+    printf("[DEMO_1AXIS] LOI khoi tao ICM42688! Code: %d\r\n", icm_status);
+  }
+
+  /* 3. Khởi tạo FOC motor — chế độ Position Loop */
+  foc_pitch.enabled = 1;
+  FOC_AlignD(&foc_pitch, 0.5f); /* Căn chỉnh trục D */
+  HAL_Delay(1000);
+  FOC_CalibrateAngle(&foc_pitch,
+                     pitch_enc.angle_rad); /* Đặt góc 0 tại vị trí hiện tại */
+  foc_pitch.position_loop_enabled = 1;
+  foc_pitch.velocity_loop_enabled = 1;
+  foc_pitch.current_loop_enabled = 0;
+
+  /* Setpoint mặc định: giữ payload nằm ngang (IMU roll = 0) */
+  gimbal_target_roll_rad = 0.0f;
+  target_pitch_angle = pitch_enc.angle_rad; /* Khởi động tại vị trí hiện tại */
+
+  /* 4. Bật control loop 2kHz (TIM7) */
+  HAL_TIM_Base_Start_IT(&htim7);
 #endif
 
 #if (TEST_MODE == TEST_MODE_POSITION || TEST_MODE == TEST_MODE_VELOCITY)
@@ -515,6 +566,22 @@ int main(void) {
         printf("[ICM42688] Cam bien chua duoc khoi tao thanh cong!\r\n");
       }
     }
+#elif (TEST_MODE == TEST_MODE_DEMO_1AXIS)
+    /* Telemetry gimbal 1 trục Roll (10Hz) */
+    if (now - last_print_time >= 100) {
+      last_print_time = now;
+      if (icm_init_ok) {
+        float roll_deg = imu_roll_rad * 57.2957795f;
+        float gyro_dps = imu_roll_vel_rad_s * 57.2957795f;
+        float enc_deg = pitch_enc.angle_deg;
+        printf("[DEMO_1AXIS] Roll: %6.2f deg | GyroX: %6.2f dps "
+               "| Enc: %6.2f deg | Vq: %.3fV | Vel: %.2f rad/s\r\n",
+               roll_deg, gyro_dps, enc_deg, foc_pitch.Vq_ref,
+               foc_pitch.velocity_mech);
+      } else {
+        printf("[DEMO_1AXIS] IMU chua san sang!\r\n");
+      }
+    }
 #endif
 #endif
   }
@@ -623,8 +690,7 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
     }
   } else if (hspi->Instance == SPI3) {
     /* SPI3 DMA Burst Read ICM42688 xong (15 bytes) */
-    HAL_GPIO_WritePin(IMU_PAYLOAD_CS_GPIO_Port, IMU_PAYLOAD_CS_Pin,
-                      GPIO_PIN_SET);
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
     icm_dma_busy = 0;
 
     /* Parse 14-byte data từ icm_rx_buf (byte 0 là dummy/cmd) */
@@ -668,6 +734,13 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
     Quaternion_t q_meas_3d = {mahony_imu.q0, mahony_imu.q1, mahony_imu.q2,
                               mahony_imu.q3};
     Quaternion_ComputeError(&q_target_3d, &q_meas_3d, e_rot);
+
+    /* Cập nhật biến Roll cho DEMO_1AXIS stabilization loop
+     * imu_roll_rad     : Góc Roll đầu ra từ Mahony AHRS [rad]
+     * imu_roll_vel_rad_s: Vận tốc góc Gyro_X [rad/s] — dùng cho inner velocity
+     * loop */
+    imu_roll_rad = - mahony_imu.roll;
+    imu_roll_vel_rad_s = - imu_payload.gyro_x_dps * 0.0174532925f;
   }
 }
 
@@ -687,14 +760,25 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
     /* TIM6: Kích hoạt SPI3 DMA đọc Burst 15-byte cho ICM42688 (SPI3) */
     if (!icm_dma_busy && icm_init_ok) {
       icm_dma_busy = 1;
-      HAL_GPIO_WritePin(IMU_PAYLOAD_CS_GPIO_Port, IMU_PAYLOAD_CS_Pin,
-                        GPIO_PIN_RESET);
+      HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
       HAL_SPI_TransmitReceive_DMA(&hspi3, icm_tx_buf, icm_rx_buf, 15);
     }
   } else if (htim->Instance == TIM7) {
     /* Chạy Vòng lặp kín theo chế độ hiện tại (không bị nghẽn I/O) */
     if (g_mode == TEST_MODE_VELOCITY) {
       FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, target_velocity_rad_s);
+    } else if (g_mode == TEST_MODE_DEMO_1AXIS) {
+      /* === GIMBAL 1-AXIS ROLL STABILIZATION LOOP ===
+       * Outer loop : IMU Roll angle  → Position PID  → target_vel
+       * Inner loop : IMU Gyro X      → Velocity PID  → Vq (SVPWM)
+       * Setpoint   : gimbal_target_roll_rad = 0 rad (nằm ngang)
+       * Nếu motor quay sai chiều, đổi dấu imu_roll_vel_rad_s và imu_roll_rad
+       */
+      FOC_PositionLoop_IMU(
+          &foc_pitch, pitch_enc.angle_rad, /* Góc cơ học Encoder — dùng SVPWM */
+          imu_roll_rad,       /* Góc Roll Mahony — Outer position loop */
+          imu_roll_vel_rad_s, /* Gyro X [rad/s]  — Inner velocity loop */
+          gimbal_target_roll_rad); /* Setpoint: 0 rad */
     } else {
       FOC_PositionLoop(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
     }

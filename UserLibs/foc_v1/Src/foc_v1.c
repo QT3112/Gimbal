@@ -479,3 +479,60 @@ void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq)
 
     FOC_SVPWM(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
 }
+
+
+
+
+
+/* ==========================================================================
+ * IMU-based Control Loops
+ * Vòng lặp điều khiển dùng góc tuyệt đối và vận tốc góc từ IMU cảm biến
+ * ========================================================================== */
+
+void FOC_VelocityLoop_IMU(FOC_Handle_t *hfoc, float angle_mech_rad,
+                          float imu_vel_rad_s, float target_vel_rad_s)
+{
+    if (!hfoc->enabled || !hfoc->velocity_loop_enabled) return;
+
+    /* --- Bước 1: Cập nhật vận tốc từ IMU Gyroscope (không tính vi phân Encoder) --- */
+    hfoc->prev_velocity_mech = hfoc->velocity_mech;
+    hfoc->velocity_mech_raw  = imu_vel_rad_s;
+    hfoc->velocity_mech      = imu_vel_rad_s; /* Gyro đã có LPF 50Hz hardware — không cần LPF lại */
+
+    /* --- Bước 2: Cập nhật góc điện từ Encoder (vẫn dùng Encoder cho SVPWM) --- */
+    FOC_SetAngle(hfoc, angle_mech_rad);
+
+    /* --- Bước 3: PID vòng tốc độ — phản hồi từ IMU --- */
+    float vel_error = target_vel_rad_s - imu_vel_rad_s;
+    float pid_out   = PID_Update(&hfoc->pid_vel, vel_error, hfoc->Ts);
+
+    if (hfoc->current_loop_enabled) {
+        hfoc->Iq_ref = _clamp(pid_out, -hfoc->current_limit, hfoc->current_limit);
+        hfoc->Id_ref = 0.0f;
+    } else {
+        hfoc->Vq_ref = pid_out;
+        hfoc->Vd_ref = 0.0f;
+        FOC_SVPWM(hfoc, hfoc->Vd_ref, hfoc->Vq_ref, hfoc->angle_elec);
+    }
+}
+
+
+void FOC_PositionLoop_IMU(FOC_Handle_t *hfoc, float angle_mech_rad,
+                          float imu_angle_rad, float imu_vel_rad_s,
+                          float target_angle_rad)
+{
+    if (!hfoc->enabled || !hfoc->position_loop_enabled) return;
+
+    /* --- Bước 1: Sài số góc IMU tuyệt đối (không wrap-around vì Euler bị giới hạn +-pi/2) --- */
+    float pos_error = target_angle_rad - imu_angle_rad;
+
+    /* Wrap-around áp dụng cho Yăw (có thể qua 0/2pi), Roll và Pitch giới hạn +-pi rất rộng */
+    if (pos_error >  FOC_PI) pos_error -= FOC_TWO_PI;
+    if (pos_error < -FOC_PI) pos_error += FOC_TWO_PI;
+
+    /* --- Bước 2: PID vòng vị trí (Outer Loop) — xuất ra vận tốc mục tiêu --- */
+    float target_vel = PID_Update(&hfoc->pid_pos, pos_error, hfoc->Ts);
+
+    /* --- Bước 3: Vòng lặp tốc độ (Inner Loop) — dùng vận tốc góc IMU để giảm chấn --- */
+    FOC_VelocityLoop_IMU(hfoc, angle_mech_rad, imu_vel_rad_s, target_vel);
+}

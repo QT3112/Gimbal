@@ -144,8 +144,15 @@ void FOC_UpdateCurrentLoopADC(FOC_Handle_t *hfoc, uint32_t raw_adc_a, uint32_t r
 
 void FOC_CurrentLoop(FOC_Handle_t *hfoc, float Ia, float Ib);
 void FOC_VelocityLoop(FOC_Handle_t *hfoc, float angle_mech_rad, float target_vel_rad_s);
-void FOC_PositionLoop(FOC_Handle_t *hfoc, float angle_mech_rad, float target_angle_rad);           
+void FOC_PositionLoop(FOC_Handle_t *hfoc, float angle_mech_rad, float target_angle_rad);
 void FOC_RunOpenLoop(FOC_Handle_t *hfoc, float velocity_elec_rad_s, float Vq);
+
+/* --- IMU-based Control Loops (dùng Gyro làm phản hồi vận tốc) --- */
+void FOC_VelocityLoop_IMU(FOC_Handle_t *hfoc, float angle_mech_rad,
+                          float imu_vel_rad_s, float target_vel_rad_s);
+void FOC_PositionLoop_IMU(FOC_Handle_t *hfoc, float angle_mech_rad,
+                          float imu_angle_rad, float imu_vel_rad_s,
+                          float target_angle_rad);
 
 #ifdef __cplusplus
 }
