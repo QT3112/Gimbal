@@ -53,7 +53,7 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-float voltage_limit = 0.05f;
+float voltage_limit = 0.5f;
 volatile float theta = 0.0f;
 float velocity = 5.0f; // rad/s điện
 float Ts = 0.0001f;    // 100us
@@ -166,7 +166,7 @@ int main(void)
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1) {
-    theta += 0.02f;
+    theta += 0.1f;
 
     if (theta > 2.0f * PI)
       theta -= 2.0f * PI;
