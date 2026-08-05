@@ -149,16 +149,11 @@ static void DEMO1AXIS_Enter(void) {
   pid_backup_pos = foc_pitch.pid_pos;
   pid_backup_vel = foc_pitch.pid_vel;
 
-  /* Bước 2: Khởi tạo PID LOCK riêng cho IMU plant
-   *   pid_pos: Kp=3.0 (nhỏ hơn 6.0 của Encoder vì Mahony có trễ pha)
-   *            Ki=0.05 (thấp để tránh windup với plant chậm)
-   *            out: ±2.0 rad/s (giới hạn vận tốc lệnh nhỏ hơn → mượt hơn)
-   *   pid_vel: Kp=0.30 (lớn hơn 0.12 vì Gyro đã mịn → dập nhiễu nhanh)
-   *            Ki=0.08 (thấp để tránh windup khi giữ góc tĩnh) */
-  PID_Init(&pid_lock_pos, 1.5f, 0.02f, 0.0f, -1.5f, 1.5f);
-  PID_Init(&pid_lock_vel, 0.1f, 0.02f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  /* Bước 2: Khởi tạo PID LOCK riêng cho IMU plant */
+  PID_Init(&pid_lock_pos, 4.5f, 0.0f, 0.0f, -1.5f, 1.5f);
+  PID_Init(&pid_lock_vel, 0.45f, 0.0f, 0.0f, -1.5f, 1.5f);
 
-  /* Bước 3: Swap PID vào FOC handle (PID_Init đã reset integral = 0) */
+  /* Bước 3: Swap PID vào FOC handle */
   foc_pitch.pid_pos = pid_lock_pos;
   foc_pitch.pid_vel = pid_lock_vel;
 
@@ -649,13 +644,11 @@ int main(void) {
     if (now - last_print_time >= 100) {
       last_print_time = now;
       if (icm_init_ok) {
-        float roll_deg = imu_roll_rad * 57.2957795f;
-        float gyro_dps = imu_roll_vel_rad_s * 57.2957795f;
-        float enc_deg = pitch_enc.angle_deg;
-        printf("[DEMO_1AXIS] Roll: %6.2f deg | GyroX: %6.2f dps "
-               "| Enc: %6.2f deg | Vq: %.3fV | Vel: %.2f rad/s\r\n",
-               roll_deg, gyro_dps, enc_deg, foc_pitch.Vq_ref,
-               foc_pitch.velocity_mech);
+        printf("[DEMO_1AXIS] Roll: %6.2f deg | GyroX: %6.2f dps | Enc: "
+               "%6.2f deg | Vq: %.3fV | Vel: %.2f rad/s | Raw: 0x%04X\r\n",
+               imu_roll_rad * 57.2957795131f, imu_payload.gyro_x_dps,
+               pitch_enc.angle_deg, foc_pitch.Vq_ref, foc_pitch.velocity_mech,
+               log_enc_raw);
       } else {
         printf("[DEMO_1AXIS] IMU chua san sang!\r\n");
       }
@@ -737,35 +730,7 @@ volatile uint8_t icm_dma_busy = 0;
 
 void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
   if (hspi->Instance == SPI1) {
-    HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
-
-    if (enc_phase == 0) {
-      /* Phase 0 xong: vừa gửi READ ANGLE, bỏ qua dữ liệu nhận về
-       * → Ngay lập tức bắt đầu Phase 1 để lấy dữ liệu thực */
-      enc_phase = 1;
-      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin,
-                        GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t *)&enc_tx_nop_cmd,
-                                  (uint8_t *)&enc_rx_angle, 1);
-    } else {
-      /* Phase 1 xong: enc_rx_angle chứa góc thực của frame trước */
-      enc_phase = 0;
-      enc_busy = 0;
-
-      uint16_t data = enc_rx_angle;
-      log_enc_raw = data; /* Lưu raw để debug */
-
-      if (AS5048A_CheckParity(data)) {
-        /* Chỉ kiểm tra parity - bỏ qua EF flag vì nó được set do lỗi
-         * khởi động SPI, không phải lỗi đo đạc góc. Dữ liệu góc
-         * trong bits[13:0] hợp lệ nếu parity đúng. */
-        pitch_enc.raw_angle = data & AS5048A_DATA_MASK;
-        pitch_enc.angle_rad =
-            (float)pitch_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
-        pitch_enc.angle_deg =
-            (float)pitch_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
-      }
-    }
+    /* Đã chuyển sang dùng Polling trong TIM6 cho hspi1 */
   } else if (hspi->Instance == SPI3) {
     /* SPI3 DMA Burst Read ICM42688 xong (15 bytes) */
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
@@ -822,41 +787,91 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
   }
 }
 
+/* Hàm bắt lỗi SPI: nếu có nhiễu gây Overrun, HAL sẽ gọi hàm này.
+ * Phải reset cờ busy để TIM6 có thể gọi lại vòng mới */
+void HAL_SPI_ErrorCallback(SPI_HandleTypeDef *hspi) {
+  if (hspi->Instance == SPI1) {
+    HAL_SPI_Abort(&hspi1); /* Ép SPI1 thoát khỏi trạng thái lỗi/bận */
+    enc_busy = 0;
+    enc_phase = 0;
+    HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
+  } else if (hspi->Instance == SPI3) {
+    HAL_SPI_Abort(&hspi3);
+    icm_dma_busy = 0;
+    HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
+  }
+}
+
 /* Hàm ngắt Timer định kỳ: TIM6 (1kHz I/O Trigger) & TIM7 (2kHz Central Control
  * Loop) */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   if (htim->Instance == TIM6) {
-    /* TIM6: Khởi động Phase 0 của 2-frame AS5048A pipeline (SPI1) */
+    /* CHUYỂN SANG POLLING: Đọc AS5048A trực tiếp trong ngắt TIM6 (tốn ~10us)
+     * Để loại trừ hoàn toàn các lỗi do DMA bị kẹt, OVR error không được reset,
+     * hoặc bộ nhớ không cập nhật. */
     if (!enc_busy) {
       enc_busy = 1;
-      enc_phase = 0;
+      uint16_t rx_dummy, rx_angle;
+
+      /* Phase 0: Gửi lệnh READ ANGLE (0xFFFF) */
       HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin,
                         GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive_DMA(&hspi1, (uint8_t *)&enc_tx_read_cmd,
-                                  (uint8_t *)&enc_rx_dummy, 1);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd,
+                              (uint8_t *)&rx_dummy, 1, 2);
+      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
+      /* Delay > 350ns (tCSn) */
+      for (volatile int i = 0; i < 200; i++) {
+      }
+
+      /* Phase 1: Gửi lệnh NOP (0xC000) để clock ra dữ liệu của Phase 0 */
+      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin,
+                        GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd,
+                              (uint8_t *)&rx_angle, 1, 2);
+      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
+
+      log_enc_raw = rx_angle;
+      if (AS5048A_CheckParity(rx_angle)) {
+        pitch_enc.raw_angle = rx_angle & AS5048A_DATA_MASK;
+        pitch_enc.angle_rad =
+            (float)pitch_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
+        pitch_enc.angle_deg =
+            (float)pitch_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
+      }
+      enc_busy = 0;
     }
     /* TIM6: Kích hoạt SPI3 DMA đọc Burst 15-byte cho ICM42688 (SPI3) */
     if (!icm_dma_busy && icm_init_ok) {
       icm_dma_busy = 1;
       HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive_DMA(&hspi3, icm_tx_buf, icm_rx_buf, 15);
+      if (HAL_SPI_TransmitReceive_DMA(&hspi3, icm_tx_buf, icm_rx_buf, 15) !=
+          HAL_OK) {
+        icm_dma_busy = 0;
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_6, GPIO_PIN_SET);
+      }
     }
   } else if (htim->Instance == TIM7) {
     /* Chạy Vòng lặp kín theo chế độ hiện tại (không bị nghẽn I/O) */
     if (g_mode == TEST_MODE_VELOCITY) {
       FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, target_velocity_rad_s);
     } else if (g_mode == TEST_MODE_DEMO_1AXIS) {
-      /* === GIMBAL 1-AXIS ROLL STABILIZATION LOOP ===
-       * Outer loop : IMU Roll angle  → Position PID  → target_vel
-       * Inner loop : IMU Gyro X      → Velocity PID  → Vq (SVPWM)
-       * Setpoint   : gimbal_target_roll_rad = 0 rad (nằm ngang)
-       * Nếu motor quay sai chiều, đổi dấu imu_roll_vel_rad_s và imu_roll_rad
-       */
-      FOC_PositionLoop_IMU(
-          &foc_pitch, pitch_enc.angle_rad, /* Góc cơ học Encoder — dùng SVPWM */
-          imu_roll_rad,       /* Góc Roll Mahony — Outer position loop */
-          imu_roll_vel_rad_s, /* Gyro X [rad/s]  — Inner velocity loop */
-          gimbal_target_roll_rad); /* Setpoint: 0 rad */
+      /* 1. Sai số góc IMU tuyệt đối */
+      float imu_error = gimbal_target_roll_rad - imu_roll_rad;
+      if (imu_error > 3.14159265359f)
+        imu_error -= 6.28318530718f;
+      if (imu_error < -3.14159265359f)
+        imu_error += 6.28318530718f;
+
+      /* 2. Position PID -> Lệnh vận tốc cơ học (rad/s) */
+      float target_vel =
+          PID_Update(&foc_pitch.pid_pos, imu_error, foc_pitch.Ts);
+
+      /* 3. Gọi FOC_VelocityLoop
+       * - Tự tính velocity_mech = d(pitch_enc.angle_rad) / dt
+       * - Tự cập nhật góc điện elec_angle = pitch_enc.angle_rad * pole_pairs
+       * - Tính Vq = pid_vel(target_vel - velocity_mech)
+       * - Gọi FOC_SVPWM sinh từ trường bám theo rotor (closeloop hoàn toàn) */
+      FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, target_vel);
     } else {
       FOC_PositionLoop(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
     }
