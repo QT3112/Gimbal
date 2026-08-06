@@ -41,7 +41,7 @@
 #define TEST_MODE_DEMO_1AXIS 5
 
 #define TEST_MODE TEST_MODE_DEMO_1AXIS
-#define COMM_MODE COMM_MODE_TERMINAL_LOG
+#define COMM_MODE COMM_MODE_APP_GUI
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -150,12 +150,13 @@ static void DEMO1AXIS_Enter(void) {
   pid_backup_vel = foc_pitch.pid_vel;
 
   /* Bước 2: Khởi tạo PID LOCK riêng cho IMU plant */
-  PID_Init(&pid_lock_pos, 4.5f, 0.0f, 0.0f, -1.5f, 1.5f);
-  PID_Init(&pid_lock_vel, 0.45f, 0.0f, 0.0f, -1.5f, 1.5f);
+  PID_Init(&pid_lock_pos, 4.0f, 0.5f, 0.1f, -1.5f, 1.5f);
+  PID_Init(&pid_lock_vel, 0.2f, 3.0f, 0.0f, -1.5f, 1.5f);
 
   /* Bước 3: Swap PID vào FOC handle */
   foc_pitch.pid_pos = pid_lock_pos;
   foc_pitch.pid_vel = pid_lock_vel;
+  FOC_SetLPF_Vel(&foc_pitch, 0.85f); /* Giảm độ trễ cho loop vận tốc IMU */
 
   /* Bước 4: Chốt góc mục tiêu = góc IMU thực tế tại thời điểm vào mode
    * (không cứng về 0° để tránh giật khi gimbal đang nghiêng lúc bật nguồn) */
@@ -181,6 +182,8 @@ static void DEMO1AXIS_Exit(void) {
   /* Reset lại PID vừa restore để xóa integral cũ trước khi vào LOCK */
   PID_Reset(&foc_pitch.pid_pos);
   PID_Reset(&foc_pitch.pid_vel);
+
+  FOC_SetLPF_Vel(&foc_pitch, 0.96f); /* Trả lại LPF cho mode cũ */
 }
 #endif /* TEST_MODE == TEST_MODE_DEMO_1AXIS */
 

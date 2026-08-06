@@ -149,27 +149,66 @@ class TelemetryPanel(QWidget):
         pw.addWidget(self.pw_err,  2)
         pw.addWidget(self.pw_vq_p, 2)
 
-        # Stack cả hai widget — chỉ show 1 cái
+        # Plot area — DEMO mode
+        self._demo_widget = QWidget()
+        dw = QVBoxLayout(self._demo_widget)
+        dw.setSpacing(4)
+        self.pw_demo_pos = _make_plot("Position Response (IMU Roll vs Target)", "deg")
+        self.pw_demo_vel = _make_plot("Velocity Response (Gyro vs Enc)", "rad/s | dps")
+        self.pw_demo_vq  = _make_plot("Vq Output Voltage", "V")
+        
+        self.c_d_roll = self.pw_demo_pos.plot(pen=pg.mkPen(C_ENC, width=2.5), name="Actual (deg)")
+        self.pw_demo_pos.addLine(y=0, pen=pg.mkPen(C_TARGET, width=2, style=Qt.PenStyle.DashLine))
+        
+        self.c_d_gyro = self.pw_demo_vel.plot(pen=pg.mkPen(C_FILT, width=2.0), name="GyroX (dps)")
+        self.c_d_vel  = self.pw_demo_vel.plot(pen=pg.mkPen(C_RAW, width=1.5), name="Enc Vel (rad/s)")
+        
+        self.c_d_vq = self.pw_demo_vq.plot(pen=pg.mkPen(C_VQ, width=2.0), name="Vq (V)")
+        for lim in (1.5, -1.5):
+            self.pw_demo_vq.addLine(y=lim, pen=pg.mkPen('#FF3333', width=1, style=Qt.PenStyle.DashLine))
+            
+        dw.addWidget(self.pw_demo_pos, 3)
+        dw.addWidget(self.pw_demo_vel, 2)
+        dw.addWidget(self.pw_demo_vq, 2)
+
+        # Stack cả ba widget — chỉ show 1 cái
         root.addWidget(self._vel_widget, 1)
         root.addWidget(self._pos_widget, 1)
+        root.addWidget(self._demo_widget, 1)
         self._vel_widget.setVisible(False)
         self._pos_widget.setVisible(True)
+        self._demo_widget.setVisible(False)
 
     def _show_mode(self, mode: str):
         if mode == self._last_mode:
             return
         self._last_mode = mode
         is_vel = (mode == 'VEL')
+        is_pos = (mode == 'POS')
+        is_demo = (mode == 'DEMO')
         self._vel_widget.setVisible(is_vel)
-        self._pos_widget.setVisible(not is_vel)
-        color = '#4FC3F7' if is_vel else '#81C784'
-        self.mode_lbl.setText(f"Mode: {'VELOCITY' if is_vel else 'POSITION'}")
+        self._pos_widget.setVisible(is_pos)
+        self._demo_widget.setVisible(is_demo)
+        
+        if is_vel:
+            color = '#4FC3F7'
+            mode_str = 'VELOCITY'
+            tgt_lbl = 'Target Vel'
+        elif is_pos:
+            color = '#81C784'
+            mode_str = 'POSITION'
+            tgt_lbl = 'Target Pos'
+        else:
+            color = '#FF8A65'
+            mode_str = 'DEMO 1-AXIS'
+            tgt_lbl = 'Target Roll'
+            
+        self.mode_lbl.setText(f"Mode: {mode_str}")
         self.mode_lbl.setStyleSheet(
             f"color: {color}; background: #1A1A2E; border-radius:4px;"
             f" padding: 3px 10px; font-weight:bold;")
         # Cập nhật label card target
-        self.card_target.findChildren(QLabel)[0].setText(
-            "Target Vel" if is_vel else "Target Pos")
+        self.card_target.findChildren(QLabel)[0].setText(tgt_lbl)
 
     def _plot(self, curve, t, d):
         n = min(len(t), len(d))
@@ -201,7 +240,7 @@ class TelemetryPanel(QWidget):
             if len(enc): self.card_enc.update(enc[-1], "{:.1f}")
             if len(tgt) and len(flt):
                 self.card_err.update(tgt[-1] - flt[-1])
-        else:
+        elif mode == 'POS':
             ptgt = self.store.get(self.store.pos_target)
             penc = self.store.get(self.store.enc_pos)
             perr = self.store.get(self.store.pos_err)
@@ -217,3 +256,21 @@ class TelemetryPanel(QWidget):
             if len(pvq):  self.card_vq.update(pvq[-1])
             if len(penc): self.card_enc.update(penc[-1], "{:.1f}")
             if len(perr): self.card_err.update(perr[-1], "{:+.1f} °")
+            
+        elif mode == 'DEMO':
+            droll = self.store.get(self.store.demo_roll)
+            dgyro = self.store.get(self.store.demo_gyro)
+            denc  = self.store.get(self.store.demo_enc)
+            dvq   = self.store.get(self.store.demo_vq)
+            dvel  = self.store.get(self.store.demo_vel)
+            
+            self._plot(self.c_d_roll, t, droll)
+            self._plot(self.c_d_gyro, t, dgyro)
+            self._plot(self.c_d_vel,  t, dvel)
+            self._plot(self.c_d_vq,   t, dvq)
+            
+            self.card_target.update(0.0, "{:.1f} °")
+            if len(dgyro): self.card_filt.update(dgyro[-1], "{:.1f}")
+            if len(dvq):   self.card_vq.update(dvq[-1])
+            if len(denc):  self.card_enc.update(denc[-1], "{:.1f}")
+            if len(droll): self.card_err.update(droll[-1], "{:+.1f} °")

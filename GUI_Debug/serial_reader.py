@@ -86,8 +86,8 @@ class SerialReaderThread(QThread):
                 ts = time.monotonic()
                 self.raw_line.emit(line)
 
-                # Chỉ parse $ telemetry vào store
-                if line.startswith('$'):
+                # Parse $ telemetry hoặc [DEMO_1AXIS] vào store
+                if line.startswith('$') or line.startswith('[DEMO_1AXIS]'):
                     self.store.push_line(line, ts)
                     self.new_frame.emit()
 

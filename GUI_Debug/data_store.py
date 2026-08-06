@@ -39,6 +39,13 @@ class FOCDataStore:
         self.vq_pos       = deque(maxlen=size)
         self.vel_filt_pos = deque(maxlen=size)
 
+        # --- DEMO: Demo 1 Axis mode ---
+        self.demo_roll    = deque(maxlen=size)
+        self.demo_gyro    = deque(maxlen=size)
+        self.demo_enc     = deque(maxlen=size)
+        self.demo_vq      = deque(maxlen=size)
+        self.demo_vel     = deque(maxlen=size)
+
         # --- Chế độ hiện tại ---
         self.current_mode = 'POS'
 
@@ -84,6 +91,18 @@ class FOCDataStore:
                 self.pos_err.append(vals[2])
                 self.vq_pos.append(vals[3])
                 self.vel_filt_pos.append(vals[4])
+                
+            elif tag == '[DEMO_1AXIS]' and 'Roll:' in line:
+                import re
+                match = re.search(r"Roll:\s*([-\d.]+).*?GyroX:\s*([-\d.]+).*?Enc:\s*([-\d.]+).*?Vq:\s*([-\d.]+).*?Vel:\s*([-\d.]+)", line)
+                if match:
+                    self._push_time(timestamp)
+                    self.current_mode = 'DEMO'
+                    self.demo_roll.append(float(match.group(1)))
+                    self.demo_gyro.append(float(match.group(2)))
+                    self.demo_enc.append(float(match.group(3)))
+                    self.demo_vq.append(float(match.group(4)))
+                    self.demo_vel.append(float(match.group(5)))
 
     # ------------------------------------------------------------------
     def get(self, channel: deque) -> np.ndarray:
