@@ -41,8 +41,26 @@
 #define TEST_MODE_DEMO_1AXIS 5
 #define TEST_MODE_READ_ENCODER 6
 
-#define TEST_MODE TEST_MODE_READ_ENCODER
+#define TEST_MODE TEST_MODE_ICM42688
 #define COMM_MODE COMM_MODE_TERMINAL_LOG
+
+/* === Giới hạn góc mềm (Soft Limit) cho từng trục - đơn vị: độ === */
+#define PITCH_MIN_DEG   15.0f
+#define PITCH_MAX_DEG  280.0f
+#define ROLL_MIN_DEG    90.0f
+#define ROLL_MAX_DEG   265.0f
+
+/* Chuyển sang Radian để dùng trong FOC (nhân hệ số PI/180) */
+#define DEG2RAD(d)  ((d) * (3.14159265f / 180.0f))
+
+/* Vị trí giữ cố định (Setpoint) */
+#define PITCH_SETPOINT_DEG  220.0f
+#define ROLL_SETPOINT_DEG   185.0f
+#define YAW_SETPOINT_DEG    180.0f
+
+/* === Giới hạn góc mềm trục Yaw === */
+#define YAW_MIN_DEG   65.0f
+#define YAW_MAX_DEG  255.0f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,6 +76,8 @@ AS5048A_Handle_t pitch_enc;
 AS5048A_Handle_t roll_enc;
 AS5048A_Handle_t yaw_enc;
 FOC_Handle_t foc_pitch;
+FOC_Handle_t foc_roll;
+FOC_Handle_t foc_yaw;
 
 ICM42688_Handle_t imu_payload;
 MahonyFilter_t mahony_imu;
@@ -68,6 +88,8 @@ float e_rot[3] = {0.0f, 0.0f, 0.0f};
 
 /* Biến lưu góc và vận tốc mục tiêu (rad & rad/s) */
 volatile float target_pitch_angle = 0.0f;
+volatile float target_roll_angle = 0.0f;
+volatile float target_yaw_angle = 0.0f;
 volatile float target_velocity_rad_s = 0.0f;
 float test_angle_elec = 0.0f;
 
@@ -363,12 +385,12 @@ int main(void) {
   /* 1. Khởi tạo cảm biến góc AS5048A Encoder */
 
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
-  
+
   // Khởi tạo Handle
   AS5048A_Init(&pitch_enc, &hspi1, ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin);
   AS5048A_Init(&roll_enc, &hspi1, ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin);
   AS5048A_Init(&yaw_enc, &hspi1, ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin);
-  
+
   // Kéo High toàn bộ CS mặc định
   HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
   HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_SET);
@@ -387,8 +409,33 @@ int main(void) {
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3); /* PA10 -> Phase C */
 
   FOC_SetPID_POS(&foc_pitch, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
-  FOC_SetPID_VEL(&foc_pitch, 0.12f, 0.4f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetPID_VEL(&foc_pitch, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
   FOC_SetLPF_Vel(&foc_pitch, 0.96f);
+
+  /* Khởi tạo FOC cho trục Roll (Dùng TIM8 theo xác nhận của phần cứng) */
+  FOC_Init(&foc_roll, &htim8, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+           PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, VOLTAGE_LIMIT, 1.0f, 0.0005f,
+           0.00005f);
+  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);
+
+  FOC_SetPID_POS(&foc_roll, 8.0f, 0.4f, 0.0f, -4.0f,
+                 4.0f); /* Kp cao hơn một chút cho Roll */
+  FOC_SetPID_VEL(&foc_roll, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetLPF_Vel(&foc_roll, 0.96f);
+
+  /* Khởi tạo FOC cho trục Yaw (Dùng TIM3) */
+  FOC_Init(&foc_yaw, &htim3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+           PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, VOLTAGE_LIMIT, 1.0f, 0.0005f,
+           0.00005f);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+
+  FOC_SetPID_POS(&foc_yaw, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
+  FOC_SetPID_VEL(&foc_yaw, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetLPF_Vel(&foc_yaw, 0.96f);
 
   /* Cấu hình Vòng lặp Hở (Open Loop Voltage = 0.30V) để test chiều dòng */
   FOC_SetPID_D(&foc_pitch, 0.0f, 0.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
@@ -399,13 +446,30 @@ int main(void) {
 
 #if (TEST_MODE == TEST_MODE_POSITION)
   foc_pitch.enabled = 1;
-  FOC_AlignD(&foc_pitch, 0.5f);
+  foc_roll.enabled = 1;
+  foc_yaw.enabled = 1;
+
+  /* Căn chỉnh trục D cho cả 3 motor (Dùng điện áp đủ lớn để ép chặt motor về 0) */
+  FOC_AlignD(&foc_pitch, 1.0f);
+  FOC_AlignD(&foc_roll, 1.0f);
+  FOC_AlignD(&foc_yaw, 1.0f);
   HAL_Delay(1000);
+
+  /* Lưu điểm Zero Offset cho cả 3 trục */
   FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
-  foc_pitch.position_loop_enabled = 1;
-  foc_pitch.velocity_loop_enabled = 1;
-  foc_pitch.current_loop_enabled = 0;
-  target_pitch_angle = pitch_enc.angle_rad;
+  FOC_CalibrateAngle(&foc_roll,  roll_enc.angle_rad);
+  FOC_CalibrateAngle(&foc_yaw,   yaw_enc.angle_rad);
+
+  /* Khởi động an toàn FOC cho cả 3 trục */
+  FOC_Start(&foc_pitch, pitch_enc.angle_rad);
+  FOC_Start(&foc_roll,  roll_enc.angle_rad);
+  FOC_Start(&foc_yaw,   yaw_enc.angle_rad);
+
+  /* Chốt mục tiêu cả 3 trục */
+  target_pitch_angle = DEG2RAD(PITCH_SETPOINT_DEG);
+  target_roll_angle  = DEG2RAD(ROLL_SETPOINT_DEG);
+  target_yaw_angle   = DEG2RAD(YAW_SETPOINT_DEG);
+
   HAL_TIM_Base_Start_IT(&htim7);
 #elif (TEST_MODE == TEST_MODE_VELOCITY)
   foc_pitch.enabled = 1;
@@ -581,35 +645,45 @@ int main(void) {
     }
 #elif (COMM_MODE == COMM_MODE_TERMINAL_LOG)
 #if (TEST_MODE == TEST_MODE_POSITION)
-    /* Kịch bản test step response vị trí tự động mỗi 4 giây: 0 rad ->
-    +90 deg
-     * -> +180 deg -> -90 deg */
+    /* --- Bỏ qua kịch bản tự động xoay góc (Step Response) để giữ nguyên 1 góc
+     * cố định --- */
+    /*
     if (now - last_step_time >= 4000) {
       last_step_time = now;
       step_state = (step_state + 1) % 4;
       if (step_state == 0) {
-        target_pitch_angle = 0.0f; /* 0 deg */
+        target_pitch_angle = 0.0f;
+        target_roll_angle = 0.0f;
       } else if (step_state == 1) {
-        target_pitch_angle = 1.5707963f; /* +90 deg (+pi/2 rad) */
-      } else if (step_state == 2) {
-        target_pitch_angle = 3.14159265f; /* +180 deg (+pi rad) */
-      } else if (step_state == 3) {
-        target_pitch_angle = -1.5707963f; /* -90 deg (-pi/2 rad) */
-      }
+        target_pitch_angle = 1.5707963f;
+        target_roll_angle = 1.5707963f;
+      } ...
     }
+    */
 
-    float target_pos_deg = target_pitch_angle * (180.0f / 3.14159265f);
-    float err_pos_deg = target_pos_deg - pitch_enc.angle_deg;
-    while (err_pos_deg > 180.0f)
-      err_pos_deg -= 360.0f;
-    while (err_pos_deg < -180.0f)
-      err_pos_deg += 360.0f;
+    /* Quy đổi góc mục tiêu ra độ để hiển thị */
+    float target_pitch_deg = target_pitch_angle * (180.0f / 3.14159265f);
+    float target_roll_deg  = target_roll_angle  * (180.0f / 3.14159265f);
+    float target_yaw_deg   = target_yaw_angle   * (180.0f / 3.14159265f);
 
-    /* Print Telemetry (10Hz) để giám sát đáp ứng vị trí */
-    printf("TargetPos: %.1f deg | Enc: %.1f deg | Err: %.1f deg | Vq: %.2fV | "
-           "VelFilt: %.2f\r\n",
-           target_pos_deg, pitch_enc.angle_deg, err_pos_deg, foc_pitch.Vq_ref,
-           foc_pitch.velocity_mech);
+    float err_pitch_deg = target_pitch_deg - pitch_enc.angle_deg;
+    float err_roll_deg  = target_roll_deg  - roll_enc.angle_deg;
+    float err_yaw_deg   = target_yaw_deg   - yaw_enc.angle_deg;
+
+    while (err_pitch_deg > 180.0f)  err_pitch_deg -= 360.0f;
+    while (err_pitch_deg < -180.0f) err_pitch_deg += 360.0f;
+    while (err_roll_deg  > 180.0f)  err_roll_deg  -= 360.0f;
+    while (err_roll_deg  < -180.0f) err_roll_deg  += 360.0f;
+    while (err_yaw_deg   > 180.0f)  err_yaw_deg   -= 360.0f;
+    while (err_yaw_deg   < -180.0f) err_yaw_deg   += 360.0f;
+
+    /* Print Telemetry (10Hz) - cả 3 trục */
+    printf("[P] Tgt:%5.1f Act:%5.1f Err:%5.1f Vq:%5.2f | "
+           "[R] Tgt:%5.1f Act:%5.1f Err:%5.1f Vq:%5.2f | "
+           "[Y] Tgt:%5.1f Act:%5.1f Err:%5.1f Vq:%5.2f\r\n",
+           target_pitch_deg, pitch_enc.angle_deg, err_pitch_deg, foc_pitch.Vq_ref,
+           target_roll_deg,  roll_enc.angle_deg,  err_roll_deg,  foc_roll.Vq_ref,
+           target_yaw_deg,   yaw_enc.angle_deg,   err_yaw_deg,   foc_yaw.Vq_ref);
 
 #elif (TEST_MODE == TEST_MODE_VELOCITY)
     /* Kịch bản test step response vận tốc tự động mỗi 3 giây */
@@ -841,38 +915,48 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
       uint16_t rx_dummy;
       uint16_t rx_angle_pitch, rx_angle_roll, rx_angle_yaw;
 
-      /* === Phase 0 (Pipeline): Gửi lệnh READ ANGLE cho cả 3 trục liên tiếp === */
+      /* === Phase 0 (Pipeline): Gửi lệnh READ ANGLE cho cả 3 trục liên tiếp ===
+       */
       /* PITCH */
-      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd, (uint8_t *)&rx_dummy, 1, 2);
+      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin,
+                        GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd,
+                              (uint8_t *)&rx_dummy, 1, 2);
       HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
-      
+
       /* ROLL */
       HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd, (uint8_t *)&rx_dummy, 1, 2);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd,
+                              (uint8_t *)&rx_dummy, 1, 2);
       HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_SET);
 
       /* YAW */
       HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin, GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd, (uint8_t *)&rx_dummy, 1, 2);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd,
+                              (uint8_t *)&rx_dummy, 1, 2);
       HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin, GPIO_PIN_SET);
 
-      /* (Thời gian thực thi code SPI của Roll, Yaw đã bù trừ đủ để tạo trễ tCSn > 350ns cho Pitch, không cần vòng lặp for delay nữa) */
+      /* (Thời gian thực thi code SPI của Roll, Yaw đã bù trừ đủ để tạo trễ tCSn
+       * > 350ns cho Pitch, không cần vòng lặp for delay nữa) */
 
       /* === Phase 1 (Pipeline): Gửi lệnh NOP để clock ra Data góc === */
       /* PITCH */
-      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd, (uint8_t *)&rx_angle_pitch, 1, 2);
+      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin,
+                        GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd,
+                              (uint8_t *)&rx_angle_pitch, 1, 2);
       HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
 
       /* ROLL */
       HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd, (uint8_t *)&rx_angle_roll, 1, 2);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd,
+                              (uint8_t *)&rx_angle_roll, 1, 2);
       HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_SET);
 
       /* YAW */
       HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin, GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd, (uint8_t *)&rx_angle_yaw, 1, 2);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd,
+                              (uint8_t *)&rx_angle_yaw, 1, 2);
       HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin, GPIO_PIN_SET);
 
       log_enc_raw = rx_angle_pitch;
@@ -880,18 +964,24 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
       /* === Xử lý Parity và tính Góc === */
       if (AS5048A_CheckParity(rx_angle_pitch)) {
         pitch_enc.raw_angle = rx_angle_pitch & AS5048A_DATA_MASK;
-        pitch_enc.angle_rad = (float)pitch_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
-        pitch_enc.angle_deg = (float)pitch_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
+        pitch_enc.angle_rad =
+            (float)pitch_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
+        pitch_enc.angle_deg =
+            (float)pitch_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
       }
       if (AS5048A_CheckParity(rx_angle_roll)) {
         roll_enc.raw_angle = rx_angle_roll & AS5048A_DATA_MASK;
-        roll_enc.angle_rad = (float)roll_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
-        roll_enc.angle_deg = (float)roll_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
+        roll_enc.angle_rad =
+            (float)roll_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
+        roll_enc.angle_deg =
+            (float)roll_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
       }
       if (AS5048A_CheckParity(rx_angle_yaw)) {
         yaw_enc.raw_angle = rx_angle_yaw & AS5048A_DATA_MASK;
-        yaw_enc.angle_rad = (float)yaw_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
-        yaw_enc.angle_deg = (float)yaw_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
+        yaw_enc.angle_rad =
+            (float)yaw_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
+        yaw_enc.angle_deg =
+            (float)yaw_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
       }
 
       enc_busy = 0;
@@ -928,8 +1018,26 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
        * - Tính Vq = pid_vel(target_vel - velocity_mech)
        * - Gọi FOC_SVPWM sinh từ trường bám theo rotor (closeloop hoàn toàn) */
       FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, target_vel);
-    } else {
+    } else if (g_mode == TEST_MODE_POSITION) {
+      /* Clamp mục tiêu trong giới hạn mềm (Soft Limit) trước khi đưa vào FOC */
+      const float pitch_min_rad = DEG2RAD(PITCH_MIN_DEG);
+      const float pitch_max_rad = DEG2RAD(PITCH_MAX_DEG);
+      const float roll_min_rad  = DEG2RAD(ROLL_MIN_DEG);
+      const float roll_max_rad  = DEG2RAD(ROLL_MAX_DEG);
+      const float yaw_min_rad   = DEG2RAD(YAW_MIN_DEG);
+      const float yaw_max_rad   = DEG2RAD(YAW_MAX_DEG);
+
+      if (target_pitch_angle < pitch_min_rad) target_pitch_angle = pitch_min_rad;
+      if (target_pitch_angle > pitch_max_rad) target_pitch_angle = pitch_max_rad;
+      if (target_roll_angle  < roll_min_rad)  target_roll_angle  = roll_min_rad;
+      if (target_roll_angle  > roll_max_rad)  target_roll_angle  = roll_max_rad;
+      if (target_yaw_angle   < yaw_min_rad)   target_yaw_angle   = yaw_min_rad;
+      if (target_yaw_angle   > yaw_max_rad)   target_yaw_angle   = yaw_max_rad;
+
+      /* Gọi hàm Position Loop cho cả 3 trục */
       FOC_PositionLoop(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
+      FOC_PositionLoop(&foc_roll,  roll_enc.angle_rad,  target_roll_angle);
+      FOC_PositionLoop(&foc_yaw,   yaw_enc.angle_rad,   target_yaw_angle);
     }
   }
 }
