@@ -39,9 +39,10 @@
 #define TEST_MODE_CURRENT 3
 #define TEST_MODE_ICM42688 4
 #define TEST_MODE_DEMO_1AXIS 5
+#define TEST_MODE_READ_ENCODER 6
 
-#define TEST_MODE TEST_MODE_DEMO_1AXIS
-#define COMM_MODE COMM_MODE_APP_GUI
+#define TEST_MODE TEST_MODE_READ_ENCODER
+#define COMM_MODE COMM_MODE_TERMINAL_LOG
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -54,6 +55,8 @@
 /* USER CODE BEGIN PV */
 
 AS5048A_Handle_t pitch_enc;
+AS5048A_Handle_t roll_enc;
+AS5048A_Handle_t yaw_enc;
 FOC_Handle_t foc_pitch;
 
 ICM42688_Handle_t imu_payload;
@@ -117,7 +120,7 @@ volatile uint32_t cal_count = 0;
   1.5f /* Nâng giới hạn điện áp 1.5V để Vq không bị bão hòa va đập (clamp) gây \
           rung motor */
 #define PWM_PERIOD 4249.0f
-#define MOTOR_POLE_PAIRS 14
+#define MOTOR_POLE_PAIRS 7
 
 /* USER CODE END PV */
 
@@ -360,7 +363,17 @@ int main(void) {
   /* 1. Khởi tạo cảm biến góc AS5048A Encoder */
 
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+  
+  // Khởi tạo Handle
   AS5048A_Init(&pitch_enc, &hspi1, ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin);
+  AS5048A_Init(&roll_enc, &hspi1, ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin);
+  AS5048A_Init(&yaw_enc, &hspi1, ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin);
+  
+  // Kéo High toàn bộ CS mặc định
+  HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin, GPIO_PIN_SET);
+
   HAL_TIM_Base_Start_IT(&htim6);
 
   HAL_Delay(100); // Chờ lấy mẫu vài frame góc ban đầu từ AS5048A
@@ -487,6 +500,10 @@ int main(void) {
 
   /* 5. Bật control loop 2kHz (TIM7) */
   HAL_TIM_Base_Start_IT(&htim7);
+#elif (TEST_MODE == TEST_MODE_READ_ENCODER)
+  printf("--- BẮT ĐẦU TEST_MODE_READ_ENCODER (3 Trục SPI Pipeline) ---\r\n");
+  /* Tắt hoàn toàn motor, chỉ đọc SPI trong ngắt TIM6 */
+  foc_pitch.enabled = 0;
 #endif
 
 #if (TEST_MODE == TEST_MODE_POSITION || TEST_MODE == TEST_MODE_VELOCITY)
@@ -656,6 +673,13 @@ int main(void) {
         printf("[DEMO_1AXIS] IMU chua san sang!\r\n");
       }
     }
+#elif (TEST_MODE == TEST_MODE_READ_ENCODER)
+    /* In dữ liệu góc của cả 3 encoder ra UART (20Hz) */
+    if (now - last_print_time >= 50) {
+      last_print_time = now;
+      printf("[ENC3D] Pitch: %6.2f | Roll: %6.2f | Yaw: %6.2f (deg)\r\n",
+             pitch_enc.angle_deg, roll_enc.angle_deg, yaw_enc.angle_deg);
+    }
 #endif
 #endif
   }
@@ -814,33 +838,62 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
      * hoặc bộ nhớ không cập nhật. */
     if (!enc_busy) {
       enc_busy = 1;
-      uint16_t rx_dummy, rx_angle;
+      uint16_t rx_dummy;
+      uint16_t rx_angle_pitch, rx_angle_roll, rx_angle_yaw;
 
-      /* Phase 0: Gửi lệnh READ ANGLE (0xFFFF) */
-      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin,
-                        GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd,
-                              (uint8_t *)&rx_dummy, 1, 2);
+      /* === Phase 0 (Pipeline): Gửi lệnh READ ANGLE cho cả 3 trục liên tiếp === */
+      /* PITCH */
+      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd, (uint8_t *)&rx_dummy, 1, 2);
       HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
-      /* Delay > 350ns (tCSn) */
-      for (volatile int i = 0; i < 200; i++) {
+      
+      /* ROLL */
+      HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd, (uint8_t *)&rx_dummy, 1, 2);
+      HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_SET);
+
+      /* YAW */
+      HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin, GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_read_cmd, (uint8_t *)&rx_dummy, 1, 2);
+      HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin, GPIO_PIN_SET);
+
+      /* (Thời gian thực thi code SPI của Roll, Yaw đã bù trừ đủ để tạo trễ tCSn > 350ns cho Pitch, không cần vòng lặp for delay nữa) */
+
+      /* === Phase 1 (Pipeline): Gửi lệnh NOP để clock ra Data góc === */
+      /* PITCH */
+      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd, (uint8_t *)&rx_angle_pitch, 1, 2);
+      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
+
+      /* ROLL */
+      HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd, (uint8_t *)&rx_angle_roll, 1, 2);
+      HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port, ENC_ROLL_CS_Pin, GPIO_PIN_SET);
+
+      /* YAW */
+      HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin, GPIO_PIN_RESET);
+      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd, (uint8_t *)&rx_angle_yaw, 1, 2);
+      HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port, ENC_YAW_CS_Pin, GPIO_PIN_SET);
+
+      log_enc_raw = rx_angle_pitch;
+
+      /* === Xử lý Parity và tính Góc === */
+      if (AS5048A_CheckParity(rx_angle_pitch)) {
+        pitch_enc.raw_angle = rx_angle_pitch & AS5048A_DATA_MASK;
+        pitch_enc.angle_rad = (float)pitch_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
+        pitch_enc.angle_deg = (float)pitch_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
+      }
+      if (AS5048A_CheckParity(rx_angle_roll)) {
+        roll_enc.raw_angle = rx_angle_roll & AS5048A_DATA_MASK;
+        roll_enc.angle_rad = (float)roll_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
+        roll_enc.angle_deg = (float)roll_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
+      }
+      if (AS5048A_CheckParity(rx_angle_yaw)) {
+        yaw_enc.raw_angle = rx_angle_yaw & AS5048A_DATA_MASK;
+        yaw_enc.angle_rad = (float)yaw_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
+        yaw_enc.angle_deg = (float)yaw_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
       }
 
-      /* Phase 1: Gửi lệnh NOP (0xC000) để clock ra dữ liệu của Phase 0 */
-      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin,
-                        GPIO_PIN_RESET);
-      HAL_SPI_TransmitReceive(&hspi1, (uint8_t *)&enc_tx_nop_cmd,
-                              (uint8_t *)&rx_angle, 1, 2);
-      HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
-
-      log_enc_raw = rx_angle;
-      if (AS5048A_CheckParity(rx_angle)) {
-        pitch_enc.raw_angle = rx_angle & AS5048A_DATA_MASK;
-        pitch_enc.angle_rad =
-            (float)pitch_enc.raw_angle * (6.28318530718f / AS5048A_MAX_VALUE);
-        pitch_enc.angle_deg =
-            (float)pitch_enc.raw_angle * (360.0f / AS5048A_MAX_VALUE);
-      }
       enc_busy = 0;
     }
     /* TIM6: Kích hoạt SPI3 DMA đọc Burst 15-byte cho ICM42688 (SPI3) */
