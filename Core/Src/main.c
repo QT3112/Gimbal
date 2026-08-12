@@ -42,7 +42,7 @@
 #define TEST_MODE_READ_ENCODER 6
 #define TEST_MODE_DEMO_3AXIS 7
 
-#define TEST_MODE TEST_MODE_POSITION
+#define TEST_MODE TEST_MODE_DEMO_3AXIS
 #define COMM_MODE COMM_MODE_TERMINAL_LOG
 
 /* === Giới hạn góc mềm (Soft Limit) cho từng trục - đơn vị: độ === */
@@ -130,6 +130,11 @@ PID_Handle_t pid_3ax_yaw_pos;   /* e_rot[2] (Z) → vel_yaw   */
 #define DEMO3AX_SIGN_ROLL  (-1.0f)
 #define DEMO3AX_SIGN_PITCH (1.0f)
 #define DEMO3AX_SIGN_YAW   (1.0f)
+
+/* Góc mục tiêu cố định cho DEMO_3AXIS (đơn vị: Độ) */
+#define DEMO3AX_TARGET_ROLL_DEG   0.4f
+#define DEMO3AX_TARGET_PITCH_DEG  -1.6f
+#define DEMO3AX_TARGET_YAW_DEG    19.0f
 
 float pitch_offset_a = 0.0f;
 float pitch_offset_b = 0.0f;
@@ -643,14 +648,20 @@ int main(void) {
            imu_payload.gyro_bias_z);
     Mahony_Init(&mahony_imu, 1.0f, 0.005f);
 
-    /* 4. Chờ Mahony converge (~2s) rồi chốt hướng mục tiêu */
+    /* 4. Chờ Mahony converge (~2s) rồi chốt hướng mục tiêu cố định */
     printf("[DEMO_3AXIS] Cho Mahony AHRS on định (2s)...\r\n");
     HAL_Delay(2000);
-    q_demo3_target.q0 = mahony_imu.q0;
-    q_demo3_target.q1 = mahony_imu.q1;
-    q_demo3_target.q2 = mahony_imu.q2;
-    q_demo3_target.q3 = mahony_imu.q3;
-    printf("[DEMO_3AXIS] Hướng mục tiêu chot: w=%.3f x=%.3f y=%.3f z=%.3f\r\n",
+    
+    Quaternion_FromEuler(
+        DEG2RAD(DEMO3AX_TARGET_ROLL_DEG),
+        DEG2RAD(DEMO3AX_TARGET_PITCH_DEG),
+        DEG2RAD(DEMO3AX_TARGET_YAW_DEG),
+        &q_demo3_target
+    );
+    
+    printf("[DEMO_3AXIS] Huong muc tieu co dinh: Roll=%.1f, Pitch=%.1f, Yaw=%.1f (deg)\r\n",
+           DEMO3AX_TARGET_ROLL_DEG, DEMO3AX_TARGET_PITCH_DEG, DEMO3AX_TARGET_YAW_DEG);
+    printf("[DEMO_3AXIS] Quat muc tieu: w=%.3f x=%.3f y=%.3f z=%.3f\r\n",
            q_demo3_target.q0, q_demo3_target.q1,
            q_demo3_target.q2, q_demo3_target.q3);
   } else {
@@ -877,14 +888,9 @@ int main(void) {
     if (now - last_print_time >= 100) {
       last_print_time = now;
       if (icm_init_ok) {
-        /* Dòng 1: Vector sai số góc + lệnh vận tốc (debug PID) */
-        printf("[3AX_ERR] eR:%6.3f eP:%6.3f eY:%6.3f | "
-               "VR:%5.2f VP:%5.2f VY:%5.2f\r\n",
-               e_rot[0], e_rot[1], e_rot[2],
-               foc_roll.velocity_mech, foc_pitch.velocity_mech, foc_yaw.velocity_mech);
-        /* Dòng 2: Trạng thái Vq (hiệu quả lực giữ của từng trục) */
-        printf("[3AX_FOC] Vq_R:%5.2f Vq_P:%5.2f Vq_Y:%5.2f | "
-               "AHRS R:%5.1f P:%5.1f Y:%5.1f (deg)\r\n",
+        printf("[3AX] eR:%5.2f eP:%5.2f eY:%5.2f | VR:%5.2f VP:%5.2f VY:%5.2f | VqR:%5.2f VqP:%5.2f VqY:%5.2f | IMU R:%5.1f P:%5.1f Y:%5.1f\r\n",
+               e_rot[1], e_rot[0], e_rot[2],
+               foc_roll.velocity_mech, foc_pitch.velocity_mech, foc_yaw.velocity_mech,
                foc_roll.Vq_ref, foc_pitch.Vq_ref, foc_yaw.Vq_ref,
                mahony_imu.roll  * 57.2957795f,
                mahony_imu.pitch * 57.2957795f,
