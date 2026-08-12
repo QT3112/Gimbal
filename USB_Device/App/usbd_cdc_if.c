@@ -95,10 +95,7 @@ uint8_t UserTxBufferFS[APP_TX_DATA_SIZE];
 
 /* USER CODE BEGIN PRIVATE_VARIABLES */
 
-/* Line buffer để tích lũy ký tự nhận được từ PC cho đến khi gặp '\n' */
-#define CDC_CMD_LINE_SIZE 128
-static char  cdc_cmd_line[CDC_CMD_LINE_SIZE];
-static uint8_t cdc_cmd_pos = 0;
+
 
 /* USER CODE END PRIVATE_VARIABLES */
 
@@ -134,8 +131,7 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *pbuf, uint32_t *Len, uint8_t epnum);
 
 /* USER CODE BEGIN PRIVATE_FUNCTIONS_DECLARATION */
 
-/* Khai báo hàm ParseCommand định nghĩa trong main.c */
-extern void ParseCommand(const char *line);
+
 
 /* USER CODE END PRIVATE_FUNCTIONS_DECLARATION */
 
@@ -269,32 +265,6 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
-  uint32_t len = *Len;
-
-  /* Tích lũy từng ký tự nhận được vào line buffer */
-  for (uint32_t i = 0; i < len; i++) {
-    char c = (char)Buf[i];
-
-    if (c == '\n' || c == '\r') {
-      /* Kết thúc dòng: nếu có nội dung thì parse lệnh */
-      if (cdc_cmd_pos > 0) {
-        cdc_cmd_line[cdc_cmd_pos] = '\0';
-        /* Chỉ xử lý nếu là lệnh bắt đầu bằng '#' */
-        if (cdc_cmd_line[0] == '#') {
-          ParseCommand(cdc_cmd_line);
-        }
-        cdc_cmd_pos = 0;
-      }
-    } else {
-      /* Thêm ký tự vào buffer, tránh tràn */
-      if (cdc_cmd_pos < CDC_CMD_LINE_SIZE - 1) {
-        cdc_cmd_line[cdc_cmd_pos++] = c;
-      } else {
-        /* Tràn buffer: reset */
-        cdc_cmd_pos = 0;
-      }
-    }
-  }
 
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
