@@ -11,12 +11,14 @@
 #include "usart.h"
 #include "usb_device.h"
 
+
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "as5048a.h"
 #include "foc_v1.h"
 #include "icm42688.h"
 #include "imu_filter.h"
+#include "sbus_protocol.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -41,8 +43,9 @@
 #define TEST_MODE_DEMO_1AXIS 5
 #define TEST_MODE_READ_ENCODER 6
 #define TEST_MODE_DEMO_3AXIS 7
+#define TEST_MODE_SBUS 8
 
-#define TEST_MODE TEST_MODE_DEMO_3AXIS
+#define TEST_MODE TEST_MODE_SBUS
 #define COMM_MODE COMM_MODE_TERMINAL_LOG
 
 /* === Giới hạn góc mềm (Soft Limit) cho từng trục - đơn vị: độ === */
@@ -84,6 +87,13 @@ ICM42688_Handle_t imu_payload;
 MahonyFilter_t mahony_imu;
 uint8_t icm_init_ok = 0;
 
+/* ===========================================================
+ * Biến dành riêng cho TEST_MODE_SBUS
+ * =========================================================== */
+#if (TEST_MODE == TEST_MODE_SBUS)
+SBUS_Handle_t sbus_rx; /* Handle SBUS — nhận qua USART1 DMA (PB7=RX, PB6=TX) */
+#endif
+
 Quaternion_t q_target_3d = {1.0f, 0.0f, 0.0f, 0.0f};
 float e_rot[3] = {0.0f, 0.0f, 0.0f};
 
@@ -119,22 +129,24 @@ PID_Handle_t pid_backup_vel; /* Lưu PID Velocity của Encoder mode */
  * Kiến trúc: Mahony AHRS → Quaternion Error → PID outer → FOC_VelocityLoop
  * Encoder chỉ đóng vòng trong (velocity/current), không dùng làm feedback góc.
  * =========================================================== */
-Quaternion_t q_demo3_target; /* Hướng mục tiêu: chốt khi vào mode, giữ cố định sau đó */
+Quaternion_t
+    q_demo3_target; /* Hướng mục tiêu: chốt khi vào mode, giữ cố định sau đó */
 
 /* PID vòng ngoài: error góc (rad) → velo setpoint (rad/s) cho từng trục */
 PID_Handle_t pid_3ax_roll_pos;  /* e_rot[1] (Y) → vel_roll  */
 PID_Handle_t pid_3ax_pitch_pos; /* e_rot[0] (X) → vel_pitch */
 PID_Handle_t pid_3ax_yaw_pos;   /* e_rot[2] (Z) → vel_yaw   */
 
-/* Hệ số chiều (có thể đảo -1 nếu motor quấy ngược chiều cần, kiểm tra bằng thực nghiệm) */
-#define DEMO3AX_SIGN_ROLL  (-1.0f)
+/* Hệ số chiều (có thể đảo -1 nếu motor quấy ngược chiều cần, kiểm tra bằng thực
+ * nghiệm) */
+#define DEMO3AX_SIGN_ROLL (-1.0f)
 #define DEMO3AX_SIGN_PITCH (1.0f)
-#define DEMO3AX_SIGN_YAW   (1.0f)
+#define DEMO3AX_SIGN_YAW (1.0f)
 
 /* Góc mục tiêu cố định cho DEMO_3AXIS (đơn vị: Độ) */
-#define DEMO3AX_TARGET_ROLL_DEG   0.4f
-#define DEMO3AX_TARGET_PITCH_DEG  -1.6f
-#define DEMO3AX_TARGET_YAW_DEG    19.0f
+#define DEMO3AX_TARGET_ROLL_DEG 0.4f
+#define DEMO3AX_TARGET_PITCH_DEG -1.6f
+#define DEMO3AX_TARGET_YAW_DEG 19.0f
 
 float pitch_offset_a = 0.0f;
 float pitch_offset_b = 0.0f;
@@ -502,7 +514,8 @@ int main(void) {
       ICM42688_Init(&imu_payload, &hspi3, GPIOC, GPIO_PIN_6, NULL);
   if (icm_pos_status == ICM42688_OK) {
     icm_init_ok = 1;
-    printf("[POS_MODE] ICM42688 OK! Dang hieu chuan Gyro Bias (giu im 1s)...\r\n");
+    printf(
+        "[POS_MODE] ICM42688 OK! Dang hieu chuan Gyro Bias (giu im 1s)...\r\n");
     ICM42688_CalibrateGyroBias(&imu_payload, 500);
     printf("[POS_MODE] Gyro Bias: X=%.2f Y=%.2f Z=%.2f dps\r\n",
            imu_payload.gyro_bias_x, imu_payload.gyro_bias_y,
@@ -510,7 +523,8 @@ int main(void) {
     Mahony_Init(&mahony_imu, 1.0f, 0.005f);
   } else {
     icm_init_ok = 0;
-    printf("[POS_MODE] CANH BAO: ICM42688 loi khoi tao (code %d), chi dung Encoder!\r\n",
+    printf("[POS_MODE] CANH BAO: ICM42688 loi khoi tao (code %d), chi dung "
+           "Encoder!\r\n",
            icm_pos_status);
   }
 #elif (TEST_MODE == TEST_MODE_VELOCITY)
@@ -615,33 +629,34 @@ int main(void) {
 
   /* 1. Enable và căn chỉnh FOC cả 3 trục (giống POSITION mode) */
   foc_pitch.enabled = 1;
-  foc_roll.enabled  = 1;
-  foc_yaw.enabled   = 1;
+  foc_roll.enabled = 1;
+  foc_yaw.enabled = 1;
 
   FOC_AlignD(&foc_pitch, 1.0f);
-  FOC_AlignD(&foc_roll,  1.0f);
-  FOC_AlignD(&foc_yaw,   1.0f);
+  FOC_AlignD(&foc_roll, 1.0f);
+  FOC_AlignD(&foc_yaw, 1.0f);
   HAL_Delay(1000);
 
   FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
-  FOC_CalibrateAngle(&foc_roll,  roll_enc.angle_rad);
-  FOC_CalibrateAngle(&foc_yaw,   yaw_enc.angle_rad);
+  FOC_CalibrateAngle(&foc_roll, roll_enc.angle_rad);
+  FOC_CalibrateAngle(&foc_yaw, yaw_enc.angle_rad);
 
   FOC_Start(&foc_pitch, pitch_enc.angle_rad);
-  FOC_Start(&foc_roll,  roll_enc.angle_rad);
-  FOC_Start(&foc_yaw,   yaw_enc.angle_rad);
+  FOC_Start(&foc_roll, roll_enc.angle_rad);
+  FOC_Start(&foc_yaw, yaw_enc.angle_rad);
 
   /* 2. Khởi tạo PID vòng ngoài cho cả 3 trục */
-  PID_Init(&pid_3ax_roll_pos,  4.0f, 0.3f, 0.05f, -3.0f, 3.0f);
+  PID_Init(&pid_3ax_roll_pos, 4.0f, 0.3f, 0.05f, -3.0f, 3.0f);
   PID_Init(&pid_3ax_pitch_pos, 4.0f, 0.3f, 0.05f, -3.0f, 3.0f);
-  PID_Init(&pid_3ax_yaw_pos,   3.0f, 0.2f, 0.0f,  -2.0f, 2.0f);
+  PID_Init(&pid_3ax_yaw_pos, 3.0f, 0.2f, 0.0f, -2.0f, 2.0f);
 
   /* 3. Khởi tạo ICM42688 + Mahony AHRS */
   ICM42688_Status_t icm_3ax_status =
       ICM42688_Init(&imu_payload, &hspi3, GPIOC, GPIO_PIN_6, NULL);
   if (icm_3ax_status == ICM42688_OK) {
     icm_init_ok = 1;
-    printf("[DEMO_3AXIS] ICM42688 OK! Dang hieu chuan Gyro Bias (giu im 1s)...\r\n");
+    printf("[DEMO_3AXIS] ICM42688 OK! Dang hieu chuan Gyro Bias (giu im "
+           "1s)...\r\n");
     ICM42688_CalibrateGyroBias(&imu_payload, 500);
     printf("[DEMO_3AXIS] Bias: X=%.2f Y=%.2f Z=%.2f dps\r\n",
            imu_payload.gyro_bias_x, imu_payload.gyro_bias_y,
@@ -651,19 +666,18 @@ int main(void) {
     /* 4. Chờ Mahony converge (~2s) rồi chốt hướng mục tiêu cố định */
     printf("[DEMO_3AXIS] Cho Mahony AHRS on định (2s)...\r\n");
     HAL_Delay(2000);
-    
-    Quaternion_FromEuler(
-        DEG2RAD(DEMO3AX_TARGET_ROLL_DEG),
-        DEG2RAD(DEMO3AX_TARGET_PITCH_DEG),
-        DEG2RAD(DEMO3AX_TARGET_YAW_DEG),
-        &q_demo3_target
-    );
-    
-    printf("[DEMO_3AXIS] Huong muc tieu co dinh: Roll=%.1f, Pitch=%.1f, Yaw=%.1f (deg)\r\n",
-           DEMO3AX_TARGET_ROLL_DEG, DEMO3AX_TARGET_PITCH_DEG, DEMO3AX_TARGET_YAW_DEG);
+
+    Quaternion_FromEuler(DEG2RAD(DEMO3AX_TARGET_ROLL_DEG),
+                         DEG2RAD(DEMO3AX_TARGET_PITCH_DEG),
+                         DEG2RAD(DEMO3AX_TARGET_YAW_DEG), &q_demo3_target);
+
+    printf("[DEMO_3AXIS] Huong muc tieu co dinh: Roll=%.1f, Pitch=%.1f, "
+           "Yaw=%.1f (deg)\r\n",
+           DEMO3AX_TARGET_ROLL_DEG, DEMO3AX_TARGET_PITCH_DEG,
+           DEMO3AX_TARGET_YAW_DEG);
     printf("[DEMO_3AXIS] Quat muc tieu: w=%.3f x=%.3f y=%.3f z=%.3f\r\n",
-           q_demo3_target.q0, q_demo3_target.q1,
-           q_demo3_target.q2, q_demo3_target.q3);
+           q_demo3_target.q0, q_demo3_target.q1, q_demo3_target.q2,
+           q_demo3_target.q3);
   } else {
     icm_init_ok = 0;
     printf("[DEMO_3AXIS] LOI khoi tao ICM42688! Code: %d\r\n", icm_3ax_status);
@@ -673,9 +687,32 @@ int main(void) {
   HAL_TIM_Base_Start_IT(&htim7);
   printf("[DEMO_3AXIS] Kich hoat! 3-Axis Stabilization dang chay...\r\n");
 #elif (TEST_MODE == TEST_MODE_READ_ENCODER)
-  printf("--- BẮT ĐẦU TEST_MODE_READ_ENCODER (3 Trục SPI Pipeline) ---\r\n");
+  printf("--- BAT DAU TEST_MODE_READ_ENCODER (3 Truc SPI Pipeline) ---\r\n");
   /* Tắt hoàn toàn motor, chỉ đọc SPI trong ngắt TIM6 */
   foc_pitch.enabled = 0;
+#elif (TEST_MODE == TEST_MODE_SBUS)
+  /* ================================================================
+   * TEST_MODE_SBUS: Đọc và giải mã tín hiệu SBUS từ RC Receiver
+   * Phần cứng: USART1 (PB7=RX, PB6=TX), 100000 baud, 8E2, DMA
+   *            Tín hiệu đảo logic — bật RX Inversion trong CubeMX
+   * Luồng: Receiver → USART1 DMA → SBUS_RxEventCallback (ISR)
+   *         → SBUS_Process() (main loop) → in 16 kênh ra UART
+   * ================================================================ */
+
+  /* Tắt hoàn toàn motor trong mode test này */
+  foc_pitch.enabled = 0;
+  foc_roll.enabled = 0;
+  foc_yaw.enabled = 0;
+
+  /* Khởi tạo SBUS qua USART1 (đã được CubeMX config: 100000 baud, 8E2, DMA RX)
+   */
+  SBUS_Status_t sbus_init_ret = SBUS_Init(&sbus_rx, &huart1);
+  if (sbus_init_ret == SBUS_OK) {
+    printf("[SBUS] Khoi tao thanh cong! Dang cho tin hieu tu Receiver...\r\n");
+  } else {
+    printf(
+        "[SBUS] LOI khoi tao! Check USART1 DMA config (100000 baud, 8E2).\r\n");
+  }
 #endif
 
 #if (TEST_MODE == TEST_MODE_POSITION || TEST_MODE == TEST_MODE_VELOCITY)
@@ -796,21 +833,18 @@ int main(void) {
     //        "[R] Tgt:%5.1f Act:%5.1f Err:%5.1f Vq:%5.2f | "
     //        "[Y] Tgt:%5.1f Act:%5.1f Err:%5.1f Vq:%5.2f\r\n",
     //        target_pitch_deg, pitch_enc.angle_deg, err_pitch_deg,
-    //        foc_pitch.Vq_ref, target_roll_deg, roll_enc.angle_deg, err_roll_deg,
-    //        foc_roll.Vq_ref, target_yaw_deg, yaw_enc.angle_deg, err_yaw_deg,
-    //        foc_yaw.Vq_ref);
+    //        foc_pitch.Vq_ref, target_roll_deg, roll_enc.angle_deg,
+    //        err_roll_deg, foc_roll.Vq_ref, target_yaw_deg, yaw_enc.angle_deg,
+    //        err_yaw_deg, foc_yaw.Vq_ref);
 
     /* Print Telemetry IMU (10Hz) - Mahony AHRS */
     if (icm_init_ok) {
-      printf("[IMU] R:%5.1f P:%5.1f Y:%5.1f (deg) | Gx:%5.1f Gy:%5.1f Gz:%5.1f (dps) | Ax:%5.2f Ay:%5.2f Az:%5.2f (g)\r\n",
-             mahony_imu.roll  * 57.2957795f,
-             mahony_imu.pitch * 57.2957795f,
-             mahony_imu.yaw   * 57.2957795f,
-             imu_payload.gyro_x_dps,
-             imu_payload.gyro_y_dps,
-             imu_payload.gyro_z_dps,
-             imu_payload.accel_x_g,
-             imu_payload.accel_y_g,
+      printf("[IMU] R:%5.1f P:%5.1f Y:%5.1f (deg) | Gx:%5.1f Gy:%5.1f Gz:%5.1f "
+             "(dps) | Ax:%5.2f Ay:%5.2f Az:%5.2f (g)\r\n",
+             mahony_imu.roll * 57.2957795f, mahony_imu.pitch * 57.2957795f,
+             mahony_imu.yaw * 57.2957795f, imu_payload.gyro_x_dps,
+             imu_payload.gyro_y_dps, imu_payload.gyro_z_dps,
+             imu_payload.accel_x_g, imu_payload.accel_y_g,
              imu_payload.accel_z_g);
     }
 
@@ -888,15 +922,80 @@ int main(void) {
     if (now - last_print_time >= 100) {
       last_print_time = now;
       if (icm_init_ok) {
-        printf("[3AX] eR:%5.2f eP:%5.2f eY:%5.2f | VR:%5.2f VP:%5.2f VY:%5.2f | VqR:%5.2f VqP:%5.2f VqY:%5.2f | IMU R:%5.1f P:%5.1f Y:%5.1f\r\n",
-               e_rot[1], e_rot[0], e_rot[2],
-               foc_roll.velocity_mech, foc_pitch.velocity_mech, foc_yaw.velocity_mech,
-               foc_roll.Vq_ref, foc_pitch.Vq_ref, foc_yaw.Vq_ref,
-               mahony_imu.roll  * 57.2957795f,
-               mahony_imu.pitch * 57.2957795f,
-               mahony_imu.yaw   * 57.2957795f);
+        printf(
+            "[3AX] eR:%5.2f eP:%5.2f eY:%5.2f | VR:%5.2f VP:%5.2f VY:%5.2f | "
+            "VqR:%5.2f VqP:%5.2f VqY:%5.2f | IMU R:%5.1f P:%5.1f Y:%5.1f\r\n",
+            e_rot[1], e_rot[0], e_rot[2], foc_roll.velocity_mech,
+            foc_pitch.velocity_mech, foc_yaw.velocity_mech, foc_roll.Vq_ref,
+            foc_pitch.Vq_ref, foc_yaw.Vq_ref, mahony_imu.roll * 57.2957795f,
+            mahony_imu.pitch * 57.2957795f, mahony_imu.yaw * 57.2957795f);
       } else {
         printf("[DEMO_3AXIS] IMU chua san sang!\r\n");
+      }
+    }
+#elif (TEST_MODE == TEST_MODE_SBUS)
+    /* ================================================================
+     * TEST_MODE_SBUS: Xử lý frame SBUS và in telemetry 10Hz
+     * ================================================================ */
+
+    /* Gọi SBUS_Process() mỗi vòng lặp — nhanh, chỉ parse khi có frame mới */
+    SBUS_Status_t sbus_st = SBUS_Process(&sbus_rx);
+
+    /* In telemetry 10Hz (mỗi 100ms) */
+    if (now - last_print_time >= 100) {
+      last_print_time = now;
+
+      if (sbus_st == SBUS_OK) {
+        /* Đọc 16 kênh raw để hiển thị */
+        uint16_t ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8;
+        uint16_t ch9, ch10, ch11, ch12, ch13, ch14, ch15, ch16;
+        SBUS_GetChannel(&sbus_rx, 1, &ch1);
+        SBUS_GetChannel(&sbus_rx, 2, &ch2);
+        SBUS_GetChannel(&sbus_rx, 3, &ch3);
+        SBUS_GetChannel(&sbus_rx, 4, &ch4);
+        SBUS_GetChannel(&sbus_rx, 5, &ch5);
+        SBUS_GetChannel(&sbus_rx, 6, &ch6);
+        SBUS_GetChannel(&sbus_rx, 7, &ch7);
+        SBUS_GetChannel(&sbus_rx, 8, &ch8);
+        SBUS_GetChannel(&sbus_rx, 9, &ch9);
+        SBUS_GetChannel(&sbus_rx, 10, &ch10);
+        SBUS_GetChannel(&sbus_rx, 11, &ch11);
+        SBUS_GetChannel(&sbus_rx, 12, &ch12);
+        SBUS_GetChannel(&sbus_rx, 13, &ch13);
+        SBUS_GetChannel(&sbus_rx, 14, &ch14);
+        SBUS_GetChannel(&sbus_rx, 15, &ch15);
+        SBUS_GetChannel(&sbus_rx, 16, &ch16);
+
+        /* Đọc normalized [-1.0..+1.0] cho các kênh điều khiển chính */
+        float norm_roll, norm_pitch, norm_throttle, norm_yaw;
+        SBUS_GetChannelNorm(&sbus_rx, 1, &norm_roll);  /* CH1: Aileron/Roll   */
+        SBUS_GetChannelNorm(&sbus_rx, 2, &norm_pitch); /* CH2: Elevator/Pitch */
+        SBUS_GetChannelNorm01(&sbus_rx, 3,
+                              &norm_throttle);       /* CH3: Throttle [0..1]*/
+        SBUS_GetChannelNorm(&sbus_rx, 4, &norm_yaw); /* CH4: Rudder/Yaw     */
+
+        /* Dòng 1: Raw 16 kênh */
+        printf("[SBUS] RAW: %4u %4u %4u %4u %4u %4u %4u %4u "
+               "%4u %4u %4u %4u %4u %4u %4u %4u | D:%u%u FS:%u FL:%u\r\n",
+               ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8, ch9, ch10, ch11, ch12,
+               ch13, ch14, ch15, ch16, SBUS_GetCH17(&sbus_rx),
+               SBUS_GetCH18(&sbus_rx), SBUS_IsFailsafe(&sbus_rx),
+               sbus_rx.frame_lost);
+
+        // /* Dòng 2: Normalized 4 kênh chính */
+        // printf("[SBUS] NORM: Roll:%+6.3f Pitch:%+6.3f Thr:%5.3f Yaw:%+6.3f\r\n",
+        //        norm_roll, norm_pitch, norm_throttle, norm_yaw);
+
+      } else if (sbus_st == SBUS_FAILSAFE) {
+        printf("[SBUS] CANH BAO: FAILSAFE dang active! Tat ca kenh ve gia tri "
+               "an toan.\r\n");
+      } else if (sbus_st == SBUS_FRAME_LOST) {
+        printf("[SBUS] CANH BAO: Frame Lost! Tin hieu yeu hoac bi nhieu.\r\n");
+      } else if (sbus_st == SBUS_TIMEOUT) {
+        printf("[SBUS] LOI: TIMEOUT! Mat tin hieu Receiver (> %dms).\r\n",
+               SBUS_TIMEOUT_MS);
+      } else {
+        printf("[SBUS] Dang cho frame dau tien...\r\n");
       }
     }
 #endif
@@ -1191,21 +1290,25 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
       FOC_PositionLoop(&foc_yaw, yaw_enc.angle_rad, target_yaw_angle);
     } else if (g_mode == TEST_MODE_DEMO_3AXIS) {
       /* 1. Lấy Quaternion đo được từ Mahony (cập nhật liên tục từ DMA ISR) */
-      Quaternion_t q_meas = {mahony_imu.q0, mahony_imu.q1,
-                             mahony_imu.q2, mahony_imu.q3};
+      Quaternion_t q_meas = {mahony_imu.q0, mahony_imu.q1, mahony_imu.q2,
+                             mahony_imu.q3};
 
       /* 2. Tính vector sai số góc 3D (không Gimbal Lock) */
       Quaternion_ComputeError(&q_demo3_target, &q_meas, e_rot);
 
       /* 3. Vòng ngoài: sai số góc → lệnh vận tốc (rad/s) cho từng trục */
-      float vel_roll  = DEMO3AX_SIGN_ROLL  * PID_Update(&pid_3ax_roll_pos,  e_rot[1], foc_roll.Ts);
-      float vel_pitch = DEMO3AX_SIGN_PITCH * PID_Update(&pid_3ax_pitch_pos, e_rot[0], foc_pitch.Ts);
-      float vel_yaw   = DEMO3AX_SIGN_YAW   * PID_Update(&pid_3ax_yaw_pos,   e_rot[2], foc_yaw.Ts);
+      float vel_roll = DEMO3AX_SIGN_ROLL *
+                       PID_Update(&pid_3ax_roll_pos, e_rot[1], foc_roll.Ts);
+      float vel_pitch = DEMO3AX_SIGN_PITCH *
+                        PID_Update(&pid_3ax_pitch_pos, e_rot[0], foc_pitch.Ts);
+      float vel_yaw =
+          DEMO3AX_SIGN_YAW * PID_Update(&pid_3ax_yaw_pos, e_rot[2], foc_yaw.Ts);
 
-      /* 4. Vòng trong: FOC_VelocityLoop đóng vòng tốc độ + điện áp (Encoder làm feedback) */
-      FOC_VelocityLoop(&foc_roll,  roll_enc.angle_rad,  vel_roll);
+      /* 4. Vòng trong: FOC_VelocityLoop đóng vòng tốc độ + điện áp (Encoder làm
+       * feedback) */
+      FOC_VelocityLoop(&foc_roll, roll_enc.angle_rad, vel_roll);
       FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, vel_pitch);
-      FOC_VelocityLoop(&foc_yaw,   yaw_enc.angle_rad,   vel_yaw);
+      FOC_VelocityLoop(&foc_yaw, yaw_enc.angle_rad, vel_yaw);
     }
   }
 }
@@ -1236,6 +1339,22 @@ void HAL_ADCEx_InjectedConvCpltCallback(ADC_HandleTypeDef *hadc) {
     }
   }
 }
+/* ================================================================
+ * HAL_UARTEx_RxEventCallback — SBUS DMA Idle Line Detection
+ *
+ * Được gọi tự động bởi HAL khi:
+ *   - DMA nhận đủ SBUS_DMA_BUF_SIZE bytes, HOẶC
+ *   - UART phát hiện Idle Line (kết thúc frame SBUS)
+ * Chỉ cần set flag trong SBUS_Handle_t, parse thực hiện trong
+ * SBUS_Process() ở main loop để tránh xử lý nặng trong ISR.
+ * ================================================================ */
+#if (TEST_MODE == TEST_MODE_SBUS)
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size) {
+  if (huart->Instance == USART1) {
+    SBUS_RxEventCallback(&sbus_rx, Size);
+  }
+}
+#endif
 /* USER CODE END 4 */
 
 /**

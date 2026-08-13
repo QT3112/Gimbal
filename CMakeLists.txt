@@ -59,6 +59,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     UserLibs/pid_lib/Src/pid_lib.c
     UserLibs/icm42688/Src/icm42688.c
     UserLibs/foc_v1/Src/foc_v1.c
+    UserLibs/sbus_protocol/Src/sbus_protocol.c
 )
 
 # Add include paths
@@ -75,6 +76,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     UserLibs/pid_lib/Inc
     UserLibs/icm42688/Inc
     UserLibs/foc_v1/Inc
+    UserLibs/sbus_protocol/Inc
 )
 
 # Add project symbols (macros)
