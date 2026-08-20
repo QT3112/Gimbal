@@ -81,7 +81,10 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define PROGRAM_MODE_MAIN 0
+#define PROGRAM_MODE_IMU_TEST 1
 
+#define PROGRAM_MODE PROGRAM_MODE_IMU_TEST
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -177,6 +180,10 @@ int main(void) {
   MX_USART3_UART_Init();
   MX_TIM7_Init();
   /* USER CODE BEGIN 2 */
+  uint32_t last_print_time = HAL_GetTick();
+  uint32_t home_start_tick = HAL_GetTick();
+
+#if (PROGRAM_MODE == PROGRAM_MODE_MAIN)
 
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
 
@@ -287,9 +294,36 @@ int main(void) {
   target_yaw_angle   = DEG2RAD(HOME_YAW_DEG);
   printf("[HOME] Bat dau Homing: Roll=%.1f Pitch=%.1f Yaw=%.1f (deg)\r\n",
          HOME_ROLL_DEG, HOME_PITCH_DEG, HOME_YAW_DEG);
+#elif (PROGRAM_MODE == PROGRAM_MODE_IMU_TEST)
+  /* Phai bat TIM6 de trigger doc IMU qua DMA */
+  HAL_TIM_Base_Start_IT(&htim6);
+  ICM42688_Status_t icm_3ax_status = ICM42688_Init(&imu_payload, &hspi3, GPIOC, GPIO_PIN_6, NULL);
+  if (icm_3ax_status == ICM42688_OK) {
+    icm_init_ok = 1;
+    printf("[DEMO_3AXIS] ICM42688 OK! Dang hieu chuan Gyro Bias (giu im 1s)...\r\n");
+    ICM42688_CalibrateGyroBias(&imu_payload, 500);
+    printf("[DEMO_3AXIS] Bias: X=%.2f Y=%.2f Z=%.2f dps\r\n",
+           imu_payload.gyro_bias_x, imu_payload.gyro_bias_y,
+           imu_payload.gyro_bias_z);
+    Mahony_Init(&mahony_imu, 1.0f, 0.005f);
+    printf("[DEMO_3AXIS] Cho Mahony AHRS on định (2s)...\r\n");
+    HAL_Delay(2000);
 
-  uint32_t last_print_time = HAL_GetTick();
-  uint32_t home_start_tick = HAL_GetTick();
+    Quaternion_FromEuler(DEG2RAD(DEMO3AX_TARGET_ROLL_DEG),
+                         DEG2RAD(DEMO3AX_TARGET_PITCH_DEG),
+                         DEG2RAD(DEMO3AX_TARGET_YAW_DEG), &q_demo3_target);
+
+    printf("[DEMO_3AXIS] Huong muc tieu co dinh: Roll=%.1f, Pitch=%.1f, Yaw=%.1f (deg)\r\n",
+           DEMO3AX_TARGET_ROLL_DEG, DEMO3AX_TARGET_PITCH_DEG, DEMO3AX_TARGET_YAW_DEG);
+    printf("[DEMO_3AXIS] Quat muc tieu: w=%.3f x=%.3f y=%.3f z=%.3f\r\n",
+           q_demo3_target.q0, q_demo3_target.q1, q_demo3_target.q2,
+           q_demo3_target.q3);
+  } else {
+    icm_init_ok = 0;
+    printf("[DEMO_3AXIS] LOI khoi tao ICM42688! Code: %d\r\n", icm_3ax_status);
+  }
+
+#endif
 
   /* USER CODE END 2 */
 
@@ -297,6 +331,7 @@ int main(void) {
   /* USER CODE BEGIN WHILE */
 
   while (1) {
+#if (PROGRAM_MODE == PROGRAM_MODE_MAIN)
     uint32_t now = HAL_GetTick();
 
     /* Luon gọi SBUS_Process để DMA ring buffer luôn được đọc */
@@ -381,8 +416,29 @@ int main(void) {
           printf("[SBUS] Dang cho frame dau tien...\r\n");
         }
       }
-
     }
+
+#elif (PROGRAM_MODE == PROGRAM_MODE_IMU_TEST)
+    uint32_t now = HAL_GetTick();
+    if (now - last_print_time >= 100) {
+      last_print_time = now;
+      printf("[AHRS]  R:%7.2f P:%7.2f Y:%7.2f (deg)\r\n",
+             mahony_imu.roll  * RAD_TO_DEG,
+             mahony_imu.pitch * RAD_TO_DEG,
+             mahony_imu.yaw   * RAD_TO_DEG);
+      printf("[GYRO]  Gx:%7.2f Gy:%7.2f Gz:%7.2f (dps)\r\n",
+             imu_payload.gyro_x_dps,
+             imu_payload.gyro_y_dps,
+             imu_payload.gyro_z_dps);
+      printf("[ACCEL] Ax:%7.3f Ay:%7.3f Az:%7.3f (g)\r\n",
+             imu_payload.accel_x_g,
+             imu_payload.accel_y_g,
+             imu_payload.accel_z_g);
+      printf("[TEMP]  %.1f degC\r\n", imu_payload.temp_c);
+      printf("---\r\n");
+    }
+#endif 
+
   }
   /* USER CODE END 3 */
 }
