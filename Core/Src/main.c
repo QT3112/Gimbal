@@ -61,6 +61,30 @@
 #define DEMO3AX_SIGN_PITCH        (1.0f)
 #define DEMO3AX_SIGN_YAW          (1.0f)
 
+/*=== PID vòng ngoài IMU Stabilization (Outer loop: e_rot [rad] → vel [rad/s]) ===*/
+/* Bắt đầu với Kp thấp, Ki=0, Kd=0 để tránh dao động; tăng dần khi test */
+#define IMU_STAB_KP_ROLL          4.0f
+#define IMU_STAB_KI_ROLL          0.3f
+#define IMU_STAB_KD_ROLL          0.05f
+#define IMU_STAB_VEL_LIMIT_ROLL   3.0f   /* [rad/s] */
+
+#define IMU_STAB_KP_PITCH         4.0f
+#define IMU_STAB_KI_PITCH         0.3f
+#define IMU_STAB_KD_PITCH         0.05f
+#define IMU_STAB_VEL_LIMIT_PITCH  3.0f   /* [rad/s] */
+
+#define IMU_STAB_KP_YAW           3.0f
+#define IMU_STAB_KI_YAW           0.2f
+#define IMU_STAB_KD_YAW           0.0f
+#define IMU_STAB_VEL_LIMIT_YAW    2.0f   /* [rad/s] */
+
+/* Hệ số Gyro Feedforward: cộng trực tiếp vận tốc góc đo được vào lệnh motor */
+/* để giảm lag phản hồi. Bắt đầu từ 0.0f rồi tăng dần khi cần */
+#define IMU_STAB_GYRO_FF_GAIN     0.0f
+
+/* Ngưỡng raw SBUS để nhận biết CH5 đang ở vị trí HIGH (toggle) */
+#define SBUS_CH5_HIGH_THRESH      1200U
+
 /*=== Cấu hình phần cứng mạch dòng ===*/
 #define GAIN_DRV                  10.0f
 #define SHUNT_RES                 0.005f
@@ -76,12 +100,42 @@
 #define DEG2RAD(d) ((d) * DEG_TO_RAD)
 
 
+/*=== [3AXIS_FOLLOW_IMU] Vị trí IMU cố định cần giữ (do người dùng đo được) ===*/
+/* Các giá trị này là góc Euler đo được từ Mahony khi gimbal cân bằng đồng thời */
+/* Đưa vào dưới dạng Euler (deg) để Quaternion_FromEuler() xử lý */
+#define F3AX_TARGET_ROLL_DEG      (-0.0f * RAD_TO_DEG)   /* e_rot Y:-0.4 rad ~ -22.9 deg -> đặt roll */
+#define F3AX_TARGET_PITCH_DEG     (-0.0f * RAD_TO_DEG)   /* e_rot X:-0.0 rad ~ 0 deg     -> pitch */
+#define F3AX_TARGET_YAW_DEG       (-1.6f * RAD_TO_DEG)   /* e_rot Z:-1.6 rad ~ -91.7 deg -> yaw  */
+
+/* Cách tiếp cận đơn giản hơn: Khởi động rồi chốt q_target = q_meas ngay lúc bắt đầu */
+/* (có thể dùng thay cho Euler target cứng). Xem giải thích bên dưới. */
+
+/*=== [3AXIS_FOLLOW_IMU] PID vòng ngoài (e_rot [rad] → vel [rad/s]) ===*/
+/* Giữ nguyên các thông số tương tự PROGRAM_MODE_MAIN IMU_STAB */
+#define F3AX_KP_ROLL              4.0f
+#define F3AX_KI_ROLL              0.3f
+#define F3AX_KD_ROLL              0.05f
+#define F3AX_VEL_LIMIT_ROLL       3.0f   /* [rad/s] */
+
+#define F3AX_KP_PITCH             4.0f
+#define F3AX_KI_PITCH             0.3f
+#define F3AX_KD_PITCH             0.05f
+#define F3AX_VEL_LIMIT_PITCH      3.0f   /* [rad/s] */
+
+#define F3AX_KP_YAW               3.0f
+#define F3AX_KI_YAW               0.2f
+#define F3AX_KD_YAW               0.0f
+#define F3AX_VEL_LIMIT_YAW        2.0f   /* [rad/s] */
+
+#define F3AX_GYRO_FF_GAIN         0.0f   /* Feedforward Gyro, bắt đầu từ 0 */
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
 #define PROGRAM_MODE_MAIN 0
 #define PROGRAM_MODE_IMU_TEST 1
+#define PROGRAM_MODE_3AXIS_FOLLOW_IMU 2
 
 #define PROGRAM_MODE PROGRAM_MODE_MAIN
 /* USER CODE END PM */
@@ -119,11 +173,21 @@ volatile float target_yaw_angle   = 0.0f;
 
 /* === Trạng thái máy trạng thái của gimbal === */
 typedef enum {
-  GIMBAL_STATE_HOMING = 0,  /* Đang tự động quay về vị trí home */
-  GIMBAL_STATE_SBUS,        /* Đang nhận lệnh điều khiển từ SBUS */
+  GIMBAL_STATE_HOMING   = 0, /* Đang tự động quay về vị trí home */
+  GIMBAL_STATE_SBUS,         /* Nhận lệnh SBUS, điều khiển encoder position */
+  GIMBAL_STATE_IMU_STAB,     /* Giữ hướng theo IMU (Cascade: IMU outer + Encoder inner) */
 } GimbalState_t;
 
 GimbalState_t g_gimbal_state = GIMBAL_STATE_HOMING;
+
+/* === Biến cho chế độ IMU Stabilization === */
+/* Velocity setpoint do PID vòng ngoài (IMU) xuất ra, được đọc trong TIM7 ISR */
+volatile float imu_stab_vel_roll  = 0.0f;
+volatile float imu_stab_vel_pitch = 0.0f;
+volatile float imu_stab_vel_yaw   = 0.0f;
+
+/* Trạng thái trước của CH5 để phát hiện cạnh lên (toggle) */
+static uint8_t sbus_ch5_prev = 0;
 
 /* USER CODE END PV */
 
@@ -247,10 +311,17 @@ int main(void)
   FOC_Start(&foc_roll, roll_enc.angle_rad);
   FOC_Start(&foc_yaw, yaw_enc.angle_rad);
 
-  /*=== Khởi tạo PID vòng ngoài cho cả 3 trục ===*/
-  PID_Init(&pid_3ax_roll_pos, 4.0f, 0.3f, 0.05f, -3.0f, 3.0f);
-  PID_Init(&pid_3ax_pitch_pos, 4.0f, 0.3f, 0.05f, -3.0f, 3.0f);
-  PID_Init(&pid_3ax_yaw_pos, 3.0f, 0.2f, 0.0f, -2.0f, 2.0f);
+  /*=== Khởi tạo PID vòng ngoài IMU Stabilization (Outer loop) ===*/
+  /* Dùng param từ #define để dễ tuning mà không cần tìm sâu vào code */
+  PID_Init(&pid_3ax_roll_pos,
+           IMU_STAB_KP_ROLL,  IMU_STAB_KI_ROLL,  IMU_STAB_KD_ROLL,
+           -IMU_STAB_VEL_LIMIT_ROLL, IMU_STAB_VEL_LIMIT_ROLL);
+  PID_Init(&pid_3ax_pitch_pos,
+           IMU_STAB_KP_PITCH, IMU_STAB_KI_PITCH, IMU_STAB_KD_PITCH,
+           -IMU_STAB_VEL_LIMIT_PITCH, IMU_STAB_VEL_LIMIT_PITCH);
+  PID_Init(&pid_3ax_yaw_pos,
+           IMU_STAB_KP_YAW,   IMU_STAB_KI_YAW,   IMU_STAB_KD_YAW,
+           -IMU_STAB_VEL_LIMIT_YAW, IMU_STAB_VEL_LIMIT_YAW);
 
   
   ICM42688_Status_t icm_3ax_status = ICM42688_Init(&imu_payload, &hspi3, GPIOC, GPIO_PIN_6, NULL);
@@ -322,6 +393,119 @@ int main(void)
     printf("[DEMO_3AXIS] LOI khoi tao ICM42688! Code: %d\r\n", icm_3ax_status);
   }
 
+#elif (PROGRAM_MODE == PROGRAM_MODE_3AXIS_FOLLOW_IMU)
+  /* ================================================================
+   * PROGRAM_MODE_3AXIS_FOLLOW_IMU: Giữ Gimbal cân bằng tại 1 hướng
+   * cố định trong không gian 3D (Cascade: IMU Outer + Encoder Inner)
+   * ================================================================ */
+
+  /* --- Phần cứng --- */
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+
+  /* Encoder */
+  AS5048A_Init(&pitch_enc, &hspi1, ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin);
+  AS5048A_Init(&roll_enc,  &hspi1, ENC_ROLL_CS_GPIO_Port,  ENC_ROLL_CS_Pin);
+  AS5048A_Init(&yaw_enc,   &hspi1, ENC_YAW_CS_GPIO_Port,   ENC_YAW_CS_Pin);
+  HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(ENC_ROLL_CS_GPIO_Port,  ENC_ROLL_CS_Pin,  GPIO_PIN_SET);
+  HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port,   ENC_YAW_CS_Pin,   GPIO_PIN_SET);
+
+  HAL_TIM_Base_Start_IT(&htim6); /* TIM6: doc encoder + trigger IMU DMA */
+  HAL_Delay(100);
+
+  /* Motor FOC Pitch */
+  FOC_Init(&foc_pitch, &htim1, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+           PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, VOLTAGE_LIMIT, 1.0f, 0.0005f, 0.00005f);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  FOC_SetPID_POS(&foc_pitch, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
+  FOC_SetPID_VEL(&foc_pitch, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetLPF_Vel(&foc_pitch, 0.96f);
+
+  /* Motor FOC Roll */
+  FOC_Init(&foc_roll, &htim8, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+           PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, VOLTAGE_LIMIT, 1.0f, 0.0005f, 0.00005f);
+  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);
+  FOC_SetPID_POS(&foc_roll, 8.0f, 0.4f, 0.0f, -4.0f, 4.0f);
+  FOC_SetPID_VEL(&foc_roll, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetLPF_Vel(&foc_roll, 0.96f);
+
+  /* Motor FOC Yaw */
+  FOC_Init(&foc_yaw, &htim3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+           PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, VOLTAGE_LIMIT, 1.0f, 0.0005f, 0.00005f);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+  FOC_SetPID_POS(&foc_yaw, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
+  FOC_SetPID_VEL(&foc_yaw, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetLPF_Vel(&foc_yaw, 0.96f);
+
+  foc_pitch.enabled = 1;
+  foc_roll.enabled  = 1;
+  foc_yaw.enabled   = 1;
+
+  /* Align + Calibrate */
+  FOC_AlignD(&foc_pitch, 1.0f);
+  FOC_AlignD(&foc_roll,  1.0f);
+  FOC_AlignD(&foc_yaw,   1.0f);
+  HAL_Delay(1000);
+  FOC_CalibrateAngle(&foc_pitch, pitch_enc.angle_rad);
+  FOC_CalibrateAngle(&foc_roll,  roll_enc.angle_rad);
+  FOC_CalibrateAngle(&foc_yaw,   yaw_enc.angle_rad);
+  FOC_Start(&foc_pitch, pitch_enc.angle_rad);
+  FOC_Start(&foc_roll,  roll_enc.angle_rad);
+  FOC_Start(&foc_yaw,   yaw_enc.angle_rad);
+
+  /* --- PID vòng ngoài IMU --- */
+  PID_Init(&pid_3ax_roll_pos,
+           F3AX_KP_ROLL,  F3AX_KI_ROLL,  F3AX_KD_ROLL,
+           -F3AX_VEL_LIMIT_ROLL, F3AX_VEL_LIMIT_ROLL);
+  PID_Init(&pid_3ax_pitch_pos,
+           F3AX_KP_PITCH, F3AX_KI_PITCH, F3AX_KD_PITCH,
+           -F3AX_VEL_LIMIT_PITCH, F3AX_VEL_LIMIT_PITCH);
+  PID_Init(&pid_3ax_yaw_pos,
+           F3AX_KP_YAW,   F3AX_KI_YAW,   F3AX_KD_YAW,
+           -F3AX_VEL_LIMIT_YAW, F3AX_VEL_LIMIT_YAW);
+
+  /* --- Khởi tạo IMU ICM42688 --- */
+  ICM42688_Status_t icm_f3ax_status = ICM42688_Init(&imu_payload, &hspi3, GPIOC, GPIO_PIN_6, NULL);
+  if (icm_f3ax_status == ICM42688_OK) {
+    icm_init_ok = 1;
+    printf("[F3AX] ICM42688 OK! Calibrating Gyro Bias (giu im ~1s)...\r\n");
+    ICM42688_CalibrateGyroBias(&imu_payload, 500);
+    printf("[F3AX] Bias: X=%.3f Y=%.3f Z=%.3f dps\r\n",
+           imu_payload.gyro_bias_x, imu_payload.gyro_bias_y, imu_payload.gyro_bias_z);
+
+    Mahony_Init(&mahony_imu, 1.0f, 0.005f);
+    printf("[F3AX] Cho Mahony on dinh (2s)...\r\n");
+    HAL_Delay(2000);
+
+    /* === Chốt hướng mục tiêu = hướng hiện tại ngay sau khi AHRS ổn định ===
+     * Đây là cách chính xác nhất: gimbal sẽ giữ đúng hướng này,
+     * không bị lệch bởi việc cấu hình target Euler cứng.
+     * Nếu muốn một góc Euler cụ thể, thay dòng dưới bằng Quaternion_FromEuler. */
+    q_target_3d.q0 = mahony_imu.q0;
+    q_target_3d.q1 = mahony_imu.q1;
+    q_target_3d.q2 = mahony_imu.q2;
+    q_target_3d.q3 = mahony_imu.q3;
+
+    printf("[F3AX] Target chot: AHRS R=%.2f P=%.2f Y=%.2f (deg)\r\n",
+           mahony_imu.roll * RAD_TO_DEG,
+           mahony_imu.pitch * RAD_TO_DEG,
+           mahony_imu.yaw  * RAD_TO_DEG);
+    printf("[F3AX] Quat target: w=%.3f x=%.3f y=%.3f z=%.3f\r\n",
+           q_target_3d.q0, q_target_3d.q1, q_target_3d.q2, q_target_3d.q3);
+  } else {
+    icm_init_ok = 0;
+    printf("[F3AX] LOI khoi tao ICM42688! Code: %d\r\n", icm_f3ax_status);
+  }
+
+  HAL_TIM_Base_Start_IT(&htim7); /* TIM7: chay FOC velocity loop */
+  printf("[F3AX] He thong san sang! Gimbal dang giu huong co dinh.\r\n");
+
 #endif
 
   /* USER CODE END 2 */
@@ -369,8 +553,68 @@ int main(void)
         }
       }
     } else {
-      /* GIMBAL_STATE_SBUS: nhận lệnh điều khiển từ tay điều */
-      SBUS_Mapping_Update(&sbus_map, &sbus_rx, sbus_st);
+      /* --- Xử lý toggle CH5: bật/tắt chế độ IMU Stabilization --- */
+      /* Chỉ phát hiện khi SBUS đang hoạt động bình thường */
+      if (sbus_st == SBUS_OK && icm_init_ok) {
+        uint16_t ch5_raw = 0;
+        SBUS_GetChannel(&sbus_rx, 5, &ch5_raw);
+        uint8_t ch5_now = (ch5_raw > SBUS_CH5_HIGH_THRESH) ? 1U : 0U;
+
+        /* Phát hiện cạnh lên (LOW→HIGH): toggle chế độ */
+        if (ch5_now && !sbus_ch5_prev) {
+          if (g_gimbal_state == GIMBAL_STATE_SBUS) {
+            /* Chuyển sang IMU_STAB: chốt q_target_3d tại hướng hiện tại của IMU */
+            /* → Gimbal không nhảy đột ngột khi vừa bật */
+            Quaternion_t q_now = {mahony_imu.q0, mahony_imu.q1,
+                                  mahony_imu.q2, mahony_imu.q3};
+            q_target_3d = q_now;
+            /* Reset PID vòng ngoài để tránh windup tích lũy từ trước */
+            PID_Reset(&pid_3ax_roll_pos);
+            PID_Reset(&pid_3ax_pitch_pos);
+            PID_Reset(&pid_3ax_yaw_pos);
+            g_gimbal_state = GIMBAL_STATE_IMU_STAB;
+            printf("[STAB] Bat che do IMU Stabilization!\r\n");
+          } else if (g_gimbal_state == GIMBAL_STATE_IMU_STAB) {
+            /* Chuyển về SBUS: lấy góc encoder hiện tại làm target để không giật */
+            target_roll_angle  = roll_enc.angle_rad;
+            target_pitch_angle = pitch_enc.angle_rad;
+            target_yaw_angle   = yaw_enc.angle_rad;
+            /* Reset velocity output về 0 */
+            imu_stab_vel_roll  = 0.0f;
+            imu_stab_vel_pitch = 0.0f;
+            imu_stab_vel_yaw   = 0.0f;
+            g_gimbal_state = GIMBAL_STATE_SBUS;
+            printf("[STAB] Tat IMU Stabilization, chuyen ve SBUS.\r\n");
+          }
+        }
+        sbus_ch5_prev = ch5_now;
+      }
+
+      /* --- Cập nhật lệnh điều khiển tùy chế độ --- */
+      if (g_gimbal_state == GIMBAL_STATE_SBUS) {
+        /* Chế độ cũ: SBUS điều khiển encoder position */
+        SBUS_Mapping_Update(&sbus_map, &sbus_rx, sbus_st);
+      } else if (g_gimbal_state == GIMBAL_STATE_IMU_STAB) {
+        /* Chế độ IMU: Tính velocity setpoint từ PID vòng ngoài (e_rot) */
+        /* e_rot được cập nhật liên tục trong DMA callback của SPI3 */
+        /* Axis mapping (cần xác nhận bằng thực nghiệm): */
+        /*   e_rot[0] = error trục X IMU → dùng cho Pitch (trước-sau) */
+        /*   e_rot[1] = error trục Y IMU → dùng cho Roll (nghiêng ngang) */
+        /*   e_rot[2] = error trục Z IMU → dùng cho Yaw (xoay) */
+        float vel_r = PID_Update(&pid_3ax_roll_pos,  e_rot[1], 0.001f);
+        float vel_p = PID_Update(&pid_3ax_pitch_pos, e_rot[0], 0.001f);
+        float vel_y = PID_Update(&pid_3ax_yaw_pos,   e_rot[2], 0.001f);
+
+        /* Cộng thêm Gyro Feedforward để giảm lag (giữ nguyên = 0 nếu chưa cần) */
+        vel_r += imu_payload.gyro_y_dps * DEG_TO_RAD * IMU_STAB_GYRO_FF_GAIN;
+        vel_p += imu_payload.gyro_x_dps * DEG_TO_RAD * IMU_STAB_GYRO_FF_GAIN;
+        vel_y += imu_payload.gyro_z_dps * DEG_TO_RAD * IMU_STAB_GYRO_FF_GAIN;
+
+        /* Ghi vào biến volatile để TIM7 ISR đọc */
+        imu_stab_vel_roll  = vel_r;
+        imu_stab_vel_pitch = vel_p;
+        imu_stab_vel_yaw   = vel_y;
+      }
     }
 
     /* USER CODE END WHILE */
@@ -385,6 +629,15 @@ int main(void)
                roll_enc.angle_deg,  HOME_ROLL_DEG,
                pitch_enc.angle_deg, HOME_PITCH_DEG,
                yaw_enc.angle_deg,   HOME_YAW_DEG);
+      } else if (g_gimbal_state == GIMBAL_STATE_IMU_STAB) {
+        /* In telemetry chế độ IMU Stabilization */
+        printf("[STAB]   AHRS R:%6.2f P:%6.2f Y:%6.2f (deg)\r\n",
+               mahony_imu.roll  * RAD_TO_DEG,
+               mahony_imu.pitch * RAD_TO_DEG,
+               mahony_imu.yaw   * RAD_TO_DEG);
+        printf("[STAB]   eRot X:%6.3f Y:%6.3f Z:%6.3f (rad) | Vel R:%5.2f P:%5.2f Y:%5.2f (rad/s)\r\n",
+               e_rot[0], e_rot[1], e_rot[2],
+               imu_stab_vel_roll, imu_stab_vel_pitch, imu_stab_vel_yaw);
       } else {
         /* In telemetry chế độ SBUS */
         if (sbus_st == SBUS_OK) {
@@ -415,10 +668,6 @@ int main(void)
           printf("[SBUS] Dang cho frame dau tien...\r\n");
         }
       }
-
-      // printf("[DEMO_3AXIS] Bias: X=%.2f Y=%.2f Z=%.2f dps\r\n",
-      //      imu_payload.gyro_bias_x, imu_payload.gyro_bias_y,
-      //      imu_payload.gyro_bias_z);
     }
 
 #elif (PROGRAM_MODE == PROGRAM_MODE_IMU_TEST)
@@ -439,6 +688,47 @@ int main(void)
              imu_payload.accel_z_g);
       printf("[TEMP]  %.1f degC\r\n", imu_payload.temp_c);
       printf("---\r\n");
+    }
+
+#elif (PROGRAM_MODE == PROGRAM_MODE_3AXIS_FOLLOW_IMU)
+    /* ================================================================
+     * Cascade Outer Loop chạy trong while(1)
+     * e_rot được update liên tục trong DMA ISR (1kHz)
+     * Outer PID chạy ở tần số vòng lặp while (~kHz, không block)
+     * ================================================================ */
+    uint32_t now = HAL_GetTick();
+
+    if (icm_init_ok) {
+      /* Tnh velocity setpoint từ PID vòng ngoài */
+      /* Axis mapping (xác nhận bằng thực nghiệm): */
+      /*   e_rot[0] ~ error X IMU → Pitch  */
+      /*   e_rot[1] ~ error Y IMU → Roll   */
+      /*   e_rot[2] ~ error Z IMU → Yaw    */
+      float vel_r = PID_Update(&pid_3ax_roll_pos,  e_rot[1], 0.001f);
+      float vel_p = PID_Update(&pid_3ax_pitch_pos, e_rot[0], 0.001f);
+      float vel_y = PID_Update(&pid_3ax_yaw_pos,   e_rot[2], 0.001f);
+
+      /* Gyro Feedforward (giữ 0 cho đến khi cần) */
+      vel_r += imu_payload.gyro_y_dps * DEG_TO_RAD * F3AX_GYRO_FF_GAIN;
+      vel_p += imu_payload.gyro_x_dps * DEG_TO_RAD * F3AX_GYRO_FF_GAIN;
+      vel_y += imu_payload.gyro_z_dps * DEG_TO_RAD * F3AX_GYRO_FF_GAIN;
+
+      /* Ghi vào biến volatile để TIM7 ISR đọc */
+      imu_stab_vel_roll  = vel_r;
+      imu_stab_vel_pitch = vel_p;
+      imu_stab_vel_yaw   = vel_y;
+    }
+
+    /* In telemetry 100ms một lần */
+    if (now - last_print_time >= 100) {
+      last_print_time = now;
+      printf("[F3AX]  AHRS R:%6.2f P:%6.2f Y:%6.2f (deg)\r\n",
+             mahony_imu.roll  * RAD_TO_DEG,
+             mahony_imu.pitch * RAD_TO_DEG,
+             mahony_imu.yaw   * RAD_TO_DEG);
+      printf("[F3AX]  eRot X:%6.3f Y:%6.3f Z:%6.3f (rad) | Vel R:%5.2f P:%5.2f Y:%5.2f\r\n",
+             e_rot[0], e_rot[1], e_rot[2],
+             imu_stab_vel_roll, imu_stab_vel_pitch, imu_stab_vel_yaw);
     }
 #endif 
 
@@ -641,25 +931,42 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
       }
     }
   } else if (htim->Instance == TIM7) {
-    /* Clamp mục tiêu trong giới hạn mềm (Soft Limit) trước khi đưa vào FOC */
-    const float pitch_min_rad = DEG2RAD(PITCH_MIN_DEG);
-    const float pitch_max_rad = DEG2RAD(PITCH_MAX_DEG);
-    const float roll_min_rad = DEG2RAD(ROLL_MIN_DEG);
-    const float roll_max_rad = DEG2RAD(ROLL_MAX_DEG);
-    const float yaw_min_rad = DEG2RAD(YAW_MIN_DEG);
-    const float yaw_max_rad = DEG2RAD(YAW_MAX_DEG);
+#if (PROGRAM_MODE == PROGRAM_MODE_3AXIS_FOLLOW_IMU)
+    /* ================================================================
+     * 3AXIS_FOLLOW_IMU: Vòng trong (1kHz) dùng FOC_VelocityLoop
+     * Velocity setpoint được ghi từ outer loop trong while(1)
+     * ================================================================ */
+    FOC_VelocityLoop(&foc_roll,  roll_enc.angle_rad,  imu_stab_vel_roll);
+    FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, imu_stab_vel_pitch);
+    FOC_VelocityLoop(&foc_yaw,   yaw_enc.angle_rad,   imu_stab_vel_yaw);
+#else
+    /* ================================================================
+     * PROGRAM_MODE_MAIN: Tach hai nhánh SBUS/HOMING va IMU_STAB
+     * ================================================================ */
+    if (g_gimbal_state == GIMBAL_STATE_IMU_STAB) {
+      FOC_VelocityLoop(&foc_roll,  roll_enc.angle_rad,  imu_stab_vel_roll);
+      FOC_VelocityLoop(&foc_pitch, pitch_enc.angle_rad, imu_stab_vel_pitch);
+      FOC_VelocityLoop(&foc_yaw,   yaw_enc.angle_rad,   imu_stab_vel_yaw);
+    } else {
+      const float pitch_min_rad = DEG2RAD(PITCH_MIN_DEG);
+      const float pitch_max_rad = DEG2RAD(PITCH_MAX_DEG);
+      const float roll_min_rad  = DEG2RAD(ROLL_MIN_DEG);
+      const float roll_max_rad  = DEG2RAD(ROLL_MAX_DEG);
+      const float yaw_min_rad   = DEG2RAD(YAW_MIN_DEG);
+      const float yaw_max_rad   = DEG2RAD(YAW_MAX_DEG);
 
-    if (target_pitch_angle < pitch_min_rad) target_pitch_angle = pitch_min_rad;
-    if (target_pitch_angle > pitch_max_rad) target_pitch_angle = pitch_max_rad;
-    if (target_roll_angle < roll_min_rad) target_roll_angle = roll_min_rad;
-    if (target_roll_angle > roll_max_rad) target_roll_angle = roll_max_rad;
-    if (target_yaw_angle < yaw_min_rad) target_yaw_angle = yaw_min_rad;
-    if (target_yaw_angle > yaw_max_rad) target_yaw_angle = yaw_max_rad;
+      if (target_pitch_angle < pitch_min_rad) target_pitch_angle = pitch_min_rad;
+      if (target_pitch_angle > pitch_max_rad) target_pitch_angle = pitch_max_rad;
+      if (target_roll_angle  < roll_min_rad)  target_roll_angle  = roll_min_rad;
+      if (target_roll_angle  > roll_max_rad)  target_roll_angle  = roll_max_rad;
+      if (target_yaw_angle   < yaw_min_rad)   target_yaw_angle   = yaw_min_rad;
+      if (target_yaw_angle   > yaw_max_rad)   target_yaw_angle   = yaw_max_rad;
 
-    /* Gọi hàm Position Loop cho cả 3 trục */
-    FOC_PositionLoop(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
-    FOC_PositionLoop(&foc_roll, roll_enc.angle_rad, target_roll_angle);
-    FOC_PositionLoop(&foc_yaw, yaw_enc.angle_rad, target_yaw_angle);
+      FOC_PositionLoop(&foc_pitch, pitch_enc.angle_rad, target_pitch_angle);
+      FOC_PositionLoop(&foc_roll,  roll_enc.angle_rad,  target_roll_angle);
+      FOC_PositionLoop(&foc_yaw,   yaw_enc.angle_rad,   target_yaw_angle);
+    }
+#endif
   }
 }
 
