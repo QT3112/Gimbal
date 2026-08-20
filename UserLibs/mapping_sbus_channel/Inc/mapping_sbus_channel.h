@@ -43,7 +43,7 @@ extern "C" {
 #define SBUS_MAP_PITCH_MIN_DEG  15.0f
 #define SBUS_MAP_PITCH_MAX_DEG  280.0f
 #define SBUS_MAP_ROLL_MIN_DEG   90.0f
-#define SBUS_MAP_ROLL_MAX_DEG   265.0f
+#define SBUS_MAP_ROLL_MAX_DEG   325.0f   /* Khop voi ROLL_MAX_DEG trong main.c */
 #define SBUS_MAP_YAW_MIN_DEG    65.0f
 #define SBUS_MAP_YAW_MAX_DEG    255.0f
 

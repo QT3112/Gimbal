@@ -38,11 +38,18 @@
 #define PITCH_MIN_DEG             15.0f
 #define PITCH_MAX_DEG             280.0f
 #define ROLL_MIN_DEG              90.0f
-#define ROLL_MAX_DEG              265.0f
+#define ROLL_MAX_DEG              325.0f   /* Mở rộng để cho phép vị trí home 310° */
 #define YAW_MIN_DEG               65.0f
 #define YAW_MAX_DEG               255.0f
 
-/*=== Góc mục tiêu cố định motor ===*/
+/*=== Vị trí Home (khởi động tự động quay về đây) ===*/
+#define HOME_ROLL_DEG             310.0f
+#define HOME_PITCH_DEG            215.0f
+#define HOME_YAW_DEG              165.0f
+#define HOME_TOL_DEG              2.0f    /* Sai số cho phép để coi là đã đến home (deg) */
+#define HOME_TIMEOUT_MS           12000   /* Tối đa 12 giây để homing */
+
+/*=== Góc mục tiêu cố định motor (dự phòng) ===*/
 #define PITCH_SETPOINT_DEG        220.0f
 #define ROLL_SETPOINT_DEG         185.0f
 #define YAW_SETPOINT_DEG          180.0f
@@ -60,7 +67,7 @@
 #define SHUNT_RES                 0.005f
 #define VOLTAGE_LIMIT             1.5f 
 #define PWM_PERIOD                4249.0f
-#define MOTOR_POLE_PAIRS          14
+#define MOTOR_POLE_PAIRS          7
 
 
 #define PI 3.14159265359f
@@ -107,6 +114,14 @@ SBUS_Mapping_Handle_t sbus_map;   /* Mapping SBUS raw → target angle gimbal */
 volatile float target_pitch_angle = 0.0f;
 volatile float target_roll_angle  = 0.0f;
 volatile float target_yaw_angle   = 0.0f;
+
+/* === Trạng thái máy trạng thái của gimbal === */
+typedef enum {
+  GIMBAL_STATE_HOMING = 0,  /* Đang tự động quay về vị trí home */
+  GIMBAL_STATE_SBUS,        /* Đang nhận lệnh điều khiển từ SBUS */
+} GimbalState_t;
+
+GimbalState_t g_gimbal_state = GIMBAL_STATE_HOMING;
 
 /* USER CODE END PV */
 
@@ -261,23 +276,20 @@ int main(void) {
   HAL_TIM_Base_Start_IT(&htim7);  // TIMER7 chạy FOC
   SBUS_Status_t sbus_init_ret = SBUS_Init(&sbus_rx, &huart1);
   if (sbus_init_ret == SBUS_OK) {
-    printf("[SBUS] Khoi tao thanh cong! Dang cho tin hieu tu Receiver...\r\n");
+    printf("[SBUS] Khoi tao thanh cong!\r\n");
   } else {
-    printf(
-        "[SBUS] LOI khoi tao! Check USART1 DMA config (100000 baud, 8E2).\r\n");
+    printf("[SBUS] LOI khoi tao! Check USART1 DMA config.\r\n");
   }
 
-  /* Khởi tạo mapping SBUS → gimbal target angle
-   * Góc ban đầu = setpoint cố định, encoder đã có giá trị sau HAL_Delay(100) */
-  SBUS_Mapping_Init(&sbus_map,
-                    &target_roll_angle,
-                    &target_pitch_angle,
-                    &target_yaw_angle,
-                    DEG2RAD(ROLL_SETPOINT_DEG),
-                    DEG2RAD(PITCH_SETPOINT_DEG),
-                    DEG2RAD(YAW_SETPOINT_DEG));
+  /* Đặt target về vị trí HOME — TIM7 ISR sẽ tự động drive motor đến đây */
+  target_roll_angle  = DEG2RAD(HOME_ROLL_DEG);
+  target_pitch_angle = DEG2RAD(HOME_PITCH_DEG);
+  target_yaw_angle   = DEG2RAD(HOME_YAW_DEG);
+  printf("[HOME] Bat dau Homing: Roll=%.1f Pitch=%.1f Yaw=%.1f (deg)\r\n",
+         HOME_ROLL_DEG, HOME_PITCH_DEG, HOME_YAW_DEG);
 
   uint32_t last_print_time = HAL_GetTick();
+  uint32_t home_start_tick = HAL_GetTick();
 
   /* USER CODE END 2 */
 
@@ -286,10 +298,46 @@ int main(void) {
 
   while (1) {
     uint32_t now = HAL_GetTick();
+
+    /* Luon gọi SBUS_Process để DMA ring buffer luôn được đọc */
     SBUS_Status_t sbus_st = SBUS_Process(&sbus_rx);
 
-    /* Cập nhật target angle gimbal từ tín hiệu SBUS */
-    SBUS_Mapping_Update(&sbus_map, &sbus_rx, sbus_st);
+    /* === STATE MACHINE === */
+    if (g_gimbal_state == GIMBAL_STATE_HOMING) {
+      /* Kiểm tra từng trục đã về home chưa (dùng angle_deg từ encoder) */
+      float err_roll  = roll_enc.angle_deg  - HOME_ROLL_DEG;
+      float err_pitch = pitch_enc.angle_deg - HOME_PITCH_DEG;
+      float err_yaw   = yaw_enc.angle_deg   - HOME_YAW_DEG;
+      if (err_roll  < 0.0f) err_roll  = -err_roll;
+      if (err_pitch < 0.0f) err_pitch = -err_pitch;
+      if (err_yaw   < 0.0f) err_yaw   = -err_yaw;
+
+      uint8_t homed = (err_roll  <= HOME_TOL_DEG)
+                   && (err_pitch <= HOME_TOL_DEG)
+                   && (err_yaw   <= HOME_TOL_DEG);
+      uint8_t timeout = ((now - home_start_tick) >= HOME_TIMEOUT_MS);
+
+      if (homed || timeout) {
+        /* Chuyển sang chế độ SBUS, khởi đầu từ vị trí encoder hiện tại */
+        SBUS_Mapping_Init(&sbus_map,
+                          &target_roll_angle,
+                          &target_pitch_angle,
+                          &target_yaw_angle,
+                          roll_enc.angle_rad,
+                          pitch_enc.angle_rad,
+                          yaw_enc.angle_rad);
+        g_gimbal_state = GIMBAL_STATE_SBUS;
+        if (homed) {
+          printf("[HOME] Homing HOAN THANH! Chuyen sang che do SBUS.\r\n");
+        } else {
+          printf("[HOME] TIMEOUT! Chuyen sang che do SBUS (eR=%.1f eP=%.1f eY=%.1f).\r\n",
+                 err_roll, err_pitch, err_yaw);
+        }
+      }
+    } else {
+      /* GIMBAL_STATE_SBUS: nhận lệnh điều khiển từ tay điều */
+      SBUS_Mapping_Update(&sbus_map, &sbus_rx, sbus_st);
+    }
 
     /* USER CODE END WHILE */
 
@@ -297,34 +345,44 @@ int main(void) {
     if (now - last_print_time >= 100) {
       last_print_time = now;
 
-      if (sbus_st == SBUS_OK) {
-        uint16_t ch1, ch2, ch4;
-        SBUS_GetChannel(&sbus_rx, 1, &ch1);
-        SBUS_GetChannel(&sbus_rx, 2, &ch2);
-        SBUS_GetChannel(&sbus_rx, 4, &ch4);
-
-        /* Lệnh trục hiện tại */
-        const char *cmd_str[] = {"NEG", "HOLD", "POS"};
-        /* cmd enum: NEG=-1, HOLD=0, POS=1 → index = cmd + 1 */
-        printf("[GIMBAL] Roll:%6.1f deg | Pitch:%6.1f deg | Yaw:%6.1f deg\r\n",
-               target_roll_angle  * 57.2957795f,
-               target_pitch_angle * 57.2957795f,
-               target_yaw_angle   * 57.2957795f);
-        printf("[SBUS]   CH1=%4u(%s) CH2=%4u(%s) CH4=%4u(%s)\r\n",
-               ch1, cmd_str[sbus_map.cmd_roll  + 1],
-               ch2, cmd_str[sbus_map.cmd_pitch + 1],
-               ch4, cmd_str[sbus_map.cmd_yaw   + 1]);
-      } else if (sbus_st == SBUS_FAILSAFE) {
-        printf("[SBUS] CANH BAO: FAILSAFE dang active! Tat ca kenh ve gia tri an toan.\r\n");
-      } else if (sbus_st == SBUS_FRAME_LOST) {
-        printf("[SBUS] CANH BAO: Frame Lost! Tin hieu yeu hoac bi nhieu.\r\n");
-      } else if (sbus_st == SBUS_TIMEOUT) {
-        printf("[SBUS] LOI: TIMEOUT! Mat tin hieu Receiver (> %dms).\r\n", SBUS_TIMEOUT_MS);
+      if (g_gimbal_state == GIMBAL_STATE_HOMING) {
+        /* In tiến trình homing */
+        printf("[HOMING] Roll:%6.1f→%.1f | Pitch:%6.1f→%.1f | Yaw:%6.1f→%.1f (deg)\r\n",
+               roll_enc.angle_deg,  HOME_ROLL_DEG,
+               pitch_enc.angle_deg, HOME_PITCH_DEG,
+               yaw_enc.angle_deg,   HOME_YAW_DEG);
       } else {
-        printf("[SBUS] Dang cho frame dau tien...\r\n");
+        /* In telemetry chế độ SBUS */
+        if (sbus_st == SBUS_OK) {
+          uint16_t ch1, ch2, ch4;
+          SBUS_GetChannel(&sbus_rx, 1, &ch1);
+          SBUS_GetChannel(&sbus_rx, 2, &ch2);
+          SBUS_GetChannel(&sbus_rx, 4, &ch4);
+          const char *cmd_str[] = {"NEG", "HOLD", "POS"};
+          printf("[TARGET] Roll:%6.1f | Pitch:%6.1f | Yaw:%6.1f (deg)\r\n",
+                 target_roll_angle  * 57.2957795f,
+                 target_pitch_angle * 57.2957795f,
+                 target_yaw_angle   * 57.2957795f);
+          printf("[ENC]    Roll:%6.1f | Pitch:%6.1f | Yaw:%6.1f (deg)\r\n",
+                 roll_enc.angle_deg,
+                 pitch_enc.angle_deg,
+                 yaw_enc.angle_deg);
+          printf("[SBUS]   CH1=%4u(%s) CH2=%4u(%s) CH4=%4u(%s)\r\n",
+                 ch1, cmd_str[sbus_map.cmd_roll  + 1],
+                 ch2, cmd_str[sbus_map.cmd_pitch + 1],
+                 ch4, cmd_str[sbus_map.cmd_yaw   + 1]);
+        } else if (sbus_st == SBUS_FAILSAFE) {
+          printf("[SBUS] CANH BAO: FAILSAFE dang active!\r\n");
+        } else if (sbus_st == SBUS_FRAME_LOST) {
+          printf("[SBUS] CANH BAO: Frame Lost!\r\n");
+        } else if (sbus_st == SBUS_TIMEOUT) {
+          printf("[SBUS] LOI: TIMEOUT! Mat tin hieu Receiver (> %dms).\r\n", SBUS_TIMEOUT_MS);
+        } else {
+          printf("[SBUS] Dang cho frame dau tien...\r\n");
+        }
       }
-    }
 
+    }
   }
   /* USER CODE END 3 */
 }
