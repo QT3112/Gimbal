@@ -104,9 +104,9 @@
 /* Các giá trị này là góc Euler đo được từ Mahony khi gimbal cân bằng đồng thời
  */
 /* Đưa vào dưới dạng Euler (deg) để Quaternion_FromEuler() xử lý */
-#define F3AX_TARGET_ROLL_DEG   0.92f    /* AHRS R đo được khi gimbal cân bằng */
-#define F3AX_TARGET_PITCH_DEG  8.69f    /* AHRS P đo được khi gimbal cân bằng */
-#define F3AX_TARGET_YAW_DEG   22.89f   /* AHRS Y đo được khi gimbal cân bằng */
+#define F3AX_TARGET_ROLL_DEG   0.0f    /* AHRS R đo được khi gimbal cân bằng */
+#define F3AX_TARGET_PITCH_DEG  0.0f    /* AHRS P đo được khi gimbal cân bằng */
+#define F3AX_TARGET_YAW_DEG   5.0f   /* AHRS Y đo được khi gimbal cân bằng */
 
 /* Cách tiếp cận đơn giản hơn: Khởi động rồi chốt q_target = q_meas ngay lúc bắt
  * đầu */
@@ -800,12 +800,12 @@ void HAL_SPI_TxRxCpltCallback(SPI_HandleTypeDef *hspi) {
     imu_payload.temp_c = (float)imu_payload.raw_temp / ICM42688_TEMP_SENS + ICM42688_TEMP_OFFSET;
 
     // Remap 
-    float gimbal_gx = imu_payload.gyro_y_dps;
-    float gimbal_gy = imu_payload.gyro_x_dps;
+    float gimbal_gx = imu_payload.gyro_x_dps;
+    float gimbal_gy = imu_payload.gyro_y_dps;
     float gimbal_gz = imu_payload.gyro_z_dps;
 
-    float gimbal_ax = imu_payload.accel_y_g;
-    float gimbal_ay = imu_payload.accel_x_g;
+    float gimbal_ax = imu_payload.accel_x_g;
+    float gimbal_ay = imu_payload.accel_y_g;
     float gimbal_az = imu_payload.accel_z_g;
 
     /* Cập nhật Mahony 3D AHRS ngay tại ngắt DMA 2kHz (dt = 0.0005s) */
