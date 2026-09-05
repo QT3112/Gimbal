@@ -5,13 +5,11 @@
 #include "main.h"
 #include "adc.h"
 #include "dma.h"
-#include "gpio.h"
-#include "pid_lib.h"
 #include "spi.h"
-#include "stm32g4xx_hal.h"
 #include "tim.h"
 #include "usart.h"
 #include "usb_device.h"
+#include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -42,11 +40,14 @@
 #define MOTOR_ROLL_MAX_DEG 325.0f 
 #define MOTOR_YAW_MIN_DEG 65.0f
 #define MOTOR_YAW_MAX_DEG 255.0f
+#define MOTOR_YAW_FORBIDDEN_MIN_DEG 65.0f
+#define MOTOR_YAW_FORBIDDEN_MAX_DEG 225.0f
+
 
 /*=== Vị trí Home motor (khởi động tự động quay về đây) ===*/
-#define HOME_MOTOR_ROLL_DEG 310.0f
-#define HOME_MOTOR_PITCH_DEG 215.0f
-#define HOME_MOTOR_YAW_DEG 165.0f
+#define HOME_MOTOR_ROLL_DEG 312.0f
+#define HOME_MOTOR_PITCH_DEG 115.0f
+#define HOME_MOTOR_YAW_DEG 342.0f
 #define HOME_MOTOR_TOL_DEG 2.0f /* Sai số cho phép để coi là đã đến home_MOTOR (deg) */
 #define HOME_MOTOR_TIMEOUT_MS 12000 /* Tối đa 12 giây để homing */
 
@@ -142,18 +143,18 @@ void SystemClock_Config(void);
 /* USER CODE END 0 */
 
 /**
- * @brief  The application entry point.
- * @retval int
- */
-int main(void) {
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
 
   /* USER CODE BEGIN 1 */
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
 
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick.
-   */
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
@@ -201,34 +202,34 @@ int main(void) {
   HAL_Delay(100); // Chờ lấy mẫu vài frame góc ban đầu từ AS5048A
 
   /*=== Khởi tạo trục Pitch ===*/
-  FOC_Init(&foc_motor_pitch, &htim1, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+  FOC_Init(&foc_motor_pitch, &htim3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
            PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, /* voltage_supply: Bus DC 12V */
            VOLTAGE_LIMIT, 1.0f, 0.0005f, 0.00005f);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
   FOC_SetPID_POS(&foc_motor_pitch, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
   FOC_SetPID_VEL(&foc_motor_pitch, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
   FOC_SetLPF_Vel(&foc_motor_pitch, 0.96f);
 
-  /*=== Khởi tạo trục Roll ===*/
+  // /*=== Khởi tạo trục Roll ===*/
   FOC_Init(&foc_motor_roll, &htim8, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
            PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, VOLTAGE_LIMIT, 1.0f, 0.0005f,
            0.00005f);
-  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);
+  // HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
+  // HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_2);
+  // HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_3);
   FOC_SetPID_POS(&foc_motor_roll, 8.0f, 0.4f, 0.0f, -4.0f, 4.0f);
   FOC_SetPID_VEL(&foc_motor_roll, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
   FOC_SetLPF_Vel(&foc_motor_roll, 0.96f);
 
   /*=== Khởi tạo trục Yaw ===*/
-  FOC_Init(&foc_motor_yaw, &htim3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+  FOC_Init(&foc_motor_yaw, &htim1, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
            PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, VOLTAGE_LIMIT, 1.0f, 0.0005f,
            0.00005f);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
-  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
   FOC_SetPID_POS(&foc_motor_yaw, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
   FOC_SetPID_VEL(&foc_motor_yaw, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
   FOC_SetLPF_Vel(&foc_motor_yaw, 0.96f);
@@ -299,91 +300,31 @@ int main(void) {
   while (1) {
 #if (PROGRAM_MODE == PROGRAM_MODE_MAIN)
     uint32_t now = HAL_GetTick();
-    // SBUS_Status_t sbus_st = SBUS_Process(&sbus_rx);
-
-    // /* === STATE MACHINE === */
-    // if (g_gimbal_state == GIMBAL_STATE_HOMING) {
-    //   /* Kiểm tra từng trục đã về home chưa (dùng angle_deg từ encoder) */
-    //   float err_motor_roll = motor_roll_enc.angle_deg - HOME_MOTOR_ROLL_DEG;
-    //   float err_motor_pitch = motor_pitch_enc.angle_deg - HOME_MOTOR_PITCH_DEG;
-    //   float err_motor_yaw = motor_yaw_enc.angle_deg - HOME_MOTOR_YAW_DEG;
-    //   if (err_motor_roll < 0.0f) err_motor_roll = -err_motor_roll;
-    //   if (err_motor_pitch < 0.0f) err_motor_pitch = -err_motor_pitch;
-    //   if (err_motor_yaw < 0.0f) err_motor_yaw = -err_motor_yaw;
-
-    //   uint8_t homed = (err_motor_roll <= HOME_MOTOR_TOL_DEG) && (err_motor_pitch <= HOME_MOTOR_TOL_DEG) && (err_motor_yaw <= HOME_MOTOR_TOL_DEG);
-    //   uint8_t timeout = ((now - home_start_tick) >= HOME_MOTOR_TIMEOUT_MS);
-
-    //   if (homed || timeout) {
-    //     /* Chuyển sang chế độ SBUS, khởi đầu từ vị trí encoder hiện tại */
-    //     SBUS_Mapping_Init(&sbus_map, &target_motor_roll_angle, &target_motor_pitch_angle,
-    //                       &target_motor_yaw_angle, motor_roll_enc.angle_rad,
-    //                       motor_pitch_enc.angle_rad, motor_yaw_enc.angle_rad);
-    //     g_gimbal_state = GIMBAL_STATE_SBUS;
-    //     if (homed) {
-    //       printf("[HOME] Homing HOAN THANH! Chuyen sang che do SBUS.\r\n");
-    //     } else {
-    //       printf("[HOME] TIMEOUT! Chuyen sang che do SBUS (eR=%.1f eP=%.1f eY=%.1f).\r\n",
-    //              err_motor_roll, err_motor_pitch, err_motor_yaw);
-    //     }
-    //   }
-    // } 
 
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    // if (now - last_print_time >= 100) {
-    //   last_print_time = now;
+    if (now - last_print_time >= 100) {
+      last_print_time = now;
+    }
 
-    //   // if (g_gimbal_state == GIMBAL_STATE_HOMING) {
-    //   //   /* In tiến trình homing */
-    //   //   printf("[HOMING] Roll:%6.1f→%.1f | Pitch:%6.1f→%.1f | Yaw:%6.1f→%.1f (deg)\r\n",
-    //   //          motor_roll_enc.angle_deg, HOME_MOTOR_ROLL_DEG, motor_pitch_enc.angle_deg,
-    //   //          HOME_MOTOR_PITCH_DEG, motor_yaw_enc.angle_deg, HOME_MOTOR_YAW_DEG);
-    //   // } else {
-    //   //   /* In telemetry chế độ SBUS */
-    //   //   if (sbus_st == SBUS_OK) {
-    //   //     uint16_t ch1, ch2, ch4;
-    //   //     SBUS_GetChannel(&sbus_rx, 1, &ch1);
-    //   //     SBUS_GetChannel(&sbus_rx, 2, &ch2);
-    //   //     SBUS_GetChannel(&sbus_rx, 4, &ch4);
-    //   //     const char *cmd_str[] = {"NEG", "HOLD", "POS"};
-    //   //     printf("[TARGET] Roll:%6.1f | Pitch:%6.1f | Yaw:%6.1f (deg)\r\n",
-    //   //            target_motor_roll_angle * 57.2957795f,
-    //   //            target_motor_pitch_angle * 57.2957795f,
-    //   //            target_motor_yaw_angle * 57.2957795f);
-    //   //     printf("[ENC]    Roll:%6.1f | Pitch:%6.1f | Yaw:%6.1f (deg)\r\n",
-    //   //            motor_roll_enc.angle_deg, motor_pitch_enc.angle_deg, motor_yaw_enc.angle_deg);
-    //   //     printf("[SBUS]   CH1=%4u(%s) CH2=%4u(%s) CH4=%4u(%s)\r\n", ch1,
-    //   //            cmd_str[sbus_map.cmd_roll + 1], ch2,
-    //   //            cmd_str[sbus_map.cmd_pitch + 1], ch4,
-    //   //            cmd_str[sbus_map.cmd_yaw + 1]);
-    //   //   } else if (sbus_st == SBUS_FAILSAFE) { printf("[SBUS] CANH BAO: FAILSAFE dang active!\r\n");} 
-    //   //     else if (sbus_st == SBUS_FRAME_LOST) { printf("[SBUS] CANH BAO: Frame Lost!\r\n");} 
-    //   //     else if (sbus_st == SBUS_TIMEOUT) { printf("[SBUS] LOI: TIMEOUT! Mat tin hieu Receiver (> %dms).\r\n", SBUS_TIMEOUT_MS);}
-    //   //     else { printf("[SBUS] Dang cho frame dau tien...\r\n");
-    //   //   }
-    //   // }
+    // printf(
+    //       "[AHRS]  R:%5.2f P:%5.2f Y:%5.2f (deg) | [GYRO]  Gx:%5.2f Gy:%5.2f "
+    //       "Gz:%5.2f (dps) | [ACCEL] Ax:%5.3f Ay:%5.3f Az:%5.3f (g) \r\n",
+    //       mahony_imu.roll * RAD_TO_DEG, mahony_imu.pitch * RAD_TO_DEG,
+    //       mahony_imu.yaw * RAD_TO_DEG, imu_payload.gyro_x_dps,
+    //       imu_payload.gyro_y_dps, imu_payload.gyro_z_dps, imu_payload.accel_x_g,
+    //       imu_payload.accel_y_g, imu_payload.accel_z_g);
 
+    printf("[ENC] R:%6.1f P:%6.1f Y:%6.1f (deg) | [FORCE] R:%5.2f P:%5.2f Y:%5.2f (V)\r\n",
+                 motor_roll_enc.angle_deg, motor_pitch_enc.angle_deg, motor_yaw_enc.angle_deg,
+                 foc_motor_roll.Vq_ref, foc_motor_pitch.Vq_ref, foc_motor_yaw.Vq_ref);
 
-      
-
-    //   // printf(
-    //   //     "[AHRS]  R:%7.2f P:%7.2f Y:%7.2f (deg) | [GYRO]  Gx:%7.2f Gy:%7.2f "
-    //   //     "Gz:%7.2f (dps) | [ACCEL] Ax:%7.3f Ay:%7.3f Az:%7.3f (g) \r\n",
-    //   //     mahony_imu.roll * RAD_TO_DEG, mahony_imu.pitch * RAD_TO_DEG,
-    //   //     mahony_imu.yaw * RAD_TO_DEG, imu_payload.gyro_x_dps,
-    //   //     imu_payload.gyro_y_dps, imu_payload.gyro_z_dps, imu_payload.accel_x_g,
-    //   //     imu_payload.accel_y_g, imu_payload.accel_z_g);
-    // }
-
-    printf("[ENC]    Roll:%6.1f | Pitch:%6.1f | Yaw:%6.1f (deg)\r\n",
-                 motor_roll_enc.angle_deg, motor_pitch_enc.angle_deg, motor_yaw_enc.angle_deg);
-
-      HAL_Delay(100);
+    HAL_Delay(100);
 
 #elif (PROGRAM_MODE == PROGRAM_MODE_IMU_TEST)
     HAL_Delay(1000);
+    printf("Test \r\n");
 #elif (PROGRAM_MODE == PROGRAM_MODE_3AXIS_FOLLOW_IMU)
     HAL_Delay(1000);
 #endif
@@ -392,22 +333,22 @@ int main(void) {
 }
 
 /**
- * @brief System Clock Configuration
- * @retval None
- */
-void SystemClock_Config(void) {
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
   /** Configure the main internal regulator output voltage
-   */
+  */
   HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1_BOOST);
 
   /** Initializes the RCC Oscillators according to the specified parameters
-   * in the RCC_OscInitTypeDef structure.
-   */
-  RCC_OscInitStruct.OscillatorType =
-      RCC_OSCILLATORTYPE_HSI | RCC_OSCILLATORTYPE_HSI48;
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI|RCC_OSCILLATORTYPE_HSI48;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
@@ -418,20 +359,22 @@ void SystemClock_Config(void) {
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV4;
   RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
     Error_Handler();
   }
 
   /** Initializes the CPU, AHB and APB buses clocks
-   */
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK |
-                                RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
   RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
   RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV1;
   RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK) {
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_4) != HAL_OK)
+  {
     Error_Handler();
   }
 }
@@ -592,42 +535,54 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
      * 3AXIS_FOLLOW_IMU: Vòng trong (2kHz) dùng FOC_VelocityLoop
      * Velocity setpoint được tính từ outer loop (TIM16 @ 500Hz)
      * ================================================================ */
-    //FOC_VelocityLoop(&foc_motor_pitch, motor_pitch_enc.angle_rad, imu_stab_vel_pitch);
-    FOC_VelocityLoop(&foc_motor_roll, motor_roll_enc.angle_rad, imu_stab_vel_roll);
-    //FOC_VelocityLoop(&foc_motor_yaw, motor_yaw_enc.angle_rad, imu_stab_vel_yaw);
+    FOC_VelocityLoop(&foc_motor_pitch, motor_pitch_enc.angle_rad, imu_stab_vel_pitch);
+    //FOC_VelocityLoop(&foc_motor_roll, motor_roll_enc.angle_rad, imu_stab_vel_roll);
+    FOC_VelocityLoop(&foc_motor_yaw, motor_yaw_enc.angle_rad, imu_stab_vel_yaw);
 #else
     /* ================================================================
      * PROGRAM_MODE_MAIN: Tach hai nhánh SBUS/HOMING va IMU_STAB
      * ================================================================ */
-    if (g_gimbal_state == GIMBAL_STATE_IMU_STAB) {
-      FOC_VelocityLoop(&foc_motor_pitch, motor_pitch_enc.angle_rad, imu_stab_vel_roll);
-      FOC_VelocityLoop(&foc_motor_roll, motor_roll_enc.angle_rad, imu_stab_vel_pitch);
-      FOC_VelocityLoop(&foc_motor_yaw, motor_yaw_enc.angle_rad, imu_stab_vel_yaw);
-    } else {
-      const float pitch_min_rad = DEG2RAD(MOTOR_PITCH_MIN_DEG);
-      const float pitch_max_rad = DEG2RAD(MOTOR_PITCH_MAX_DEG);
-      const float roll_min_rad = DEG2RAD(MOTOR_ROLL_MIN_DEG);
-      const float roll_max_rad = DEG2RAD(MOTOR_ROLL_MAX_DEG);
-      const float yaw_min_rad = DEG2RAD(MOTOR_YAW_MIN_DEG);
-      const float yaw_max_rad = DEG2RAD(MOTOR_YAW_MAX_DEG);
+    
+    const float pitch_min_rad = DEG2RAD(MOTOR_PITCH_MIN_DEG);
+    const float pitch_max_rad = DEG2RAD(MOTOR_PITCH_MAX_DEG);
+    const float roll_min_rad = DEG2RAD(MOTOR_ROLL_MIN_DEG);
+    const float roll_max_rad = DEG2RAD(MOTOR_ROLL_MAX_DEG);
+    // const float yaw_min_rad = DEG2RAD(MOTOR_YAW_MIN_DEG);
+    // const float yaw_max_rad = DEG2RAD(MOTOR_YAW_MAX_DEG);
+    const float yaw_forbid_min_rad = DEG2RAD(MOTOR_YAW_FORBIDDEN_MIN_DEG);
+    const float yaw_forbid_max_rad = DEG2RAD(MOTOR_YAW_FORBIDDEN_MAX_DEG);
 
-      if (target_motor_pitch_angle < pitch_min_rad)
-        target_motor_pitch_angle = pitch_min_rad;
-      if (target_motor_pitch_angle > pitch_max_rad)
-        target_motor_pitch_angle = pitch_max_rad;
-      if (target_motor_roll_angle < roll_min_rad)
-        target_motor_roll_angle = roll_min_rad;
-      if (target_motor_roll_angle > roll_max_rad)
-        target_motor_roll_angle = roll_max_rad;
-      if (target_motor_yaw_angle < yaw_min_rad)
-        target_motor_yaw_angle = yaw_min_rad;
-      if (target_motor_yaw_angle > yaw_max_rad)
-        target_motor_yaw_angle = yaw_max_rad;
 
-      FOC_PositionLoop(&foc_motor_pitch, motor_pitch_enc.angle_rad, target_motor_pitch_angle);
-      FOC_PositionLoop(&foc_motor_roll, motor_roll_enc.angle_rad, target_motor_roll_angle);
-      FOC_PositionLoop(&foc_motor_yaw, motor_yaw_enc.angle_rad, target_motor_yaw_angle);
+    if (target_motor_pitch_angle < pitch_min_rad)
+      target_motor_pitch_angle = pitch_min_rad;
+    if (target_motor_pitch_angle > pitch_max_rad)
+      target_motor_pitch_angle = pitch_max_rad;
+    if (target_motor_roll_angle < roll_min_rad)
+      target_motor_roll_angle = roll_min_rad;
+    if (target_motor_roll_angle > roll_max_rad)
+      target_motor_roll_angle = roll_max_rad;
+    // if (target_motor_yaw_angle < yaw_min_rad)
+    //   target_motor_yaw_angle = yaw_min_rad;
+    // if (target_motor_yaw_angle > yaw_max_rad)
+    //   target_motor_yaw_angle = yaw_max_rad;
+
+
+    // Kiểm tra xem target có bị rơi vào vùng cấm không (từ 65 độ -> 225 độ)
+    if (target_motor_yaw_angle > yaw_forbid_min_rad && target_motor_yaw_angle < yaw_forbid_max_rad) {
+      float dist_to_min = target_motor_yaw_angle - yaw_forbid_min_rad;
+      float dist_to_max = yaw_forbid_max_rad - target_motor_yaw_angle;
+      if (dist_to_min < dist_to_max) {
+        target_motor_yaw_angle = yaw_forbid_min_rad; // Đẩy về 65 độ
+      } else {
+        target_motor_yaw_angle = yaw_forbid_max_rad; // Đẩy về 225 độ
+      }
     }
+
+
+    FOC_PositionLoop(&foc_motor_pitch, motor_pitch_enc.angle_rad, target_motor_pitch_angle);
+    //FOC_PositionLoop(&foc_motor_roll,  motor_roll_enc.angle_rad,  target_motor_roll_angle);
+    FOC_PositionLoop(&foc_motor_yaw,   motor_yaw_enc.angle_rad,   target_motor_yaw_angle);
+  
 #endif
   }
 }
@@ -635,22 +590,24 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
 /* USER CODE END 4 */
 
 /**
- * @brief  This function is executed in case of error occurrence.
- * @retval None
- */
-void Error_Handler(void) {
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
   /* USER CODE BEGIN Error_Handler_Debug */
   /* USER CODE END Error_Handler_Debug */
 }
 #ifdef USE_FULL_ASSERT
 /**
- * @brief  Reports the name of the source file and the source line number
- *         where the assert_param error has occurred.
- * @param  file: pointer to the source file name
- * @param  line: assert_param error line source number
- * @retval None
- */
-void assert_failed(uint8_t *file, uint32_t line) {
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
   /* USER CODE BEGIN 6 */
   /* USER CODE END 6 */
 }

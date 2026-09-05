@@ -77,12 +77,12 @@ void Error_Handler(void);
 #define DRV3_INH_C_GPIO_Port GPIOB
 #define DRV3_SO1_Pin GPIO_PIN_2
 #define DRV3_SO1_GPIO_Port GPIOB
-#define ENC_PITCH_CS_Pin GPIO_PIN_12
-#define ENC_PITCH_CS_GPIO_Port GPIOB
-#define ENC_ROLL_CS_Pin GPIO_PIN_13
-#define ENC_ROLL_CS_GPIO_Port GPIOB
-#define ENC_YAW_CS_Pin GPIO_PIN_14
+#define ENC_YAW_CS_Pin GPIO_PIN_12
 #define ENC_YAW_CS_GPIO_Port GPIOB
+#define ENC_PITCH_CS_Pin GPIO_PIN_13
+#define ENC_PITCH_CS_GPIO_Port GPIOB
+#define ENC_ROLL_CS_Pin GPIO_PIN_14
+#define ENC_ROLL_CS_GPIO_Port GPIOB
 #define IMU_PAYLOAD_CS_Pin GPIO_PIN_15
 #define IMU_PAYLOAD_CS_GPIO_Port GPIOB
 #define IMU_FRAME_CS_Pin GPIO_PIN_6

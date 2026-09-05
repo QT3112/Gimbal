@@ -163,8 +163,8 @@ void Mahony_Update(MahonyFilter_t *mahony, float gx, float gy, float gz, float a
 
     // Trích xuất góc Euler (Roll, Pitch, Yaw)
     // Các góc đầu ra được tính bằng Radian.
-    mahony->roll  = atan2f(2.0f * (mahony->q0 * mahony->q1 + mahony->q2 * mahony->q3), 1.0f - 2.0f * (mahony->q1 * mahony->q1 + mahony->q2 * mahony->q2));
-    mahony->pitch = asinf(2.0f * (mahony->q0 * mahony->q2 - mahony->q3 * mahony->q1));
+    mahony->pitch  = atan2f(2.0f * (mahony->q0 * mahony->q1 + mahony->q2 * mahony->q3), 1.0f - 2.0f * (mahony->q1 * mahony->q1 + mahony->q2 * mahony->q2));
+    mahony->roll = asinf(2.0f * (mahony->q0 * mahony->q2 - mahony->q3 * mahony->q1));
     mahony->yaw   = atan2f(2.0f * (mahony->q0 * mahony->q3 + mahony->q1 * mahony->q2), 1.0f - 2.0f * (mahony->q2 * mahony->q2 + mahony->q3 * mahony->q3));
 }
 
@@ -202,8 +202,8 @@ void Quaternion_Conjugate(const Quaternion_t *q, Quaternion_t *result) {
 }
 
 void Quaternion_ToEuler(const Quaternion_t *q, float *roll, float *pitch, float *yaw) {
-    if (roll)  *roll  = atan2f(2.0f * (q->q0 * q->q1 + q->q2 * q->q3), 1.0f - 2.0f * (q->q1 * q->q1 + q->q2 * q->q2));
-    if (pitch) *pitch = asinf(2.0f * (q->q0 * q->q2 - q->q3 * q->q1));
+    if (pitch)  *pitch  = atan2f(2.0f * (q->q0 * q->q1 + q->q2 * q->q3), 1.0f - 2.0f * (q->q1 * q->q1 + q->q2 * q->q2));
+    if (roll) *roll = asinf(2.0f * (q->q0 * q->q2 - q->q3 * q->q1));
     if (yaw)   *yaw   = atan2f(2.0f * (q->q0 * q->q3 + q->q1 * q->q2), 1.0f - 2.0f * (q->q2 * q->q2 + q->q3 * q->q3));
 }
 
