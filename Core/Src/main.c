@@ -81,7 +81,7 @@
 #define PROGRAM_MODE_MAIN 0
 #define PROGRAM_MODE_IMU_TEST 1
 #define PROGRAM_MODE_3AXIS_FOLLOW_IMU 2
-#define PROGRAM_MODE PROGRAM_MODE_MAIN
+#define PROGRAM_MODE PROGRAM_MODE_3AXIS_FOLLOW_IMU
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -120,6 +120,10 @@ volatile float target_motor_yaw_angle = 0.0f;
 volatile float imu_stab_vel_roll = 0.0f;
 volatile float imu_stab_vel_pitch = 0.0f;
 volatile float imu_stab_vel_yaw = 0.0f;
+
+/* Góc IMU chốt lúc startup — giữ cố định làm target ổn định */
+volatile float imu_pitch_target_rad = 0.0f;
+volatile float imu_yaw_target_rad   = 0.0f;
 
 /* === Trạng thái máy trạng thái của gimbal === */
 typedef enum {
@@ -209,7 +213,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
   FOC_SetPID_POS(&foc_motor_pitch, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
-  FOC_SetPID_VEL(&foc_motor_pitch, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetPID_VEL(&foc_motor_pitch, 0.4f, 0.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
   FOC_SetLPF_Vel(&foc_motor_pitch, 0.96f);
 
   // /*=== Khởi tạo trục Roll ===*/
@@ -231,7 +235,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
   FOC_SetPID_POS(&foc_motor_yaw, 6.0f, 0.4f, 0.0f, -3.0f, 3.0f);
-  FOC_SetPID_VEL(&foc_motor_yaw, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetPID_VEL(&foc_motor_yaw, 0.4f, 0.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
   FOC_SetLPF_Vel(&foc_motor_yaw, 0.96f);
 
   foc_motor_pitch.enabled = 1;
@@ -287,7 +291,77 @@ int main(void)
 #elif (PROGRAM_MODE == PROGRAM_MODE_IMU_TEST)
   HAL_Delay(1000);
 #elif (PROGRAM_MODE == PROGRAM_MODE_3AXIS_FOLLOW_IMU)
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
+
+  /*=== Khởi tạo encoder Pitch và Yaw ===*/
+  AS5048A_Init(&motor_pitch_enc, &hspi1, ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin);
+  AS5048A_Init(&motor_yaw_enc,   &hspi1, ENC_YAW_CS_GPIO_Port,   ENC_YAW_CS_Pin);
+  HAL_GPIO_WritePin(ENC_PITCH_CS_GPIO_Port, ENC_PITCH_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(ENC_YAW_CS_GPIO_Port,   ENC_YAW_CS_Pin,   GPIO_PIN_SET);
+
+  HAL_TIM_Base_Start_IT(&htim6); /* TIM6: đọc encoder + trigger IMU DMA */
+  HAL_Delay(100);                /* Chờ vài frame encoder ổn định */
+
+  /*=== Khởi tạo FOC trục Pitch (TIM3) ===*/
+  FOC_Init(&foc_motor_pitch, &htim3, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+           PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, VOLTAGE_LIMIT, 1.0f, 0.0005f, 0.00005f);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
+  FOC_SetPID_VEL(&foc_motor_pitch, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetLPF_Vel(&foc_motor_pitch, 0.96f);
+
+  /*=== Khởi tạo FOC trục Yaw (TIM1) ===*/
+  FOC_Init(&foc_motor_yaw, &htim1, TIM_CHANNEL_1, TIM_CHANNEL_2, TIM_CHANNEL_3,
+           PWM_PERIOD, MOTOR_POLE_PAIRS, 12.0f, VOLTAGE_LIMIT, 1.0f, 0.0005f, 0.00005f);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+  HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+  FOC_SetPID_VEL(&foc_motor_yaw, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetLPF_Vel(&foc_motor_yaw, 0.96f);
+
+  foc_motor_pitch.enabled = 1;
+  foc_motor_yaw.enabled   = 1;
+
+  /*=== AlignD: kéo rotor về D-axis để calibrate angle offset ===*/
+  FOC_AlignD(&foc_motor_pitch, 1.0f);
+  FOC_AlignD(&foc_motor_yaw,   1.0f);
   HAL_Delay(1000);
+
+  FOC_CalibrateAngle(&foc_motor_pitch, motor_pitch_enc.angle_rad);
+  FOC_CalibrateAngle(&foc_motor_yaw,   motor_yaw_enc.angle_rad);
+
+  FOC_Start(&foc_motor_pitch, motor_pitch_enc.angle_rad);
+  FOC_Start(&foc_motor_yaw,   motor_yaw_enc.angle_rad);
+
+  /*=== Khởi tạo IMU ICM42688 ===*/
+  ICM42688_Status_t imu_status3 = ICM42688_Init(&imu_payload, &hspi3, GPIOC, GPIO_PIN_6, NULL);
+  if (imu_status3 == ICM42688_OK) {
+    icm_init_ok = 1;
+    ICM42688_CalibrateGyroBias(&imu_payload, 500);
+    Mahony_Init(&mahony_imu, 1.0f, 0.005f);
+    printf("[IMU] Khoi tao OK. Cho Mahony hoi tu (2s)...\r\n");
+    HAL_Delay(2000); /* Chờ Mahony filter hội tụ */
+
+    /* Chốt góc IMU hiện tại làm target ổn định (Dừ gimbal ở vị trí mong muốn trong 2s này!) */
+    imu_pitch_target_rad = mahony_imu.pitch;
+    imu_yaw_target_rad   = mahony_imu.yaw;
+    printf("[IMU] Target chot: Pitch=%.2f  Yaw=%.2f (deg)\r\n",
+           imu_pitch_target_rad * RAD_TO_DEG,
+           imu_yaw_target_rad   * RAD_TO_DEG);
+  } else {
+    icm_init_ok = 0;
+    printf("[IMU] LOI khoi tao! Code: %d\r\n", imu_status3);
+  }
+
+  /*=== Khởi tạo PID outer loop: IMU angle error → velocity setpoint [rad/s] ===*/
+  PID_Init(&pid_imu_pitch_pos, 2.0f, 0.05f, 0.0f, -8.0f, 8.0f);
+  PID_Init(&pid_imu_yaw_pos,   2.0f, 0.05f, 0.0f, -8.0f, 8.0f);
+
+  /*=== Khởi động timers điều khiển ===*/
+  HAL_TIM_Base_Start_IT(&htim16); /* Outer PID @ 500Hz */
+  HAL_TIM_Base_Start_IT(&htim7);  /* Inner FOC @ 2kHz  */
+  printf("[3AXIS_IMU] San sang! Bat dau on dinh.\r\n");
 #endif
 
   /* USER CODE END 2 */
@@ -308,13 +382,13 @@ int main(void)
       last_print_time = now;
     }
 
-    // printf(
-    //       "[AHRS]  R:%5.2f P:%5.2f Y:%5.2f (deg) | [GYRO]  Gx:%5.2f Gy:%5.2f "
-    //       "Gz:%5.2f (dps) | [ACCEL] Ax:%5.3f Ay:%5.3f Az:%5.3f (g) \r\n",
-    //       mahony_imu.roll * RAD_TO_DEG, mahony_imu.pitch * RAD_TO_DEG,
-    //       mahony_imu.yaw * RAD_TO_DEG, imu_payload.gyro_x_dps,
-    //       imu_payload.gyro_y_dps, imu_payload.gyro_z_dps, imu_payload.accel_x_g,
-    //       imu_payload.accel_y_g, imu_payload.accel_z_g);
+    printf(
+          "[AHRS]  R:%5.2f P:%5.2f Y:%5.2f (deg) | [GYRO]  Gx:%5.2f Gy:%5.2f "
+          "Gz:%5.2f (dps) | [ACCEL] Ax:%5.3f Ay:%5.3f Az:%5.3f (g) \r\n",
+          mahony_imu.roll * RAD_TO_DEG, mahony_imu.pitch * RAD_TO_DEG,
+          mahony_imu.yaw * RAD_TO_DEG, imu_payload.gyro_x_dps,
+          imu_payload.gyro_y_dps, imu_payload.gyro_z_dps, imu_payload.accel_x_g,
+          imu_payload.accel_y_g, imu_payload.accel_z_g);
 
     printf("[ENC] R:%6.1f P:%6.1f Y:%6.1f (deg) | [FORCE] R:%5.2f P:%5.2f Y:%5.2f (V)\r\n",
                  motor_roll_enc.angle_deg, motor_pitch_enc.angle_deg, motor_yaw_enc.angle_deg,
@@ -326,7 +400,15 @@ int main(void)
     HAL_Delay(1000);
     printf("Test \r\n");
 #elif (PROGRAM_MODE == PROGRAM_MODE_3AXIS_FOLLOW_IMU)
-    HAL_Delay(1000);
+    uint32_t now = HAL_GetTick();
+    if (now - last_print_time >= 100) {
+      last_print_time = now;
+      printf("[AHRS] P:%6.2f Y:%6.2f (deg) | [TGT] P:%6.2f Y:%6.2f (deg) | [ENC] P:%6.1f Y:%6.1f (deg) | [FORCE] P:%5.2f Y:%5.2f (V)\r\n",
+             mahony_imu.pitch * RAD_TO_DEG, mahony_imu.yaw * RAD_TO_DEG,
+             imu_pitch_target_rad * RAD_TO_DEG, imu_yaw_target_rad * RAD_TO_DEG,
+             motor_pitch_enc.angle_deg, motor_yaw_enc.angle_deg,
+             foc_motor_pitch.Vq_ref, foc_motor_yaw.Vq_ref);
+    }
 #endif
   }
   /* USER CODE END 3 */
@@ -516,18 +598,22 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
       }
     }
   } else if (htim->Instance == TIM16) {
+    /* Outer loop @ 500Hz: IMU angle error → velocity setpoint [rad/s] cho FOC_VelocityLoop */
     if (icm_init_ok) {
-      float imu_error_roll = DEG2RAD(IMU_ROLL_TARGET_DEG) - (mahony_imu.roll);
-      float imu_error_pitch = DEG2RAD(IMU_PITCH_TARGET_DEG) - (mahony_imu.pitch);
-      float imu_error_yaw = DEG2RAD(IMU_YAW_TARGET_DEG) - (mahony_imu.yaw);
+      /* Sai số: target chốt lúc startup - góc IMU thực tế
+       * Khi frame nghiêng pitch tăng → error âm → velocity âm → motor bù ngược lại */
+      float imu_error_pitch = -imu_pitch_target_rad + mahony_imu.pitch;
+      float imu_error_yaw   = -imu_yaw_target_rad   + mahony_imu.yaw;
 
-      if (imu_error_roll > PI) imu_error_roll -= TWO_PI;
-      if (imu_error_pitch > PI) imu_error_pitch -= TWO_PI;
-      if (imu_error_yaw > PI) imu_error_yaw -= TWO_PI;
+      /* Wrap về [-π, +π]: chọn hướng bù ngắn nhất (quan trọng cho Yaw) */
+      if (imu_error_pitch >  PI) imu_error_pitch -= TWO_PI;
+      if (imu_error_pitch < -PI) imu_error_pitch += TWO_PI;
+      if (imu_error_yaw   >  PI) imu_error_yaw   -= TWO_PI;
+      if (imu_error_yaw   < -PI) imu_error_yaw   += TWO_PI;
 
-      imu_stab_vel_roll = PID_Update(&pid_imu_roll_pos, imu_error_roll, 0.002);
-      imu_stab_vel_pitch = PID_Update(&pid_imu_pitch_pos, imu_error_pitch, 0.002);
-      imu_stab_vel_yaw = PID_Update(&pid_imu_yaw_pos, imu_error_yaw, 0.002);
+      /* PID → velocity setpoint [rad/s] */
+      imu_stab_vel_pitch = PID_Update(&pid_imu_pitch_pos, imu_error_pitch, 0.002f);
+      imu_stab_vel_yaw   = PID_Update(&pid_imu_yaw_pos,   imu_error_yaw,   0.002f);
     }
   } else if (htim->Instance == TIM7) {
 #if (PROGRAM_MODE == PROGRAM_MODE_3AXIS_FOLLOW_IMU)
