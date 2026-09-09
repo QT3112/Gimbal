@@ -337,7 +337,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
-  FOC_SetPID_VEL(&foc_motor_pitch, 0.4f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
+  FOC_SetPID_VEL(&foc_motor_pitch, 1.0f, 5.0f, 0.0f, -VOLTAGE_LIMIT, VOLTAGE_LIMIT);
   FOC_SetLPF_Vel(&foc_motor_pitch, 0.96f);
 
   /*=== Khởi tạo FOC trục Yaw (TIM1) ===*/
@@ -384,8 +384,8 @@ int main(void)
   }
 
   /*=== Khởi tạo PID outer loop: IMU angle error → velocity setpoint [rad/s] ===*/
-  PID_Init(&pid_imu_pitch_pos, 2.0f, 0.05f, 0.0f, -8.0f, 8.0f);
-  PID_Init(&pid_imu_yaw_pos,   2.0f, 0.05f, 0.0f, -8.0f, 8.0f);
+  PID_Init(&pid_imu_pitch_pos, 40.0f, 0.0f, 1.0f, -10.0f, 10.0f);
+  PID_Init(&pid_imu_yaw_pos,   30.0f, 5.0f, 10.0f, -8.0f, 8.0f);
 
   /*=== Khởi động timers điều khiển ===*/
   HAL_TIM_Base_Start_IT(&htim16); /* Outer PID @ 500Hz */
