@@ -86,7 +86,9 @@
 #define PROGRAM_MODE_3AXIS_FOLLOW_IMU 2
 #define PROGRAM_MODE_3AXIS_IMU_ON_FRAME 3
 #define PROGRAM_MODE_TEST_VELOCITY 4
-#define PROGRAM_MODE PROGRAM_MODE_3AXIS_FOLLOW_IMU
+#define PROGRAM_MODE_TEST_SBUS 5
+#define PROGRAM_MODE_3AXIS_FOLLOW_IMU_SBUS 6
+#define PROGRAM_MODE PROGRAM_MODE_3AXIS_FOLLOW_IMU 
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -341,7 +343,7 @@ int main(void)
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_1);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_2);
   HAL_TIM_PWM_Start(&htim3, TIM_CHANNEL_3);
-  FOC_SetPID_VEL(&foc_motor_pitch, 1.0f, 5.0f, 0.0f, -PITCH_VOLTAGE_LIMIT, PITCH_VOLTAGE_LIMIT);
+  FOC_SetPID_VEL(&foc_motor_pitch, 1.0f, 0.1f, 0.0f, -PITCH_VOLTAGE_LIMIT, PITCH_VOLTAGE_LIMIT);
   FOC_SetLPF_Vel(&foc_motor_pitch, 0.96f);
 
   // /*=== Khởi tạo trục Roll ===*/
@@ -402,7 +404,7 @@ int main(void)
   }
 
   /*=== Khởi tạo PID outer loop: IMU angle error → velocity setpoint [rad/s] ===*/
-  PID_Init(&pid_imu_pitch_pos, 40.0f, 0.0f, 1.0f, -10.0f, 10.0f);
+  PID_Init(&pid_imu_pitch_pos, 30.0f, 2.0f, 3.0f, -10.0f, 10.0f);
   PID_Init(&pid_imu_roll_pos, 30.0f, 5.0f, 10.0f, -8.0f, 8.0f);
   PID_Init(&pid_imu_yaw_pos,   30.0f, 5.0f, 10.0f, -8.0f, 8.0f);
 
@@ -503,6 +505,7 @@ int main(void)
   /* Khởi động TIM7 (không cần TIM16 — target được tính trực tiếp trong TIM7) */
   HAL_TIM_Base_Start_IT(&htim7);  /* Inner FOC @ 2kHz */
   printf("[IMU_FRAME] San sang! Bat dau on dinh theo delta IMU.\r\n");
+#elif (PROGRAM_MODE == PROGRAM_MODE_3AXIS_FOLLOW_IMU_SBUS)
 #elif (PROGRAM_MODE == PROGRAM_MODE_TEST_VELOCITY)
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);
   /*=== Khởi tạo encoder ===*/
@@ -543,6 +546,14 @@ int main(void)
 
   HAL_TIM_Base_Start_IT(&htim7);  /* Inner FOC @ 2kHz */
   printf("[TEST_VELOCITY] San sang quay (1.0 rad/s)!\r\n");
+#elif (PROGRAM_MODE == PROGRAM_MODE_TEST_SBUS)
+  SBUS_Status_t sbus_init_ret = SBUS_Init(&sbus_rx, &huart1);
+  if (sbus_init_ret == SBUS_OK) {
+    printf("[SBUS] Khoi tao thanh cong! Dang cho tin hieu tu Receiver...\r\n");
+  } else {
+    printf(
+        "[SBUS] LOI khoi tao! Check USART1 DMA config (100000 baud, 8E2).\r\n");
+  }
 #endif
 
   /* USER CODE END 2 */
@@ -616,6 +627,67 @@ int main(void)
              motor_pitch_enc.angle_deg, motor_yaw_enc.angle_deg,
              foc_motor_pitch.velocity_mech, foc_motor_yaw.velocity_mech,
              foc_motor_pitch.Vq_ref, foc_motor_yaw.Vq_ref);
+    }
+#elif (PROGRAM_MODE == PROGRAM_MODE_TEST_SBUS)
+    /* Gọi SBUS_Process() mỗi vòng lặp — nhanh, chỉ parse khi có frame mới */
+    SBUS_Status_t sbus_st = SBUS_Process(&sbus_rx);
+    uint32_t now = HAL_GetTick();
+    /* In telemetry 10Hz (mỗi 100ms) */
+    if (now - last_print_time >= 100) {
+      last_print_time = now;
+
+      if (sbus_st == SBUS_OK) {
+        /* Đọc 16 kênh raw để hiển thị */
+        uint16_t ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8;
+        uint16_t ch9, ch10, ch11, ch12, ch13, ch14, ch15, ch16;
+        SBUS_GetChannel(&sbus_rx, 1, &ch1);
+        SBUS_GetChannel(&sbus_rx, 2, &ch2);
+        SBUS_GetChannel(&sbus_rx, 3, &ch3);
+        SBUS_GetChannel(&sbus_rx, 4, &ch4);
+        SBUS_GetChannel(&sbus_rx, 5, &ch5);
+        SBUS_GetChannel(&sbus_rx, 6, &ch6);
+        SBUS_GetChannel(&sbus_rx, 7, &ch7);
+        SBUS_GetChannel(&sbus_rx, 8, &ch8);
+        SBUS_GetChannel(&sbus_rx, 9, &ch9);
+        SBUS_GetChannel(&sbus_rx, 10, &ch10);
+        SBUS_GetChannel(&sbus_rx, 11, &ch11);
+        SBUS_GetChannel(&sbus_rx, 12, &ch12);
+        SBUS_GetChannel(&sbus_rx, 13, &ch13);
+        SBUS_GetChannel(&sbus_rx, 14, &ch14);
+        SBUS_GetChannel(&sbus_rx, 15, &ch15);
+        SBUS_GetChannel(&sbus_rx, 16, &ch16);
+
+        /* Đọc normalized [-1.0..+1.0] cho các kênh điều khiển chính */
+        float norm_roll, norm_pitch, norm_throttle, norm_yaw;
+        SBUS_GetChannelNorm(&sbus_rx, 1, &norm_roll);  /* CH1: Aileron/Roll   */
+        SBUS_GetChannelNorm(&sbus_rx, 2, &norm_pitch); /* CH2: Elevator/Pitch */
+        SBUS_GetChannelNorm01(&sbus_rx, 3,
+                              &norm_throttle);       /* CH3: Throttle [0..1]*/
+        SBUS_GetChannelNorm(&sbus_rx, 4, &norm_yaw); /* CH4: Rudder/Yaw     */
+
+        /* Dòng 1: Raw 16 kênh */
+        printf("[SBUS] RAW: %4u %4u %4u %4u %4u %4u %4u %4u "
+               "%4u %4u %4u %4u %4u %4u %4u %4u | D:%u%u FS:%u FL:%u\r\n",
+               ch1, ch2, ch3, ch4, ch5, ch6, ch7, ch8, ch9, ch10, ch11, ch12,
+               ch13, ch14, ch15, ch16, SBUS_GetCH17(&sbus_rx),
+               SBUS_GetCH18(&sbus_rx), SBUS_IsFailsafe(&sbus_rx),
+               sbus_rx.frame_lost);
+
+        // /* Dòng 2: Normalized 4 kênh chính */
+        // printf("[SBUS] NORM: Roll:%+6.3f Pitch:%+6.3f Thr:%5.3f Yaw:%+6.3f\r\n",
+        //        norm_roll, norm_pitch, norm_throttle, norm_yaw);
+
+      } else if (sbus_st == SBUS_FAILSAFE) {
+        printf("[SBUS] CANH BAO: FAILSAFE dang active! Tat ca kenh ve gia tri "
+               "an toan.\r\n");
+      } else if (sbus_st == SBUS_FRAME_LOST) {
+        printf("[SBUS] CANH BAO: Frame Lost! Tin hieu yeu hoac bi nhieu.\r\n");
+      } else if (sbus_st == SBUS_TIMEOUT) {
+        printf("[SBUS] LOI: TIMEOUT! Mat tin hieu Receiver (> %dms).\r\n",
+               SBUS_TIMEOUT_MS);
+      } else {
+        printf("[SBUS] Dang cho frame dau tien...\r\n");
+      }
     }
 #endif
   }
